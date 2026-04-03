@@ -4,7 +4,11 @@ use log::warn;
 
 use crate::{
     bridge::GridLineCell,
-    editor::{AnchorInfo, DrawCommand, DrawCommandBatcher, grid::CharacterGrid, style::Style},
+    editor::{
+        AnchorInfo, DrawCommand, DrawCommandBatcher,
+        grid::{CharacterGrid, GridCell},
+        style::Style,
+    },
     renderer::{WindowDrawCommand, box_drawing},
     units::{GridRect, GridSize},
 };
@@ -243,87 +247,7 @@ impl Window {
         text: &mut String,
     ) -> (usize, LineFragmentData) {
         let row = self.grid.row(row_index).unwrap();
-
-        let (_, style) = &row[start];
-
-        let mut width = 0u32;
-        let mut last_box_char = None;
-        let mut text_range = text.len() as u32..text.len() as u32;
-        let mut words = Vec::new();
-        let mut current_word = WordData::default();
-
-        for (cluster, possible_end_style) in row.iter().take(self.grid.width).skip(start) {
-            // Style doesn't match. Draw what we've got.
-            if style != possible_end_style {
-                break;
-            }
-
-            // Box drawing characters are rendered specially; break up the segment such that
-            // repeated box drawing characters are in a segment by themselves
-            if box_drawing::is_box_char(cluster) {
-                if text_range.is_empty() {
-                    last_box_char = Some(cluster)
-                }
-                if (!text_range.is_empty() && last_box_char.is_none())
-                    || last_box_char != Some(cluster)
-                {
-                    // either we have non-box chars accumulated or this is a different box char
-                    // from what we have seen before. Either way, render what we have
-                    break;
-                }
-            } else if last_box_char.is_some() {
-                // render the list of box chars we have accumulated so far
-                break;
-            }
-
-            width += 1;
-
-            // We can't deal with clusters that are longer than 255 bytes, so replace them with spaces.
-            // This should only happen if Neovim sends corrupted lines, or maybe in some pathological
-            // Unicode combining sequence.
-            let cluster = if cluster.len() > 255 { " " } else { cluster };
-
-            if cluster.is_empty() {
-                // For double-width char, the empty cell should be part of the current word as a 0 cluster size
-                // Or ignored when it's part of whitespace
-                if !current_word.cluster_sizes.is_empty() {
-                    current_word.cluster_sizes.push(0);
-                }
-                continue;
-            }
-
-            let is_whitespace = cluster.chars().next().is_some_and(|char| char.is_whitespace());
-            if is_whitespace {
-                if !current_word.cluster_sizes.is_empty() {
-                    // Finish the current word
-                    words.push(current_word);
-                    current_word = WordData::default();
-                }
-            } else if current_word.cluster_sizes.is_empty() {
-                // Properly initialize a new word
-                current_word.cell = width - 1;
-                current_word.cluster_sizes.push(cluster.len() as u8);
-                current_word.text_offset = text.len() as u32 - text_range.start;
-            } else {
-                current_word.cluster_sizes.push(cluster.len() as u8);
-            }
-
-            // Add the grid cell to the cells to render.
-            text.push_str(cluster);
-            text_range.end += cluster.len() as u32;
-        }
-        if !current_word.cluster_sizes.is_empty() {
-            words.push(current_word);
-        }
-
-        let line_fragment = LineFragmentData {
-            text_range,
-            cells: start as u32..start as u32 + width,
-            style: style.clone(),
-            words,
-        };
-
-        (start + width as usize, line_fragment)
+        build_line_fragment_from_cells(row, self.grid.width, start, text)
     }
 
     // Redraw line by calling build_line_fragment starting at 0
@@ -486,6 +410,95 @@ impl Window {
     pub fn close(&self, batcher: &mut DrawCommandBatcher) {
         self.send_command(batcher, WindowDrawCommand::Close);
     }
+}
+
+fn build_line_fragment_from_cells(
+    row: &[GridCell],
+    width: usize,
+    start: usize,
+    text: &mut String,
+) -> (usize, LineFragmentData) {
+    let (_, style) = &row[start];
+
+    let mut consumed_width = 0u32;
+    let mut last_box_char = None;
+    let mut text_range = text.len() as u32..text.len() as u32;
+    let mut words = Vec::new();
+    let mut current_word = WordData::default();
+
+    for (cluster, possible_end_style) in row.iter().take(width).skip(start) {
+        if style != possible_end_style {
+            break;
+        }
+
+        if box_drawing::is_box_char(cluster) {
+            if text_range.is_empty() {
+                last_box_char = Some(cluster)
+            }
+            if (!text_range.is_empty() && last_box_char.is_none()) || last_box_char != Some(cluster)
+            {
+                break;
+            }
+        } else if last_box_char.is_some() {
+            break;
+        }
+
+        consumed_width += 1;
+
+        let cluster = if cluster.len() > 255 { " " } else { cluster };
+        if cluster.is_empty() {
+            if !current_word.cluster_sizes.is_empty() {
+                current_word.cluster_sizes.push(0);
+            }
+            continue;
+        }
+
+        let is_whitespace = cluster.chars().next().is_some_and(|char| char.is_whitespace());
+        if is_whitespace {
+            if !current_word.cluster_sizes.is_empty() {
+                words.push(current_word);
+                current_word = WordData::default();
+            }
+        } else if current_word.cluster_sizes.is_empty() {
+            current_word.cell = consumed_width - 1;
+            current_word.cluster_sizes.push(cluster.len() as u8);
+            current_word.text_offset = text.len() as u32 - text_range.start;
+        } else {
+            current_word.cluster_sizes.push(cluster.len() as u8);
+        }
+
+        text.push_str(cluster);
+        text_range.end += cluster.len() as u32;
+    }
+
+    if !current_word.cluster_sizes.is_empty() {
+        words.push(current_word);
+    }
+
+    let line_fragment = LineFragmentData {
+        text_range,
+        cells: start as u32..start as u32 + consumed_width,
+        style: style.clone(),
+        words,
+    };
+
+    (start + consumed_width as usize, line_fragment)
+}
+
+pub fn line_from_cells(row: &[GridCell]) -> Line {
+    let mut current_start = 0;
+    let mut line_fragments = Vec::new();
+    let mut text = String::new();
+
+    while current_start < row.len() {
+        let (next_start, line_fragment) =
+            build_line_fragment_from_cells(row, row.len(), current_start, &mut text);
+        current_start = next_start;
+        line_fragments.push(line_fragment);
+    }
+
+    let cells = Some(row.iter().map(|(character, _)| character.clone()).collect());
+    Line { text, fragments: line_fragments, cells }
 }
 
 #[cfg(test)]

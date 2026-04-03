@@ -18,6 +18,10 @@ use crate::{
     editor::WindowType,
     renderer::{MessageSelection, Renderer, WindowDrawDetails},
     settings::Settings,
+    terminal::input::{
+        TerminalInputSettings, encode_mouse_drag, encode_mouse_move, encode_mouse_press,
+        encode_mouse_release, encode_mouse_scroll,
+    },
     units::{GridPos, GridScale, GridSize, GridVec, PixelPos, PixelRect, PixelSize, PixelVec},
     window::{WindowSettings, keyboard_manager::KeyboardManager},
 };
@@ -66,6 +70,11 @@ pub struct PointerTransitionResult {
 
 pub struct MouseEventResult {
     pub overlay_event: OverlayEvent,
+}
+
+pub struct TerminalMouseEventResult {
+    pub overlay_event: OverlayEvent,
+    pub bytes: Vec<Vec<u8>>,
 }
 
 pub struct EditorState<'a> {
@@ -644,6 +653,129 @@ impl MouseManager {
                 }
             }
         }
+    }
+
+    pub fn handle_terminal_event(
+        &mut self,
+        event: &WindowEvent,
+        keyboard_manager: &KeyboardManager,
+        renderer: &Renderer,
+        window: &Window,
+        input: TerminalInputSettings,
+    ) -> TerminalMouseEventResult {
+        let full_region = WindowDrawDetails {
+            id: 0,
+            region: renderer.window_regions.first().map_or(PixelRect::ZERO, |v| v.region),
+            grid_size: renderer.window_regions.first().map_or(GridSize::ZERO, |v| v.grid_size),
+            window_type: crate::editor::WindowType::Editor,
+        };
+        let editor_state = EditorState {
+            grid_scale: &renderer.grid_renderer.grid_scale,
+            window_regions: &renderer.window_regions,
+            full_region,
+            window,
+            keyboard_manager,
+        };
+        let hide_mouse_when_typing = self.settings.get::<WindowSettings>().hide_mouse_when_typing;
+        let mut bytes = Vec::new();
+
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.window_position = (position.x as f32, position.y as f32).into();
+                if let Some(details) = self.get_window_details_under_mouse(&editor_state) {
+                    self.grid_position = self.get_relative_position(details, &editor_state);
+                    if let Some(drag) = &self.drag_details {
+                        if let Some(encoded) = encode_mouse_drag(
+                            input,
+                            drag.button,
+                            self.grid_position.x,
+                            self.grid_position.y,
+                        ) {
+                            bytes.push(encoded);
+                        }
+                    } else if let Some(encoded) =
+                        encode_mouse_move(input, self.grid_position.x, self.grid_position.y)
+                    {
+                        bytes.push(encoded);
+                    }
+                }
+                if self.mouse_hidden && window.has_focus() {
+                    self.request_cursor_visible(window);
+                } else if self.cursor_resync_needed && window.has_focus() {
+                    self.force_cursor_visible(window);
+                }
+            }
+            WindowEvent::CursorEntered { .. } => {
+                if self.mouse_hidden {
+                    self.request_cursor_visible(window);
+                } else if self.cursor_resync_needed && window.has_focus() {
+                    self.force_cursor_visible(window);
+                }
+            }
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(_, y), .. } => {
+                if let Some(details) = self.get_window_details_under_mouse(&editor_state) {
+                    let position = self.get_relative_position(details, &editor_state);
+                    let steps = y.abs().max(1.0) as usize;
+                    for _ in 0..steps {
+                        if let Some(encoded) =
+                            encode_mouse_scroll(input, *y > 0.0, position.x, position.y)
+                        {
+                            bytes.push(encoded);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::PixelDelta(delta), .. } => {
+                if delta.y != 0.0 {
+                    if let Some(details) = self.get_window_details_under_mouse(&editor_state) {
+                        let position = self.get_relative_position(details, &editor_state);
+                        if let Some(encoded) =
+                            encode_mouse_scroll(input, delta.y > 0.0, position.x, position.y)
+                        {
+                            bytes.push(encoded);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if let Some(details) = self.get_window_details_under_mouse(&editor_state) {
+                    let position = self.get_relative_position(details, &editor_state);
+                    self.grid_position = position;
+                    if *state == ElementState::Pressed {
+                        if let Some(encoded) =
+                            encode_mouse_press(input, *button, position.x, position.y)
+                        {
+                            bytes.push(encoded);
+                        }
+                        self.drag_details =
+                            Some(DragDetails { button: *button, draw_details: details.clone() });
+                    } else {
+                        if let Some(encoded) =
+                            encode_mouse_release(input, *button, position.x, position.y)
+                        {
+                            bytes.push(encoded);
+                        }
+                        self.drag_details = None;
+                    }
+                } else if *state == ElementState::Released {
+                    self.drag_details = None;
+                }
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. }
+                if hide_mouse_when_typing
+                    && key_event.state == ElementState::Pressed
+                    && !self.mouse_hidden
+                    && window.has_focus() =>
+            {
+                self.hide_cursor(window);
+            }
+            WindowEvent::Focused(focused_event) if hide_mouse_when_typing => {
+                self.handle_focus_change(window, *focused_event);
+            }
+            _ => {}
+        }
+
+        TerminalMouseEventResult { overlay_event: OverlayEvent::default(), bytes }
     }
 
     pub fn handle_event(

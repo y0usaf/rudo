@@ -80,32 +80,55 @@ impl KeyboardManager {
                     neovim_handler,
                 );
             }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                // Record the modifier states so that we can properly add them to the keybinding text
-                log::trace!("{:?}", *modifiers);
-                self.modifiers = *modifiers;
+            WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(*modifiers),
+            _ => {}
+        }
+    }
 
-                #[cfg(target_os = "macos")]
-                {
-                    let ws = self.settings.get::<WindowSettings>();
-                    self.meta_is_pressed = match ws.input_macos_option_key_is_meta {
-                        OptionAsMeta::Both => self.modifiers.state().alt_key(),
-                        OptionAsMeta::OnlyLeft => {
-                            self.modifiers.lalt_state() == ModifiersKeyState::Pressed
-                        }
-                        OptionAsMeta::OnlyRight => {
-                            self.modifiers.ralt_state() == ModifiersKeyState::Pressed
-                        }
-                        OptionAsMeta::None => false,
-                    };
-                }
-
-                #[cfg(not(target_os = "macos"))]
-                {
-                    self.meta_is_pressed = self.modifiers.state().alt_key();
+    pub fn handle_terminal_event(&mut self, event: &WindowEvent) -> Option<Vec<u8>> {
+        match event {
+            WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. }
+                if self.ime_preedit.0.is_empty() =>
+            {
+                if key_event.state == ElementState::Pressed {
+                    self.encode_terminal_key_event(key_event)
+                } else {
+                    None
                 }
             }
-            _ => {}
+            WindowEvent::Ime(Ime::Commit(text)) => Some(text.as_bytes().to_vec()),
+            WindowEvent::Ime(Ime::Preedit(text, cursor_offset)) => {
+                self.ime_preedit = (text.to_string(), *cursor_offset);
+                None
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.update_modifiers(*modifiers);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn update_modifiers(&mut self, modifiers: Modifiers) {
+        log::trace!("{:?}", modifiers);
+        self.modifiers = modifiers;
+
+        #[cfg(target_os = "macos")]
+        {
+            let ws = self.settings.get::<WindowSettings>();
+            self.meta_is_pressed = match ws.input_macos_option_key_is_meta {
+                OptionAsMeta::Both => self.modifiers.state().alt_key(),
+                OptionAsMeta::OnlyLeft => self.modifiers.lalt_state() == ModifiersKeyState::Pressed,
+                OptionAsMeta::OnlyRight => {
+                    self.modifiers.ralt_state() == ModifiersKeyState::Pressed
+                }
+                OptionAsMeta::None => false,
+            };
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.meta_is_pressed = self.modifiers.state().alt_key();
         }
     }
 
@@ -197,6 +220,38 @@ impl KeyboardManager {
             .map(|text| self.format_key_text(text.as_str(), false))
     }
 
+    fn encode_terminal_key_event(&self, key_event: &KeyEvent) -> Option<Vec<u8>> {
+        let state = self.modifiers.state();
+        let mut bytes =
+            if let Some(special) = encode_special_terminal_key(key_event, state.shift_key()) {
+                special
+            } else if let Some(text) = key_event
+                .text
+                .as_ref()
+                .or(match &key_event.logical_key {
+                    Key::Character(text) => Some(text),
+                    _ => None,
+                })
+                .filter(|_| !state.super_key())
+            {
+                if state.control_key() {
+                    encode_control_text(text.as_str())?
+                } else {
+                    text.as_bytes().to_vec()
+                }
+            } else {
+                return None;
+            };
+
+        if self.meta_is_pressed {
+            let mut prefixed = vec![0x1b];
+            prefixed.append(&mut bytes);
+            bytes = prefixed;
+        }
+
+        Some(bytes)
+    }
+
     fn format_key_text(&self, text: &str, is_special: bool) -> String {
         // Neovim always converts shifted ascii alpha characters to uppercase, so do it here already
         // This fixes some bugs where winit does not report the uppercase text as it should
@@ -246,6 +301,74 @@ impl KeyboardManager {
         state.super_key().then(|| ret += "D-");
         ret
     }
+}
+
+fn encode_control_text(text: &str) -> Option<Vec<u8>> {
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+
+    let byte = match ch {
+        '@' | '2' | ' ' => 0x00,
+        'a'..='z' => (ch as u8) - b'a' + 1,
+        'A'..='Z' => (ch as u8) - b'A' + 1,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    };
+
+    Some(vec![byte])
+}
+
+fn encode_special_terminal_key(key_event: &KeyEvent, shift: bool) -> Option<Vec<u8>> {
+    if key_event.location == KeyLocation::Numpad {
+        if let Some(text) = key_event.text.as_ref() {
+            return Some(text.as_bytes().to_vec());
+        }
+    }
+
+    let Key::Named(key) = &key_event.logical_key else {
+        return None;
+    };
+
+    let sequence = match key {
+        NamedKey::ArrowUp => "\x1b[A",
+        NamedKey::ArrowDown => "\x1b[B",
+        NamedKey::ArrowRight => "\x1b[C",
+        NamedKey::ArrowLeft => "\x1b[D",
+        NamedKey::Home => "\x1b[H",
+        NamedKey::End => "\x1b[F",
+        NamedKey::Insert => "\x1b[2~",
+        NamedKey::Delete => "\x1b[3~",
+        NamedKey::PageUp => "\x1b[5~",
+        NamedKey::PageDown => "\x1b[6~",
+        NamedKey::Enter => "\r",
+        NamedKey::Tab if shift => "\x1b[Z",
+        NamedKey::Tab => "\t",
+        NamedKey::Escape => "\x1b",
+        NamedKey::Backspace => "\x7f",
+        NamedKey::F1 => "\x1bOP",
+        NamedKey::F2 => "\x1bOQ",
+        NamedKey::F3 => "\x1bOR",
+        NamedKey::F4 => "\x1bOS",
+        NamedKey::F5 => "\x1b[15~",
+        NamedKey::F6 => "\x1b[17~",
+        NamedKey::F7 => "\x1b[18~",
+        NamedKey::F8 => "\x1b[19~",
+        NamedKey::F9 => "\x1b[20~",
+        NamedKey::F10 => "\x1b[21~",
+        NamedKey::F11 => "\x1b[23~",
+        NamedKey::F12 => "\x1b[24~",
+        _ => return None,
+    };
+
+    Some(sequence.as_bytes().to_vec())
 }
 
 fn get_special_key(key_event: &KeyEvent) -> Option<&str> {

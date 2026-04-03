@@ -50,6 +50,7 @@ use crate::{
         HotReloadConfigs, PersistentWindowSettings, Settings, SettingsChanged, clamped_grid_size,
         load_last_window_settings, save_window_size,
     },
+    terminal::input::TerminalInputSettings,
     units::{Grid, GridSize},
     utils::expand_tilde,
 };
@@ -97,6 +98,7 @@ impl From<&str> for ForceClickKind {
 pub enum WindowCommand {
     TitleChanged(String),
     SetMouseEnabled(bool),
+    TerminalInputChanged(TerminalInputSettings),
     ListAvailableFonts,
     FocusWindow,
     #[cfg(target_os = "macos")]

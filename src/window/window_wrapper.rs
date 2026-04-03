@@ -41,12 +41,14 @@ use {
 use crate::{
     CmdLineSettings,
     bridge::{
-        NeovimHandler, NeovimRuntime, OpenArgs, OpenMode, ParallelCommand, RestartDetails,
-        SerialCommand, send_ui, set_active_route_handler, unregister_route_handler,
+        NeovimHandler, NeovimRuntime, OpenArgs, ParallelCommand, RestartDetails, SerialCommand,
+        send_ui, set_active_route_handler, unregister_route_handler,
     },
     clipboard::ClipboardHandle,
     cmd_line::{GeometryArgs, MouseCursorIcon},
+    editor::start_editor_handler,
     profiling::{tracy_frame, tracy_gpu_collect, tracy_gpu_zone, tracy_plot, tracy_zone},
+    pty::PtySize,
     renderer::{
         DrawCommand, MessageSelection, Renderer, RendererSettingsChanged, SkiaRenderer, VSync,
         create_skia_renderer,
@@ -56,6 +58,10 @@ use crate::{
         Config, DEFAULT_GRID_SIZE, MIN_GRID_SIZE, RendererHotReloadConfigs, Settings,
         SettingsChanged, WindowHotReloadConfigs, clamped_grid_size, font::FontSettings,
         load_last_window_settings,
+    },
+    terminal::{
+        input::{TerminalInputSettings, encode_focus_report},
+        runtime::{TerminalHandle, TerminalRuntime},
     },
     units::{GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelSize},
     window::{
@@ -106,6 +112,7 @@ pub struct RouteWindow {
     pub skia_renderer: Rc<RefCell<Box<dyn SkiaRenderer>>>,
     pub winit_window: Rc<Window>,
     pub neovim_handler: NeovimHandler,
+    pub terminal_handle: Option<TerminalHandle>,
     pub mouse_manager: Rc<RefCell<Box<MouseManager>>>,
     pub renderer: Rc<RefCell<Box<Renderer>>>,
     #[cfg(target_os = "macos")]
@@ -143,6 +150,7 @@ struct RouteState {
     font_changed_last_frame: bool,
     saved_inner_size: dpi::PhysicalSize<u32>,
     saved_grid_size: Option<GridSize<u32>>,
+    terminal_input: TerminalInputSettings,
     requested_columns: Option<u32>,
     requested_lines: Option<u32>,
     window_padding: WindowPadding,
@@ -161,6 +169,7 @@ impl RouteState {
             saved_grid_size: None,
             requested_columns: None,
             requested_lines: None,
+            terminal_input: TerminalInputSettings::default(),
             window_padding: WindowPadding { left: 0, right: 0, top: 0, bottom: 0 },
             is_minimized: false,
             ime_enabled: false,
@@ -175,6 +184,8 @@ struct RouteCore {
     route_id: RouteId,
     renderer: Rc<RefCell<Box<Renderer>>>,
     neovim_handler: NeovimHandler,
+    terminal_handle: Option<TerminalHandle>,
+    terminal_input: TerminalInputSettings,
     cwd: Option<PathBuf>,
     title: String,
     mouse_enabled: bool,
@@ -198,6 +209,7 @@ pub struct WinitWindowWrapper {
     route_cores: FxHashMap<RouteId, RouteCore>,
     pending_window_creation_route: Option<RouteId>,
     pub runtime: Option<NeovimRuntime>,
+    pub terminal_runtime: Option<TerminalRuntime>,
     pub runtime_tracker: RunningTracker,
     pending_restart: FxHashMap<RouteId, RestartRequest>,
     keyboard_manager: KeyboardManager,
@@ -232,12 +244,24 @@ impl WinitWindowWrapper {
                 (None, Some(msg))
             }
         };
+        let terminal_runtime = match TerminalRuntime::new() {
+            Ok(rt) => Some(rt),
+            Err(error) => {
+                let msg = format!("Failed to create terminal runtime: {error:?}");
+                log::error!("{msg}");
+                None
+            }
+        };
+        let startup_error = startup_error.or_else(|| {
+            terminal_runtime.is_none().then_some("Failed to create terminal runtime".to_string())
+        });
 
         Self {
             routes: Default::default(),
             route_cores: FxHashMap::default(),
             pending_window_creation_route: None,
             runtime,
+            terminal_runtime,
             runtime_tracker,
             pending_restart: FxHashMap::default(),
             keyboard_manager: KeyboardManager::new(settings.clone()),
@@ -289,21 +313,27 @@ impl WinitWindowWrapper {
         ))));
 
         let route_id = RouteId::next();
-        let runtime = self.runtime.as_mut().expect("Neovim runtime has not been initialized");
-
-        let neovim_handler = match runtime.launch(
+        let terminal_runtime =
+            self.terminal_runtime.as_mut().expect("terminal runtime has not been initialized");
+        let initial_grid_size = desired_grid_size.unwrap_or(DEFAULT_GRID_SIZE);
+        let neovim_handler = start_editor_handler(
             route_id,
             proxy.clone(),
-            desired_grid_size,
             self.runtime_tracker.clone(),
             self.settings.clone(),
-            &config,
+            self.clipboard.clone(),
+        );
+        let terminal_handle = match terminal_runtime.launch(
+            route_id,
+            proxy.clone(),
+            self.runtime_tracker.clone(),
+            PtySize::new(initial_grid_size.width as u16, initial_grid_size.height as u16),
             None,
-            OpenMode::Startup,
+            None,
         ) {
-            Ok(handler) => handler,
+            Ok(handle) => handle,
             Err(err) => {
-                let msg = format!("Failed to launch neovim runtime: {err:?}");
+                let msg = format!("Failed to launch terminal runtime: {err:?}");
                 log::error!("{msg}");
                 self.report_startup_error(proxy, msg);
                 return;
@@ -316,8 +346,10 @@ impl WinitWindowWrapper {
                 route_id,
                 renderer,
                 neovim_handler,
+                terminal_handle: Some(terminal_handle),
+                terminal_input: TerminalInputSettings::default(),
                 cwd: None,
-                title: String::from("Neovide"),
+                title: String::from("Termvide"),
                 mouse_enabled: true,
                 pending_initial_window_size,
                 last_synced_grid_size: None,
@@ -339,6 +371,9 @@ impl WinitWindowWrapper {
     pub fn exit(&mut self) {
         for route in self.routes.values_mut() {
             route.state.vsync = None;
+        }
+        if let Some(runtime) = self.terminal_runtime.as_mut() {
+            runtime.shutdown_timeout(std::time::Duration::from_millis(500));
         }
     }
 
@@ -447,6 +482,11 @@ impl WinitWindowWrapper {
                     mouse_manager.enabled = mouse_enabled;
                 }
             }
+            WindowCommand::TerminalInputChanged(input) => {
+                if let Some(route) = self.routes.get_mut(&target_window_id) {
+                    route.state.terminal_input = input;
+                }
+            }
             WindowCommand::ListAvailableFonts => self.send_font_names(target_window_id),
             WindowCommand::FocusWindow => {
                 if let Some(route) = &self.routes.get(&target_window_id) {
@@ -553,6 +593,9 @@ impl WinitWindowWrapper {
             }
             WindowCommand::ThemeChanged(new_theme) => {
                 route_core.inferred_theme = new_theme;
+            }
+            WindowCommand::TerminalInputChanged(input) => {
+                route_core.terminal_input = input;
             }
             WindowCommand::ListAvailableFonts => {
                 let renderer = route_core.renderer.borrow();
@@ -762,8 +805,12 @@ impl WinitWindowWrapper {
             return;
         };
         let renderer = route.window.renderer.borrow();
-        let neovim_handler = &route.window.neovim_handler;
         let font_names = renderer.font_names();
+        if route.window.terminal_handle.is_some() {
+            log::info!("Available fonts: {:?}", font_names);
+            return;
+        }
+        let neovim_handler = &route.window.neovim_handler;
         send_ui(ParallelCommand::DisplayAvailableFonts(font_names), neovim_handler);
     }
 
@@ -771,6 +818,12 @@ impl WinitWindowWrapper {
         let Some(route) = self.routes.get(&window_id) else {
             return;
         };
+        if let Some(terminal_handle) = route.window.terminal_handle.clone() {
+            if let Some(runtime) = self.terminal_runtime.as_ref() {
+                runtime.shutdown_process(terminal_handle);
+            }
+            return;
+        }
         let neovim_handler = &route.window.neovim_handler;
         send_ui(ParallelCommand::Quit, neovim_handler);
     }
@@ -779,6 +832,14 @@ impl WinitWindowWrapper {
         let Some(route) = self.routes.get(&window_id) else {
             return;
         };
+        if let Some(terminal_handle) = route.window.terminal_handle.clone() {
+            if route.state.terminal_input.focus_reporting {
+                if let Some(runtime) = self.terminal_runtime.as_ref() {
+                    runtime.write(terminal_handle, encode_focus_report(false).to_vec());
+                }
+            }
+            return;
+        }
         let neovim_handler = &route.window.neovim_handler;
         send_ui(ParallelCommand::FocusLost, neovim_handler);
     }
@@ -789,15 +850,23 @@ impl WinitWindowWrapper {
                 return;
             };
             set_active_route_handler(route.route_id);
-            let neovim_handler = &route.window.neovim_handler;
-            send_ui(ParallelCommand::FocusGained, neovim_handler);
-            // Got focus back after being minimized previously
-            if route.state.is_minimized {
-                // Sending <NOP> after suspend triggers the `VimResume` AutoCmd
-                send_ui(SerialCommand::Keyboard("<NOP>".into()), neovim_handler);
+            if let Some(terminal_handle) = route.window.terminal_handle.clone() {
+                if route.state.terminal_input.focus_reporting {
+                    if let Some(runtime) = self.terminal_runtime.as_ref() {
+                        runtime.write(terminal_handle, encode_focus_report(true).to_vec());
+                    }
+                }
+            } else {
+                let neovim_handler = &route.window.neovim_handler;
+                send_ui(ParallelCommand::FocusGained, neovim_handler);
+                // Got focus back after being minimized previously
+                if route.state.is_minimized {
+                    // Sending <NOP> after suspend triggers the `VimResume` AutoCmd
+                    send_ui(SerialCommand::Keyboard("<NOP>".into()), neovim_handler);
 
-                if let Some(route) = self.routes.get_mut(&window_id) {
-                    route.state.is_minimized = false;
+                    if let Some(route) = self.routes.get_mut(&window_id) {
+                        route.state.is_minimized = false;
+                    }
                 }
             }
         }
@@ -813,6 +882,8 @@ impl WinitWindowWrapper {
     ) -> Option<OverlayEvent> {
         let route = self.routes.get_mut(&window_id)?;
         let neovim_handler = &route.window.neovim_handler;
+        let terminal_handle = route.window.terminal_handle.clone();
+        let terminal_input = route.state.terminal_input;
 
         #[cfg(target_os = "macos")]
         let mut consumed_key_event = false;
@@ -842,33 +913,61 @@ impl WinitWindowWrapper {
             }
         }
 
-        let mouse_result = {
+        let overlay_event = {
             let mut mouse_manager = route.window.mouse_manager.borrow_mut();
             let window = route.window.winit_window.clone();
             let renderer = route.window.renderer.borrow();
-            mouse_manager.handle_event(
-                event,
-                &self.keyboard_manager,
-                &renderer,
-                &window,
-                neovim_handler,
-            )
+            if let Some(terminal_handle) = terminal_handle.clone() {
+                let result = mouse_manager.handle_terminal_event(
+                    event,
+                    &self.keyboard_manager,
+                    &renderer,
+                    &window,
+                    terminal_input,
+                );
+                if let Some(runtime) = self.terminal_runtime.as_ref() {
+                    for bytes in result.bytes {
+                        runtime.write(terminal_handle.clone(), bytes);
+                    }
+                }
+                result.overlay_event
+            } else {
+                mouse_manager
+                    .handle_event(event, &self.keyboard_manager, &renderer, &window, neovim_handler)
+                    .overlay_event
+            }
         };
 
         #[cfg(target_os = "macos")]
         if !consumed_key_event {
-            self.keyboard_manager.handle_event(event, neovim_handler);
+            if let Some(terminal_handle) = terminal_handle.clone() {
+                if let Some(bytes) = self.keyboard_manager.handle_terminal_event(event) {
+                    if let Some(runtime) = self.terminal_runtime.as_ref() {
+                        runtime.write(terminal_handle, bytes);
+                    }
+                }
+            } else {
+                self.keyboard_manager.handle_event(event, neovim_handler);
+            }
         }
 
         #[cfg(not(target_os = "macos"))]
-        self.keyboard_manager.handle_event(event, neovim_handler);
+        if let Some(terminal_handle) = terminal_handle {
+            if let Some(bytes) = self.keyboard_manager.handle_terminal_event(event) {
+                if let Some(runtime) = self.terminal_runtime.as_ref() {
+                    runtime.write(terminal_handle, bytes);
+                }
+            }
+        } else {
+            self.keyboard_manager.handle_event(event, neovim_handler);
+        }
 
         {
             let mut renderer = route.window.renderer.borrow_mut();
             renderer.handle_event(event);
         }
 
-        Some(mouse_result.overlay_event)
+        Some(overlay_event)
     }
 
     pub fn handle_window_event(&mut self, window_id: WindowId, event: WindowEvent) -> bool {
@@ -1410,7 +1509,7 @@ impl WinitWindowWrapper {
         event_loop: &ActiveEventLoop,
         proxy: &EventLoopProxy<EventPayload>,
         cwd: Option<&Path>,
-        args: Option<OpenArgs>,
+        _args: Option<OpenArgs>,
     ) {
         let creating_initial_window = self.routes.is_empty();
         let route_id = if creating_initial_window {
@@ -1461,14 +1560,15 @@ impl WinitWindowWrapper {
         };
         let theme = self.get_theme_for(initial_inferred_theme);
         let maximized = matches!(desired_window_size, WindowSize::Maximized);
-        let window_config = create_window(event_loop, maximized, "Neovide", &self.settings, theme);
+        let window_config = create_window(event_loop, maximized, "Termvide", &self.settings, theme);
         let window = Rc::new(window_config.window.clone());
-        let mut route_title = String::from("Neovide");
+        let mut route_title = String::from("Termvide");
         let mut route_last_synced_grid_size = None;
         let mut route_inferred_theme = None;
         let mut route_mouse_enabled = true;
         let mut should_apply_initial_window_size = false;
         let mut route_font_changed_last_frame = false;
+        let mut route_terminal_input = TerminalInputSettings::default();
 
         let WindowSettings {
             input_ime,
@@ -1490,58 +1590,70 @@ impl WinitWindowWrapper {
             ..
         } = self.settings.get::<WindowSettings>();
 
-        let (renderer, neovim_handler, route_pending_initial_window_size, route_cwd) =
-            if creating_initial_window {
-                let Some(route_core) = self.route_cores.remove(&route_id) else {
-                    log::warn!("Missing pending route core for initial route {route_id:?}");
-                    return;
-                };
-                debug_assert_eq!(route_core.route_id, route_id);
-                route_title = route_core.title;
-                route_last_synced_grid_size = route_core.last_synced_grid_size;
-                route_inferred_theme = route_core.inferred_theme;
-                route_mouse_enabled = route_core.mouse_enabled;
-                should_apply_initial_window_size = route_core.should_show_observed;
-                route_font_changed_last_frame = route_core.font_changed_last_frame;
-                (
-                    route_core.renderer,
-                    route_core.neovim_handler,
-                    route_core.pending_initial_window_size,
-                    route_core.cwd,
-                )
-            } else {
-                let config = Config::init();
-                let renderer = Rc::new(RefCell::new(Box::new(Renderer::new(
-                    1.0,
-                    config.clone(),
-                    self.settings.clone(),
-                ))));
-
-                let runtime =
-                    self.runtime.as_mut().expect("Neovim runtime has not been initialized");
-                let neovim_handler = match runtime.launch(
-                    route_id,
-                    proxy.clone(),
-                    desired_grid_size,
-                    self.runtime_tracker.clone(),
-                    self.settings.clone(),
-                    &config,
-                    cwd,
-                    args.map_or(OpenMode::None, OpenMode::Args),
-                ) {
-                    Ok(handler) => handler,
-                    Err(err) => {
-                        let msg = format!("Failed to launch neovim runtime: {err:?}");
-                        log::error!("{msg}");
-                        let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError {
-                            message: msg,
-                        }));
-                        return;
-                    }
-                };
-
-                (renderer, neovim_handler, None, cwd.map(Path::to_path_buf))
+        let (
+            renderer,
+            neovim_handler,
+            terminal_handle,
+            route_pending_initial_window_size,
+            route_cwd,
+        ) = if creating_initial_window {
+            let Some(route_core) = self.route_cores.remove(&route_id) else {
+                log::warn!("Missing pending route core for initial route {route_id:?}");
+                return;
             };
+            debug_assert_eq!(route_core.route_id, route_id);
+            route_title = route_core.title;
+            route_last_synced_grid_size = route_core.last_synced_grid_size;
+            route_inferred_theme = route_core.inferred_theme;
+            route_mouse_enabled = route_core.mouse_enabled;
+            should_apply_initial_window_size = route_core.should_show_observed;
+            route_font_changed_last_frame = route_core.font_changed_last_frame;
+            route_terminal_input = route_core.terminal_input;
+            (
+                route_core.renderer,
+                route_core.neovim_handler,
+                route_core.terminal_handle,
+                route_core.pending_initial_window_size,
+                route_core.cwd,
+            )
+        } else {
+            let config = Config::init();
+            let renderer = Rc::new(RefCell::new(Box::new(Renderer::new(
+                1.0,
+                config.clone(),
+                self.settings.clone(),
+            ))));
+            let initial_grid_size = desired_grid_size.unwrap_or(DEFAULT_GRID_SIZE);
+            let terminal_runtime =
+                self.terminal_runtime.as_mut().expect("terminal runtime has not been initialized");
+            let neovim_handler = start_editor_handler(
+                route_id,
+                proxy.clone(),
+                self.runtime_tracker.clone(),
+                self.settings.clone(),
+                self.clipboard.clone(),
+            );
+            let terminal_handle = match terminal_runtime.launch(
+                route_id,
+                proxy.clone(),
+                self.runtime_tracker.clone(),
+                PtySize::new(initial_grid_size.width as u16, initial_grid_size.height as u16),
+                None,
+                cwd.map(Path::to_path_buf),
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let msg = format!("Failed to launch terminal runtime: {err:?}");
+                    log::error!("{msg}");
+                    let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError {
+                        message: msg,
+                    }));
+                    return;
+                }
+            };
+
+            (renderer, neovim_handler, Some(terminal_handle), None, cwd.map(Path::to_path_buf))
+        };
 
         window.set_ime_allowed(input_ime);
 
@@ -1707,6 +1819,7 @@ impl WinitWindowWrapper {
         state.vsync = Some(vsync);
         state.inferred_theme = route_inferred_theme;
         state.font_changed_last_frame = route_font_changed_last_frame;
+        state.terminal_input = route_terminal_input;
         let route = Route {
             route_id,
             window: RouteWindow {
@@ -1714,6 +1827,7 @@ impl WinitWindowWrapper {
                 skia_renderer: skia_renderer.clone(),
                 winit_window: window.clone(),
                 neovim_handler,
+                terminal_handle,
                 mouse_manager: Rc::new(RefCell::new(Box::new(mouse_manager))),
                 #[cfg(target_os = "macos")]
                 macos_feature: Some(Rc::new(RefCell::new(Box::new(macos_feature)))),
@@ -2527,13 +2641,14 @@ impl WinitWindowWrapper {
     }
 
     fn update_grid_size_from_window(&mut self, window_id: WindowId) {
-        let (grid_scale, neovim_handler, last_synced, saved_inner_size) =
+        let (grid_scale, neovim_handler, terminal_handle, last_synced, saved_inner_size) =
             match self.routes.get(&window_id) {
                 Some(route) => {
                     let renderer = route.window.renderer.borrow();
                     (
                         renderer.grid_renderer.grid_scale,
                         route.window.neovim_handler.clone(),
+                        route.window.terminal_handle.clone(),
                         route.window.last_synced_grid_size,
                         route.state.saved_inner_size,
                     )
@@ -2557,13 +2672,22 @@ impl WinitWindowWrapper {
             saved_inner_size
         );
 
-        send_ui(
-            ParallelCommand::Resize {
-                width: grid_size.width.into(),
-                height: grid_size.height.into(),
-            },
-            &neovim_handler,
-        );
+        if let Some(terminal_handle) = terminal_handle {
+            if let Some(runtime) = self.terminal_runtime.as_ref() {
+                runtime.resize(
+                    terminal_handle,
+                    PtySize::new(grid_size.width as u16, grid_size.height as u16),
+                );
+            }
+        } else {
+            send_ui(
+                ParallelCommand::Resize {
+                    width: grid_size.width.into(),
+                    height: grid_size.height.into(),
+                },
+                &neovim_handler,
+            );
+        }
 
         if let Some(route_mut) = self.routes.get_mut(&window_id) {
             route_mut.window.last_synced_grid_size = Some(grid_size);

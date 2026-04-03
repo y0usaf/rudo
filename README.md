@@ -1,15 +1,13 @@
-# Neovide
+# Termvide
 
 [![Discord](https://img.shields.io/discord/896132176091955261?style=flat&logo=discord)](https://discord.gg/SjFpZdQys6) [![Chat on Matrix](https://matrix.to/img/matrix-badge.svg)](https://matrix.to/#/#neovide:matrix.org) [![Discussions](https://img.shields.io/badge/GitHub-Discussions-green?logo=github)](https://github.com/neovide/neovide/discussions)
 
 <img align="left" src="website/docs/assets/neovide-128x128.png">
 
-This is a simple graphical user interface for [Neovim](https://github.com/neovim/neovim) (an
-aggressively refactored and updated Vim editor). Where possible there are some graphical
-improvements, but functionally it should act like the terminal UI.
+Termvide is a GPU-accelerated terminal emulator forked from [Neovide](https://github.com/neovide/neovide).
+It reuses Neovide's rendering stack while replacing the Neovim bridge with a PTY-backed terminal core.
 
-To checkout all the **cool features**, **installation instructions**, **configuration settings** and
-much more, head on over to [neovide.dev](https://neovide.dev).
+For now this repository is focused on making the fork usable as a daily-driver terminal emulator.
 
 <br>
 
