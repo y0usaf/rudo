@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::editor::Style;
+use crate::terminal::style::TerminalStyle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellWidth {
@@ -13,7 +13,7 @@ pub enum CellWidth {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalCell {
     pub text: String,
-    pub style: Option<Arc<Style>>,
+    pub style: Option<Arc<TerminalStyle>>,
     pub width: CellWidth,
 }
 
@@ -24,19 +24,23 @@ impl Default for TerminalCell {
 }
 
 impl TerminalCell {
-    pub fn blank(style: Option<Arc<Style>>) -> Self {
+    pub fn blank(style: Option<Arc<TerminalStyle>>) -> Self {
         Self { text: " ".to_string(), style, width: CellWidth::Single }
     }
 
-    pub fn continuation(style: Option<Arc<Style>>) -> Self {
+    pub fn continuation(style: Option<Arc<TerminalStyle>>) -> Self {
         Self { text: String::new(), style, width: CellWidth::Continuation }
     }
 
-    pub fn zero_width(text: impl Into<String>, style: Option<Arc<Style>>) -> Self {
+    pub fn zero_width(text: impl Into<String>, style: Option<Arc<TerminalStyle>>) -> Self {
         Self { text: text.into(), style, width: CellWidth::Zero }
     }
 
-    pub fn occupied(text: impl Into<String>, style: Option<Arc<Style>>, width: CellWidth) -> Self {
+    pub fn occupied(
+        text: impl Into<String>,
+        style: Option<Arc<TerminalStyle>>,
+        width: CellWidth,
+    ) -> Self {
         Self { text: text.into(), style, width }
     }
 

@@ -41,7 +41,6 @@ impl KeyboardManager {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub fn current_modifiers(&self) -> Modifiers {
         self.modifiers
     }

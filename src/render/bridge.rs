@@ -1,19 +1,20 @@
 use std::sync::Arc;
 
-use skia_safe::Color4f;
-
 use crate::{
     bridge::EditorMode,
-    editor::{Colors, Cursor, Style, WindowType, line_from_cells},
+    editor::{Cursor, Style, WindowType, line_from_cells},
     renderer::{DrawCommand, WindowDrawCommand},
-    terminal::{cell::CellWidth, state::TerminalState},
+    terminal::{
+        cell::CellWidth,
+        state::{TerminalDamage, TerminalState},
+        theme::TerminalTheme,
+    },
 };
 
 const PRIMARY_GRID_ID: u64 = 1;
 
 pub struct TerminalRenderBridge {
     grid_id: u64,
-    default_style: Style,
 }
 
 impl Default for TerminalRenderBridge {
@@ -24,18 +25,26 @@ impl Default for TerminalRenderBridge {
 
 impl TerminalRenderBridge {
     pub fn new(grid_id: u64) -> Self {
-        Self { grid_id, default_style: Style::new(default_colors()) }
+        Self { grid_id }
     }
 
-    pub fn with_default_style(grid_id: u64, default_style: Style) -> Self {
-        Self { grid_id, default_style }
+    pub fn with_theme(_theme: TerminalTheme) -> Self {
+        Self::new(PRIMARY_GRID_ID)
+    }
+
+    pub fn with_theme_for_grid(grid_id: u64, _theme: TerminalTheme) -> Self {
+        Self::new(grid_id)
+    }
+
+    pub fn with_default_style(grid_id: u64, _default_style: Style) -> Self {
+        Self::new(grid_id)
     }
 
     pub fn full_draw_commands(&self, state: &TerminalState) -> Vec<DrawCommand> {
         let screen = state.screen();
         let mut commands = Vec::with_capacity(screen.rows() + 6);
 
-        commands.push(DrawCommand::DefaultStyleChanged(self.default_style.clone()));
+        commands.push(DrawCommand::DefaultStyleChanged(Style::new(default_colors(state.theme()))));
         commands.push(DrawCommand::ModeChanged(EditorMode::Unknown("terminal".to_string())));
         commands.push(DrawCommand::Window {
             grid_id: self.grid_id,
@@ -48,21 +57,7 @@ impl TerminalRenderBridge {
         });
         commands
             .push(DrawCommand::Window { grid_id: self.grid_id, command: WindowDrawCommand::Clear });
-
-        for row in (0..screen.rows()).rev() {
-            let row_cells = (0..screen.cols())
-                .map(|col| {
-                    let cell = screen.get(col, row).cloned().unwrap_or_default();
-                    (cell.text, cell.style)
-                })
-                .collect::<Vec<_>>();
-            let line = line_from_cells(&row_cells);
-            commands.push(DrawCommand::Window {
-                grid_id: self.grid_id,
-                command: WindowDrawCommand::DrawLine { row, line },
-            });
-        }
-
+        self.push_row_draw_commands(&mut commands, state, (0..screen.rows()).rev());
         commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state)));
         commands
             .push(DrawCommand::Window { grid_id: self.grid_id, command: WindowDrawCommand::Show });
@@ -70,11 +65,44 @@ impl TerminalRenderBridge {
         commands
     }
 
+    pub fn draw_commands(&self, state: &TerminalState, damage: TerminalDamage) -> Vec<DrawCommand> {
+        match damage {
+            TerminalDamage::Full => self.full_draw_commands(state),
+            TerminalDamage::None => vec![DrawCommand::UpdateCursor(self.cursor_from_state(state))],
+            TerminalDamage::Rows(rows) => {
+                let mut commands = Vec::with_capacity(rows.len() + 1);
+                self.push_row_draw_commands(&mut commands, state, rows.into_iter().rev());
+                commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state)));
+                commands
+            }
+        }
+    }
+
+    fn push_row_draw_commands<I>(
+        &self,
+        commands: &mut Vec<DrawCommand>,
+        state: &TerminalState,
+        rows: I,
+    ) where
+        I: IntoIterator<Item = usize>,
+    {
+        let screen = state.screen();
+        for row in rows {
+            commands.push(DrawCommand::Window {
+                grid_id: self.grid_id,
+                command: WindowDrawCommand::DrawLine {
+                    row,
+                    line: line_for_row(screen, row, state.theme()),
+                },
+            });
+        }
+    }
+
     fn cursor_from_state(&self, state: &TerminalState) -> Cursor {
         let screen = state.screen();
         let terminal_cursor = state.cursor();
         let (text, style, double_width) =
-            cursor_cell(screen, terminal_cursor.column, terminal_cursor.row);
+            cursor_cell(screen, terminal_cursor.column, terminal_cursor.row, state.theme());
 
         Cursor {
             grid_position: (terminal_cursor.column as u64, terminal_cursor.row as u64),
@@ -92,31 +120,47 @@ impl TerminalRenderBridge {
     }
 }
 
+fn line_for_row(
+    screen: &crate::terminal::screen::TerminalScreen,
+    row: usize,
+    theme: &TerminalTheme,
+) -> crate::editor::Line {
+    let cells = screen.row(row).expect("row draw requested for valid terminal row");
+
+    let row_cells = cells
+        .iter()
+        .map(|cell| {
+            let style = cell.style.as_ref().map(|style| style.resolve(theme));
+            (cell.text.clone(), style)
+        })
+        .collect::<Vec<_>>();
+    line_from_cells(&row_cells)
+}
+
 fn cursor_cell(
     screen: &crate::terminal::screen::TerminalScreen,
     col: usize,
     row: usize,
+    theme: &TerminalTheme,
 ) -> (String, Option<Arc<Style>>, bool) {
-    let Some(cell) = screen.get(col, row).cloned() else {
+    let Some(cell) = screen.get(col, row) else {
         return (" ".to_string(), None, false);
     };
 
     match cell.width {
         CellWidth::Continuation if col > 0 => {
-            let left = screen.get(col - 1, row).cloned().unwrap_or(cell);
-            (left.text, left.style, true)
+            let left = screen.get(col - 1, row).unwrap_or(cell);
+            (left.text.clone(), left.style.as_ref().map(|style| style.resolve(theme)), true)
         }
-        CellWidth::Double => (cell.text, cell.style, true),
-        _ => (cell.text, cell.style, false),
+        CellWidth::Double => {
+            (cell.text.clone(), cell.style.as_ref().map(|style| style.resolve(theme)), true)
+        }
+        _ => (cell.text.clone(), cell.style.as_ref().map(|style| style.resolve(theme)), false),
     }
 }
 
-fn default_colors() -> Colors {
-    Colors {
-        foreground: Some(Color4f::new(0.9, 0.9, 0.9, 1.0)),
-        background: Some(Color4f::new(0.05, 0.05, 0.05, 1.0)),
-        special: Some(Color4f::new(0.9, 0.9, 0.9, 1.0)),
-    }
+fn default_colors(theme: &TerminalTheme) -> crate::editor::Colors {
+    theme.default_colors()
 }
 
 #[cfg(test)]
@@ -124,7 +168,10 @@ mod tests {
     use super::TerminalRenderBridge;
     use crate::{
         renderer::{DrawCommand, WindowDrawCommand},
-        terminal::{parser::TerminalParser, state::TerminalState},
+        terminal::{
+            parser::TerminalParser,
+            state::{TerminalDamage, TerminalState},
+        },
     };
 
     #[test]
@@ -161,5 +208,27 @@ mod tests {
         let commands = bridge.full_draw_commands(&state);
 
         assert!(commands.iter().any(|command| matches!(command, DrawCommand::UpdateCursor(cursor) if cursor.double_width && cursor.grid_cell.0 == "好")));
+    }
+
+    #[test]
+    fn row_damage_only_redraws_changed_rows() {
+        let bridge = TerminalRenderBridge::default();
+        let mut parser = TerminalParser::new();
+        let mut state = TerminalState::new(4, 2);
+        parser.advance(&mut state, b"ab\r\ncd");
+
+        let commands = bridge.draw_commands(&state, TerminalDamage::Rows(vec![1]));
+
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    DrawCommand::Window { command: WindowDrawCommand::DrawLine { .. }, .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(commands.iter().any(|command| matches!(command, DrawCommand::UpdateCursor(_))));
     }
 }

@@ -8,7 +8,10 @@ use crate::{
     },
     render::bridge::TerminalRenderBridge,
     running_tracker::RunningTracker,
-    terminal::{input::TerminalInputSettings, parser::TerminalParser, state::TerminalState},
+    terminal::{
+        input::TerminalInputSettings, parser::TerminalParser, state::TerminalState,
+        theme::TerminalTheme,
+    },
     window::{EventPayload, RouteId, UserEvent, WindowCommand},
 };
 
@@ -27,10 +30,11 @@ pub struct TerminalFrame {
 
 impl TerminalSessionCore {
     pub fn new(cols: usize, rows: usize) -> Self {
+        let theme = TerminalTheme::load();
         Self {
             parser: TerminalParser::new(),
-            state: TerminalState::new(cols, rows),
-            render_bridge: TerminalRenderBridge::default(),
+            state: TerminalState::with_theme(cols, rows, theme.clone()),
+            render_bridge: TerminalRenderBridge::with_theme(theme),
         }
     }
 
@@ -40,8 +44,9 @@ impl TerminalSessionCore {
 
     pub fn apply_bytes(&mut self, bytes: &[u8]) -> TerminalFrame {
         self.parser.advance(&mut self.state, bytes);
+        let damage = self.state.take_damage();
         TerminalFrame {
-            commands: self.render_bridge.full_draw_commands(&self.state),
+            commands: self.render_bridge.draw_commands(&self.state, damage),
             responses: self.state.take_pending_responses(),
         }
     }
@@ -90,7 +95,7 @@ where
 {
     tokio::spawn(async move {
         let mut session = TerminalSessionCore::new(cols, rows);
-        let mut last_title = session.state().snapshot().title;
+        let mut last_title = session.state().title().map(str::to_owned);
         let mut last_input = session.state().input_settings();
         emit_terminal_input(&proxy, route_id, last_input);
         emit_draw_commands(&proxy, route_id, session.bootstrap_draw_commands());
@@ -106,21 +111,22 @@ where
                 process.write(&response).await?;
             }
             let commands = frame.commands;
-            let snapshot = session.state().snapshot();
-            if snapshot.input != last_input {
-                emit_terminal_input(&proxy, route_id, snapshot.input);
-                last_input = snapshot.input;
+            let input = session.state().input_settings();
+            if input != last_input {
+                emit_terminal_input(&proxy, route_id, input);
+                last_input = input;
             }
-            if snapshot.title != last_title {
-                if let Some(title) = snapshot.title.clone() {
+            let title = session.state().title();
+            if title != last_title.as_deref() {
+                if let Some(title) = title {
                     proxy
                         .send_event(EventPayload::for_route(
-                            UserEvent::WindowCommand(WindowCommand::TitleChanged(title)),
+                            UserEvent::WindowCommand(WindowCommand::TitleChanged(title.to_owned())),
                             route_id,
                         ))
                         .ok();
                 }
-                last_title = snapshot.title;
+                last_title = title.map(str::to_owned);
             }
             emit_draw_commands(&proxy, route_id, commands);
         }
@@ -183,7 +189,19 @@ mod tests {
         let frame = session.apply_bytes(b"ab\r\ncd");
 
         assert!(!bootstrap.is_empty());
-        assert!(frame.commands.len() >= 6);
+        assert!(frame.commands.iter().any(|command| matches!(
+            command,
+            crate::renderer::DrawCommand::Window {
+                command: crate::renderer::WindowDrawCommand::DrawLine { .. },
+                ..
+            }
+        )));
+        assert!(
+            frame
+                .commands
+                .iter()
+                .any(|command| matches!(command, crate::renderer::DrawCommand::UpdateCursor(_)))
+        );
         assert!(frame.responses.is_empty());
         assert_eq!(session.state().screen().row_text(0).trim(), "ab");
         assert_eq!(session.state().screen().row_text(1).trim(), "cd");

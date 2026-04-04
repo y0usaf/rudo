@@ -123,59 +123,41 @@ pub struct NativePtyProcess {
 #[async_trait]
 impl PtyProcess for NativePtyProcess {
     async fn resize(&mut self, size: PtySize) -> Result<()> {
-        let master = self.master.clone();
-        task::spawn_blocking(move || master.lock().resize(size.into()))
-            .await
-            .context("PTY resize task join failed")?
-            .context("PTY resize failed")
+        task::block_in_place(|| self.master.lock().resize(size.into())).context("PTY resize failed")
     }
 
     async fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>> {
-        let reader = self.reader.clone();
-        task::spawn_blocking(move || {
+        task::block_in_place(|| {
             let mut buffer = vec![0; max_bytes.max(1)];
-            let bytes_read = reader.lock().read(&mut buffer)?;
+            let bytes_read = self.reader.lock().read(&mut buffer)?;
             buffer.truncate(bytes_read);
             Ok::<_, std::io::Error>(buffer)
         })
-        .await
-        .context("PTY read task join failed")?
         .context("PTY read failed")
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        let writer = self.writer.clone();
-        let bytes = bytes.to_vec();
-        task::spawn_blocking(move || {
-            let mut writer = writer.lock();
-            writer.write_all(&bytes)?;
+        task::block_in_place(|| {
+            let mut writer = self.writer.lock();
+            writer.write_all(bytes)?;
             writer.flush()
         })
-        .await
-        .context("PTY write task join failed")?
         .context("PTY write failed")
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        let child = self.child.clone();
-        task::spawn_blocking(move || child.lock().kill())
-            .await
-            .context("PTY shutdown task join failed")?
-            .context("PTY child termination failed")
+        task::block_in_place(|| self.child.lock().kill()).context("PTY child termination failed")
     }
 
     async fn wait(&mut self) -> Result<PtyExitStatus> {
-        let child = self.child.clone();
-        task::spawn_blocking(move || {
-            let status = child.lock().wait()?;
+        task::block_in_place(|| {
+            let status = self.child.lock().wait()?;
             Ok::<_, std::io::Error>(PtyExitStatus {
                 success: status.success(),
                 code: status.exit_code(),
                 signal: status.signal().map(str::to_string),
             })
         })
-        .await
-        .context("PTY wait task join failed")?
         .context("PTY wait failed")
     }
 

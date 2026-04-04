@@ -3,12 +3,14 @@ use std::{collections::VecDeque, sync::Arc};
 use skia_safe::Color4f;
 use unicode_width::UnicodeWidthChar;
 
-use crate::editor::{Colors, CursorShape, Style, UnderlineStyle};
+use crate::editor::{CursorShape, UnderlineStyle};
 use crate::terminal::{
     cell::{CellWidth, TerminalCell},
     cursor::TerminalCursor,
     input::{TerminalInputSettings, TerminalMouseMode},
     screen::TerminalScreen,
+    style::{TerminalColor, TerminalColors, TerminalStyle},
+    theme::{TerminalTheme, to_osc_rgb_spec},
 };
 
 const DEFAULT_SCROLLBACK_LIMIT: usize = 10_000;
@@ -17,6 +19,7 @@ const DEFAULT_SCROLLBACK_LIMIT: usize = 10_000;
 pub enum TerminalDamage {
     None,
     Full,
+    Rows(Vec<usize>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,9 +33,9 @@ pub struct TerminalSnapshot {
     pub input: TerminalInputSettings,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TerminalPen {
-    pub colors: Colors,
+    pub colors: TerminalColors,
     pub reverse: bool,
     pub italic: bool,
     pub bold: bool,
@@ -40,34 +43,18 @@ pub struct TerminalPen {
     pub underline: Option<UnderlineStyle>,
 }
 
-impl Default for TerminalPen {
-    fn default() -> Self {
-        Self {
-            colors: Colors { foreground: None, background: None, special: None },
-            reverse: false,
-            italic: false,
-            bold: false,
-            strikethrough: false,
-            underline: None,
-        }
-    }
-}
-
 impl TerminalPen {
-    pub fn to_style(&self) -> Option<Arc<Style>> {
-        if self == &Self::default() {
-            None
-        } else {
-            Some(Arc::new(Style {
-                colors: self.colors.clone(),
-                reverse: self.reverse,
-                italic: self.italic,
-                bold: self.bold,
-                strikethrough: self.strikethrough,
-                blend: 0,
-                underline: self.underline,
-            }))
-        }
+    pub fn to_style(&self) -> Option<Arc<TerminalStyle>> {
+        let style = TerminalStyle {
+            colors: self.colors.clone(),
+            reverse: self.reverse,
+            italic: self.italic,
+            bold: self.bold,
+            strikethrough: self.strikethrough,
+            underline: self.underline,
+        };
+
+        if style.is_default() { None } else { Some(Arc::new(style)) }
     }
 
     pub fn reset(&mut self) {
@@ -91,10 +78,16 @@ pub struct TerminalState {
     pending_responses: Vec<Vec<u8>>,
     scroll_region_top: usize,
     scroll_region_bottom: usize,
+    base_theme: TerminalTheme,
+    theme: TerminalTheme,
 }
 
 impl TerminalState {
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_theme(cols, rows, TerminalTheme::default())
+    }
+
+    pub fn with_theme(cols: usize, rows: usize, theme: TerminalTheme) -> Self {
         Self {
             primary_screen: TerminalScreen::new(cols, rows),
             alternate_screen: TerminalScreen::new(cols, rows),
@@ -111,6 +104,8 @@ impl TerminalState {
             pending_responses: Vec::new(),
             scroll_region_top: 0,
             scroll_region_bottom: rows.max(1),
+            base_theme: theme.clone(),
+            theme,
         }
     }
 
@@ -158,12 +153,84 @@ impl TerminalState {
         self.input
     }
 
+    pub fn theme(&self) -> &TerminalTheme {
+        &self.theme
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn set_palette_color(&mut self, index: u8, color: Color4f) {
+        self.theme.set_palette_color(index, color);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn reset_palette_color(&mut self, index: u8) {
+        self.theme.set_palette_color(index, self.base_theme.palette_color(index));
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn reset_palette(&mut self) {
+        for index in 0u8..=255 {
+            self.theme.set_palette_color(index, self.base_theme.palette_color(index));
+        }
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn set_default_foreground(&mut self, color: Color4f) {
+        self.theme.set_foreground(color);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn reset_default_foreground(&mut self) {
+        self.theme.set_foreground(self.base_theme.foreground);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn set_default_background(&mut self, color: Color4f) {
+        self.theme.set_background(color);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn reset_default_background(&mut self) {
+        self.theme.set_background(self.base_theme.background);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn set_cursor_color(&mut self, color: Color4f) {
+        self.theme.set_cursor(color);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn reset_cursor_color(&mut self) {
+        self.theme.set_cursor(self.base_theme.cursor);
+        self.damage = TerminalDamage::Full;
+    }
+
+    pub fn queue_osc_color_response(&mut self, code: &str, color: Color4f) {
+        self.pending_responses
+            .push(format!("\x1b]{code};{}\x1b\\", to_osc_rgb_spec(color)).into_bytes());
+    }
+
+    pub fn queue_osc_palette_response(&mut self, index: u8, color: Color4f) {
+        self.pending_responses
+            .push(format!("\x1b]4;{index};{}\x1b\\", to_osc_rgb_spec(color)).into_bytes());
+    }
+
     pub fn take_pending_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_responses)
     }
 
     pub fn take_damage(&mut self) -> TerminalDamage {
-        std::mem::replace(&mut self.damage, TerminalDamage::None)
+        match std::mem::replace(&mut self.damage, TerminalDamage::None) {
+            TerminalDamage::Rows(mut rows) => {
+                rows.sort_unstable();
+                rows.dedup();
+                if rows.is_empty() { TerminalDamage::None } else { TerminalDamage::Rows(rows) }
+            }
+            damage => damage,
+        }
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -199,7 +266,7 @@ impl TerminalState {
         }
 
         self.cursor.column = (self.cursor.column + width).min(self.cols().saturating_sub(1));
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn carriage_return(&mut self) {
@@ -217,7 +284,6 @@ impl TerminalState {
     pub fn restore_cursor_position(&mut self) {
         if let Some(saved) = self.saved_cursor_position.clone() {
             self.cursor = saved;
-            self.damage = TerminalDamage::Full;
         }
     }
 
@@ -225,14 +291,12 @@ impl TerminalState {
         let count = count.max(1);
         self.cursor.row = (self.cursor.row + count).min(self.rows().saturating_sub(1));
         self.cursor.column = 0;
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn previous_line(&mut self, count: usize) {
         let count = count.max(1);
         self.cursor.row = self.cursor.row.saturating_sub(count);
         self.cursor.column = 0;
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn linefeed(&mut self) {
@@ -253,6 +317,7 @@ impl TerminalState {
                     self.scrollback.pop_front();
                 }
             }
+            self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
         } else if self.cursor.row + 1 >= self.rows() {
             let removed = self.screen_mut().scroll_up(1);
             if !self.using_alternate_screen {
@@ -263,10 +328,10 @@ impl TerminalState {
                     self.scrollback.pop_front();
                 }
             }
+            self.mark_rows_dirty(0..self.rows());
         } else {
             self.cursor.row += 1;
         }
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn reverse_index(&mut self) {
@@ -274,10 +339,10 @@ impl TerminalState {
         let scroll_region_bottom = self.scroll_region_bottom;
         if self.cursor.row == scroll_region_top {
             self.screen_mut().scroll_down_in_region(scroll_region_top, scroll_region_bottom, 1);
+            self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
         } else {
             self.cursor.row = self.cursor.row.saturating_sub(1);
         }
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn tab(&mut self) {
@@ -288,17 +353,14 @@ impl TerminalState {
     pub fn set_cursor_position(&mut self, row: usize, col: usize) {
         self.cursor.row = row.min(self.rows().saturating_sub(1));
         self.cursor.column = col.min(self.cols().saturating_sub(1));
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn set_cursor_column(&mut self, col: usize) {
         self.cursor.column = col.min(self.cols().saturating_sub(1));
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn set_cursor_row(&mut self, row: usize) {
         self.cursor.row = row.min(self.rows().saturating_sub(1));
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
@@ -320,7 +382,6 @@ impl TerminalState {
             self.cursor.column.saturating_add_signed(cols).min(self.cols().saturating_sub(1));
         self.cursor.row = new_row;
         self.cursor.column = new_col;
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn clear_screen(&mut self) {
@@ -332,77 +393,81 @@ impl TerminalState {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().clear_from_cursor(col, row);
-        self.damage = TerminalDamage::Full;
+        self.mark_rows_dirty(row..self.rows());
     }
 
     pub fn clear_to_cursor(&mut self) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().clear_to_cursor(col, row);
-        self.damage = TerminalDamage::Full;
+        self.mark_rows_dirty(0..row.saturating_add(1));
     }
 
     pub fn clear_line(&mut self) {
         let row = self.cursor.row;
         self.screen_mut().clear_line(row);
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn clear_line_from_cursor(&mut self) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().clear_line_from(row, col);
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn clear_line_to_cursor(&mut self) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().clear_line_to(row, col);
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn erase_chars(&mut self, count: usize) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().erase_chars(row, col, count.max(1));
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn delete_chars(&mut self, count: usize) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().delete_chars(row, col, count.max(1));
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn insert_blank_chars(&mut self, count: usize) {
         let row = self.cursor.row;
         let col = self.cursor.column;
         self.screen_mut().insert_blank_chars(row, col, count.max(1));
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 
     pub fn insert_lines(&mut self, count: usize) {
         let row = self.cursor.row;
         let scroll_region_bottom = self.scroll_region_bottom;
-        if row >= self.scroll_region_top && row < scroll_region_bottom {
+        let dirty_end = if row >= self.scroll_region_top && row < scroll_region_bottom {
             self.screen_mut().insert_lines_in_region(row, scroll_region_bottom, count.max(1));
+            scroll_region_bottom
         } else {
             self.screen_mut().insert_lines(row, count.max(1));
-        }
-        self.damage = TerminalDamage::Full;
+            self.rows()
+        };
+        self.mark_rows_dirty(row..dirty_end);
     }
 
     pub fn delete_lines(&mut self, count: usize) {
         let row = self.cursor.row;
         let scroll_region_bottom = self.scroll_region_bottom;
-        if row >= self.scroll_region_top && row < scroll_region_bottom {
+        let dirty_end = if row >= self.scroll_region_top && row < scroll_region_bottom {
             self.screen_mut().delete_lines_in_region(row, scroll_region_bottom, count.max(1));
+            scroll_region_bottom
         } else {
             self.screen_mut().delete_lines(row, count.max(1));
-        }
-        self.damage = TerminalDamage::Full;
+            self.rows()
+        };
+        self.mark_rows_dirty(row..dirty_end);
     }
 
     pub fn scroll_up_lines(&mut self, count: usize) {
@@ -424,7 +489,7 @@ impl TerminalState {
                 self.scrollback.pop_front();
             }
         }
-        self.damage = TerminalDamage::Full;
+        self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
     }
 
     pub fn scroll_down_lines(&mut self, count: usize) {
@@ -435,22 +500,19 @@ impl TerminalState {
             scroll_region_bottom,
             count.max(1),
         );
-        self.damage = TerminalDamage::Full;
+        self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
     }
 
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = Some(title.into());
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor.visible = visible;
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn set_cursor_shape(&mut self, shape: CursorShape) {
         self.cursor.shape = shape;
-        self.damage = TerminalDamage::Full;
     }
 
     pub fn enter_alternate_screen(&mut self) {
@@ -478,6 +540,14 @@ impl TerminalState {
     }
 
     pub fn set_sgr(&mut self, params: &[i64]) {
+        self.set_sgr_iter(params.iter().copied());
+    }
+
+    pub(crate) fn set_sgr_iter<I>(&mut self, params: I)
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let params = params.into_iter().collect::<Vec<_>>();
         if params.is_empty() {
             self.pen.reset();
             return;
@@ -498,18 +568,22 @@ impl TerminalState {
                 27 => self.pen.reverse = false,
                 29 => self.pen.strikethrough = false,
                 30..=37 => {
-                    self.pen.colors.foreground = Some(ansi_color((params[index] - 30) as u8, false))
+                    self.pen.colors.foreground =
+                        Some(TerminalColor::Palette((params[index] - 30) as u8))
                 }
                 39 => self.pen.colors.foreground = None,
                 40..=47 => {
-                    self.pen.colors.background = Some(ansi_color((params[index] - 40) as u8, false))
+                    self.pen.colors.background =
+                        Some(TerminalColor::Palette((params[index] - 40) as u8))
                 }
                 49 => self.pen.colors.background = None,
                 90..=97 => {
-                    self.pen.colors.foreground = Some(ansi_color((params[index] - 90) as u8, true))
+                    self.pen.colors.foreground =
+                        Some(TerminalColor::Palette((params[index] - 90 + 8) as u8))
                 }
                 100..=107 => {
-                    self.pen.colors.background = Some(ansi_color((params[index] - 100) as u8, true))
+                    self.pen.colors.background =
+                        Some(TerminalColor::Palette((params[index] - 100 + 8) as u8))
                 }
                 38 | 48 => {
                     if let Some((color, consumed)) = parse_extended_color(&params[index + 1..]) {
@@ -584,6 +658,31 @@ impl TerminalState {
         }
     }
 
+    fn mark_row_dirty(&mut self, row: usize) {
+        self.mark_rows_dirty(row..row.saturating_add(1));
+    }
+
+    fn mark_rows_dirty(&mut self, rows: std::ops::Range<usize>) {
+        if rows.start >= rows.end {
+            return;
+        }
+
+        let rows_end = rows.end.min(self.rows());
+        if rows.start >= rows_end {
+            return;
+        }
+
+        match &mut self.damage {
+            TerminalDamage::Full => {}
+            TerminalDamage::None => {
+                self.damage = TerminalDamage::Rows((rows.start..rows_end).collect());
+            }
+            TerminalDamage::Rows(existing_rows) => {
+                existing_rows.extend(rows.start..rows_end);
+            }
+        }
+    }
+
     fn wrap_if_needed(&mut self, width: usize) {
         if self.cursor.column + width > self.cols() {
             self.carriage_return();
@@ -597,62 +696,15 @@ impl TerminalState {
         if let Some(cell) = self.screen_mut().get_mut(target_col, row) {
             cell.text.push(ch);
         }
-        self.damage = TerminalDamage::Full;
+        self.mark_row_dirty(row);
     }
 }
 
-fn parse_extended_color(params: &[i64]) -> Option<(Color4f, usize)> {
+fn parse_extended_color(params: &[i64]) -> Option<(TerminalColor, usize)> {
     match params {
-        [5, index, ..] => Some((palette_color(*index as u8), 2)),
-        [2, r, g, b, ..] => Some((rgb(*r as u8, *g as u8, *b as u8), 4)),
+        [5, index, ..] => Some((TerminalColor::Palette(*index as u8), 2)),
+        [2, r, g, b, ..] => Some((TerminalColor::Rgb(rgb(*r as u8, *g as u8, *b as u8)), 4)),
         _ => None,
-    }
-}
-
-fn ansi_color(index: u8, bright: bool) -> Color4f {
-    let palette = if bright {
-        [
-            rgb(128, 128, 128),
-            rgb(255, 85, 85),
-            rgb(80, 250, 123),
-            rgb(241, 250, 140),
-            rgb(189, 147, 249),
-            rgb(255, 121, 198),
-            rgb(139, 233, 253),
-            rgb(255, 255, 255),
-        ]
-    } else {
-        [
-            rgb(0, 0, 0),
-            rgb(205, 49, 49),
-            rgb(13, 188, 121),
-            rgb(229, 229, 16),
-            rgb(36, 114, 200),
-            rgb(188, 63, 188),
-            rgb(17, 168, 205),
-            rgb(229, 229, 229),
-        ]
-    };
-
-    palette[index as usize % palette.len()]
-}
-
-fn palette_color(index: u8) -> Color4f {
-    match index {
-        0..=7 => ansi_color(index, false),
-        8..=15 => ansi_color(index - 8, true),
-        16..=231 => {
-            let index = index - 16;
-            let r = index / 36;
-            let g = (index % 36) / 6;
-            let b = index % 6;
-            let component = |value: u8| if value == 0 { 0 } else { value * 40 + 55 };
-            rgb(component(r), component(g), component(b))
-        }
-        232..=255 => {
-            let gray = 8 + (index - 232) * 10;
-            rgb(gray, gray, gray)
-        }
     }
 }
 
@@ -663,6 +715,7 @@ fn rgb(r: u8, g: u8, b: u8) -> Color4f {
 #[cfg(test)]
 mod tests {
     use super::TerminalState;
+    use crate::terminal::style::TerminalColor;
 
     #[test]
     fn linefeed_pushes_primary_screen_into_scrollback() {
@@ -699,9 +752,13 @@ mod tests {
         let mut state = TerminalState::new(2, 2);
         state.set_sgr(&[38, 2, 10, 20, 30]);
 
-        let color = state.pen().colors.foreground.unwrap();
-        assert!(color.r > 0.03 && color.r < 0.05);
-        assert!(color.g > 0.07 && color.g < 0.09);
-        assert!(color.b > 0.11 && color.b < 0.13);
+        match state.pen().colors.foreground.as_ref().unwrap() {
+            TerminalColor::Rgb(color) => {
+                assert!(color.r > 0.03 && color.r < 0.05);
+                assert!(color.g > 0.07 && color.g < 0.09);
+                assert!(color.b > 0.11 && color.b < 0.13);
+            }
+            color => panic!("expected rgb color, got {color:?}"),
+        }
     }
 }

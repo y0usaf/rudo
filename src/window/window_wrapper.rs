@@ -11,8 +11,9 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use rustc_hash::FxHashMap;
 use winit::{
     dpi,
-    event::{Ime, WindowEvent},
+    event::{ElementState, Ime, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoopProxy},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Cursor, Fullscreen, Theme, Window, WindowId},
 };
 
@@ -828,6 +829,32 @@ impl WinitWindowWrapper {
         send_ui(ParallelCommand::Quit, neovim_handler);
     }
 
+    fn is_terminal_quit_shortcut(&self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. } = event else {
+            return false;
+        };
+
+        if key_event.state != ElementState::Pressed {
+            return false;
+        }
+
+        if !matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::KeyQ)) {
+            return false;
+        }
+
+        let modifiers = self.keyboard_manager.current_modifiers().state();
+
+        #[cfg(target_os = "macos")]
+        {
+            modifiers.super_key() && !modifiers.control_key()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            modifiers.alt_key() && !modifiers.control_key() && !modifiers.super_key()
+        }
+    }
+
     pub fn handle_focus_lost(&mut self, window_id: WindowId) {
         let Some(route) = self.routes.get(&window_id) else {
             return;
@@ -880,6 +907,12 @@ impl WinitWindowWrapper {
         window_id: WindowId,
         event: &WindowEvent,
     ) -> Option<OverlayEvent> {
+        let is_terminal_route = self.routes.get(&window_id)?.window.terminal_handle.is_some();
+        if is_terminal_route && self.is_terminal_quit_shortcut(event) {
+            self.handle_quit(window_id);
+            return Some(OverlayEvent::default());
+        }
+
         let route = self.routes.get_mut(&window_id)?;
         let neovim_handler = &route.window.neovim_handler;
         let terminal_handle = route.window.terminal_handle.clone();
@@ -926,8 +959,8 @@ impl WinitWindowWrapper {
                     terminal_input,
                 );
                 if let Some(runtime) = self.terminal_runtime.as_ref() {
-                    for bytes in result.bytes {
-                        runtime.write(terminal_handle.clone(), bytes);
+                    if !result.bytes.is_empty() {
+                        runtime.write(terminal_handle.clone(), result.bytes);
                     }
                 }
                 result.overlay_event

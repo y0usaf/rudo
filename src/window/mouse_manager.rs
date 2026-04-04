@@ -74,7 +74,7 @@ pub struct MouseEventResult {
 
 pub struct TerminalMouseEventResult {
     pub overlay_event: OverlayEvent,
-    pub bytes: Vec<Vec<u8>>,
+    pub bytes: Vec<u8>,
 }
 
 pub struct EditorState<'a> {
@@ -691,12 +691,12 @@ impl MouseManager {
                             self.grid_position.x,
                             self.grid_position.y,
                         ) {
-                            bytes.push(encoded);
+                            bytes.extend(encoded);
                         }
                     } else if let Some(encoded) =
                         encode_mouse_move(input, self.grid_position.x, self.grid_position.y)
                     {
-                        bytes.push(encoded);
+                        bytes.extend(encoded);
                     }
                 }
                 if self.mouse_hidden && window.has_focus() {
@@ -720,7 +720,7 @@ impl MouseManager {
                         if let Some(encoded) =
                             encode_mouse_scroll(input, *y > 0.0, position.x, position.y)
                         {
-                            bytes.push(encoded);
+                            bytes.extend(encoded);
                         }
                     }
                 }
@@ -732,7 +732,7 @@ impl MouseManager {
                         if let Some(encoded) =
                             encode_mouse_scroll(input, delta.y > 0.0, position.x, position.y)
                         {
-                            bytes.push(encoded);
+                            bytes.extend(encoded);
                         }
                     }
                 }
@@ -745,7 +745,7 @@ impl MouseManager {
                         if let Some(encoded) =
                             encode_mouse_press(input, *button, position.x, position.y)
                         {
-                            bytes.push(encoded);
+                            bytes.extend(encoded);
                         }
                         self.drag_details =
                             Some(DragDetails { button: *button, draw_details: details.clone() });
@@ -753,7 +753,7 @@ impl MouseManager {
                         if let Some(encoded) =
                             encode_mouse_release(input, *button, position.x, position.y)
                         {
-                            bytes.push(encoded);
+                            bytes.extend(encoded);
                         }
                         self.drag_details = None;
                     }
