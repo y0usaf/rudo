@@ -7,7 +7,7 @@ use winit::event_loop::EventLoopProxy;
 use crate::{
     pty::{
         NativePtyProcess, NativePtySystem, PtySize, PtySpawnConfig, PtySystem,
-        platform_default_shell,
+        platform_default_shell, terminal_environment,
     },
     running_tracker::RunningTracker,
     terminal::session::spawn_pty_listener,
@@ -50,7 +50,7 @@ impl TerminalRuntime {
             shell: Some(shell),
             args: Vec::new(),
             cwd,
-            env: Vec::new(),
+            env: terminal_environment(),
             size,
         })?;
 

@@ -95,6 +95,14 @@ pub fn platform_default_shell(configured_shell: Option<&str>) -> OsString {
     platform_default_shell_impl()
 }
 
+pub fn terminal_environment() -> Vec<(OsString, OsString)> {
+    vec![
+        (OsString::from("TERM"), OsString::from("xterm-256color")),
+        (OsString::from("COLORTERM"), OsString::from("truecolor")),
+        (OsString::from("TERM_PROGRAM"), OsString::from("termvide")),
+    ]
+}
+
 #[cfg(unix)]
 fn platform_default_shell_impl() -> OsString {
     unix::platform_default_shell_impl()
@@ -216,6 +224,14 @@ mod tests {
     #[test]
     fn default_shell_never_returns_empty() {
         assert!(!platform_default_shell(None).is_empty());
+    }
+
+    #[test]
+    fn terminal_environment_sets_expected_term() {
+        let env = terminal_environment();
+        assert!(env.iter().any(|(key, value)| {
+            key == &OsString::from("TERM") && value == &OsString::from("xterm-256color")
+        }));
     }
 
     #[cfg(unix)]

@@ -5,6 +5,7 @@ use winit::event_loop::EventLoopProxy;
 use crate::{
     pty::{
         NativePtySystem, PtyProcess, PtySize, PtySpawnConfig, PtySystem, platform_default_shell,
+        terminal_environment,
     },
     render::bridge::TerminalRenderBridge,
     running_tracker::RunningTracker,
@@ -159,7 +160,7 @@ pub fn spawn_native_terminal_listener(
         shell: Some(shell),
         args: Vec::new(),
         cwd,
-        env: Vec::new(),
+        env: terminal_environment(),
         size,
     })?;
 
