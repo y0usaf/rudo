@@ -41,13 +41,8 @@ use {
 
 use crate::{
     CmdLineSettings,
-    bridge::{
-        NeovimHandler, NeovimRuntime, OpenArgs, ParallelCommand, RestartDetails, SerialCommand,
-        send_ui, set_active_route_handler, unregister_route_handler,
-    },
     clipboard::ClipboardHandle,
     cmd_line::{GeometryArgs, MouseCursorIcon},
-    editor::start_editor_handler,
     profiling::{tracy_frame, tracy_gpu_collect, tracy_gpu_zone, tracy_plot, tracy_zone},
     pty::PtySize,
     renderer::{
@@ -61,6 +56,7 @@ use crate::{
         load_last_window_settings,
     },
     terminal::{
+        ClipboardRequest, ClipboardRequestKind, ClipboardSelection,
         input::{TerminalInputSettings, encode_focus_report},
         runtime::{TerminalHandle, TerminalRuntime},
     },
@@ -79,12 +75,131 @@ use {
 
 const GRID_TOLERANCE: f32 = 1e-3;
 
+fn clipboard_register(selection: ClipboardSelection) -> &'static str {
+    match selection {
+        ClipboardSelection::Clipboard => "+",
+        #[cfg(target_os = "linux")]
+        ClipboardSelection::Primary => "*",
+        #[cfg(not(target_os = "linux"))]
+        ClipboardSelection::Primary => "+",
+        _ => "+",
+    }
+}
+
+fn encode_osc52_reply(selection: ClipboardSelection, content: &str) -> Vec<u8> {
+    let selection_code = match selection {
+        ClipboardSelection::Clipboard => 'c',
+        ClipboardSelection::Primary => 'p',
+        ClipboardSelection::Secondary => 'q',
+        ClipboardSelection::Select => 's',
+        ClipboardSelection::Cut0 => '0',
+        ClipboardSelection::Cut1 => '1',
+        ClipboardSelection::Cut2 => '2',
+        ClipboardSelection::Cut3 => '3',
+        ClipboardSelection::Cut4 => '4',
+        ClipboardSelection::Cut5 => '5',
+        ClipboardSelection::Cut6 => '6',
+        ClipboardSelection::Cut7 => '7',
+    };
+    let encoded = encode_base64(content.as_bytes());
+    format!("\x1b]52;{selection_code};{encoded}\x1b\\").into_bytes()
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = u32::from(b0) << 16 | u32::from(b1) << 8 | u32::from(b2);
+
+        output.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        output.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        output.push(if chunk.len() > 2 { TABLE[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    output
+}
+
 fn round_or_op<Op: FnOnce(f32) -> f32>(v: f32, op: Op) -> f32 {
     let rounded = v.round();
     if v.abs_diff_eq(&rounded, GRID_TOLERANCE) { rounded } else { op(v) }
 }
 
+fn pty_size_with_pixels(grid_size: GridSize<u32>, pixel_size: PixelSize<u32>) -> PtySize {
+    PtySize {
+        cols: grid_size.width.min(u16::MAX as u32) as u16,
+        rows: grid_size.height.min(u16::MAX as u32) as u16,
+        pixel_width: pixel_size.width.min(u16::MAX as u32) as u16,
+        pixel_height: pixel_size.height.min(u16::MAX as u32) as u16,
+    }
+}
+
 use approx::AbsDiffEq;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NeovimHandler;
+
+#[derive(Debug, Default)]
+pub(crate) struct NeovimRuntime;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenArgs;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RestartDetails;
+
+#[derive(Clone, Debug)]
+enum ParallelCommand {
+    DisplayAvailableFonts(Vec<String>),
+    Quit,
+    FocusLost,
+    FocusGained,
+    FileDrop { path: String, tabs: Option<()> },
+    Resize { width: u64, height: u64 },
+}
+
+#[derive(Clone, Debug)]
+enum SerialCommand {
+    Keyboard(String),
+}
+
+fn send_ui<T>(_command: T, _handler: &NeovimHandler) {}
+fn set_active_route_handler(_route_id: RouteId) {}
+fn unregister_route_handler(_route_id: RouteId) {}
+
+fn start_editor_handler(
+    _route_id: RouteId,
+    _event_loop_proxy: EventLoopProxy<EventPayload>,
+    _running_tracker: RunningTracker,
+    _settings: Arc<Settings>,
+    _clipboard: ClipboardHandle,
+) -> NeovimHandler {
+    NeovimHandler
+}
+
+impl NeovimRuntime {
+    fn new(_clipboard: ClipboardHandle) -> Result<Self, &'static str> {
+        Ok(Self)
+    }
+
+    pub fn shutdown(&self, _timeout: std::time::Duration) {}
+
+    fn restart(
+        &mut self,
+        _route_id: RouteId,
+        _proxy: EventLoopProxy<EventPayload>,
+        _handler: NeovimHandler,
+        _grid_size: GridSize<u32>,
+        _settings: Arc<Settings>,
+        _details: RestartDetails,
+        _cwd: Option<&Path>,
+    ) -> Result<(), &'static str> {
+        Err("terminal-only build does not support Neovim restarts")
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct WindowPadding {
@@ -283,7 +398,7 @@ impl WinitWindowWrapper {
 
     fn report_startup_error(&self, proxy: &EventLoopProxy<EventPayload>, message: String) {
         self.runtime_tracker.quit_with_code(1, &message);
-        let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError { message }));
+        let _ = proxy.send_event(EventPayload::all(UserEvent::ProcessLaunchError { message }));
     }
 
     pub fn request_window_creation(&mut self, proxy: &EventLoopProxy<EventPayload>) {
@@ -328,7 +443,7 @@ impl WinitWindowWrapper {
             route_id,
             proxy.clone(),
             self.runtime_tracker.clone(),
-            PtySize::new(initial_grid_size.width as u16, initial_grid_size.height as u16),
+            pty_size_with_pixels(initial_grid_size, PixelSize::default()),
             None,
             None,
         ) {
@@ -488,6 +603,15 @@ impl WinitWindowWrapper {
                     route.state.terminal_input = input;
                 }
             }
+            WindowCommand::ClipboardSet(request) => {
+                self.apply_clipboard_request(request);
+            }
+            WindowCommand::ClipboardQuery(selection) => {
+                self.reply_to_clipboard_query(target_window_id, selection);
+            }
+            WindowCommand::OpenHyperlink(uri) => {
+                self.open_hyperlink(&uri);
+            }
             WindowCommand::ListAvailableFonts => self.send_font_names(target_window_id),
             WindowCommand::FocusWindow => {
                 if let Some(route) = &self.routes.get(&target_window_id) {
@@ -597,6 +721,17 @@ impl WinitWindowWrapper {
             }
             WindowCommand::TerminalInputChanged(input) => {
                 route_core.terminal_input = input;
+            }
+            WindowCommand::ClipboardSet(request) => {
+                self.apply_clipboard_request(request);
+            }
+            WindowCommand::ClipboardQuery(selection) => {
+                if let Some(window_id) = self.window_id_for_route(route_id) {
+                    self.reply_to_clipboard_query(window_id, selection);
+                }
+            }
+            WindowCommand::OpenHyperlink(uri) => {
+                self.open_hyperlink(&uri);
             }
             WindowCommand::ListAvailableFonts => {
                 let renderer = route_core.renderer.borrow();
@@ -946,6 +1081,7 @@ impl WinitWindowWrapper {
             }
         }
 
+        let mut hyperlink_to_open = None;
         let overlay_event = {
             let mut mouse_manager = route.window.mouse_manager.borrow_mut();
             let window = route.window.winit_window.clone();
@@ -958,6 +1094,7 @@ impl WinitWindowWrapper {
                     &window,
                     terminal_input,
                 );
+                hyperlink_to_open = result.open_hyperlink;
                 if let Some(runtime) = self.terminal_runtime.as_ref() {
                     if !result.bytes.is_empty() {
                         runtime.write(terminal_handle.clone(), result.bytes);
@@ -965,16 +1102,16 @@ impl WinitWindowWrapper {
                 }
                 result.overlay_event
             } else {
-                mouse_manager
-                    .handle_event(event, &self.keyboard_manager, &renderer, &window, neovim_handler)
-                    .overlay_event
+                OverlayEvent::default()
             }
         };
 
         #[cfg(target_os = "macos")]
         if !consumed_key_event {
             if let Some(terminal_handle) = terminal_handle.clone() {
-                if let Some(bytes) = self.keyboard_manager.handle_terminal_event(event) {
+                if let Some(bytes) =
+                    self.keyboard_manager.handle_terminal_event(event, terminal_input)
+                {
                     if let Some(runtime) = self.terminal_runtime.as_ref() {
                         runtime.write(terminal_handle, bytes);
                     }
@@ -986,7 +1123,8 @@ impl WinitWindowWrapper {
 
         #[cfg(not(target_os = "macos"))]
         if let Some(terminal_handle) = terminal_handle {
-            if let Some(bytes) = self.keyboard_manager.handle_terminal_event(event) {
+            if let Some(bytes) = self.keyboard_manager.handle_terminal_event(event, terminal_input)
+            {
                 if let Some(runtime) = self.terminal_runtime.as_ref() {
                     runtime.write(terminal_handle, bytes);
                 }
@@ -998,6 +1136,10 @@ impl WinitWindowWrapper {
         {
             let mut renderer = route.window.renderer.borrow_mut();
             renderer.handle_event(event);
+        }
+
+        if let Some(uri) = hyperlink_to_open {
+            self.open_hyperlink(&uri);
         }
 
         Some(overlay_event)
@@ -1213,6 +1355,54 @@ impl WinitWindowWrapper {
                 true
             }
         }
+    }
+
+    fn apply_clipboard_request(&self, request: ClipboardRequest) {
+        let register = clipboard_register(request.selection);
+
+        if let ClipboardRequestKind::Set(content) = request.kind {
+            if let Some(clipboard) = self.clipboard.upgrade() {
+                if let Ok(mut clipboard) = clipboard.lock() {
+                    let _ = clipboard.set_contents(content, register);
+                }
+            }
+        }
+    }
+
+    fn reply_to_clipboard_query(&self, window_id: WindowId, selection: ClipboardSelection) {
+        let Some(route) = self.routes.get(&window_id) else {
+            return;
+        };
+        let Some(terminal_handle) = route.window.terminal_handle.clone() else {
+            return;
+        };
+        let Some(runtime) = self.terminal_runtime.as_ref() else {
+            return;
+        };
+
+        let register = clipboard_register(selection);
+        let content = if let Some(clipboard) = self.clipboard.upgrade() {
+            if let Ok(mut clipboard) = clipboard.lock() {
+                clipboard.get_contents(register).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        runtime.write(terminal_handle, encode_osc52_reply(selection, &content));
+    }
+
+    fn open_hyperlink(&self, uri: &str) {
+        #[cfg(target_os = "windows")]
+        let command = ("cmd", vec!["/C", "start", "", uri]);
+        #[cfg(target_os = "macos")]
+        let command = ("open", vec![uri]);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let command = ("xdg-open", vec![uri]);
+
+        let _ = std::process::Command::new(command.0).args(command.1).spawn();
     }
 
     fn copy_message_selection(&self, window_id: WindowId, selection: MessageSelection) {
@@ -1670,7 +1860,7 @@ impl WinitWindowWrapper {
                 route_id,
                 proxy.clone(),
                 self.runtime_tracker.clone(),
-                PtySize::new(initial_grid_size.width as u16, initial_grid_size.height as u16),
+                pty_size_with_pixels(initial_grid_size, PixelSize::default()),
                 None,
                 cwd.map(Path::to_path_buf),
             ) {
@@ -1678,7 +1868,7 @@ impl WinitWindowWrapper {
                 Err(err) => {
                     let msg = format!("Failed to launch terminal runtime: {err:?}");
                     log::error!("{msg}");
-                    let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError {
+                    let _ = proxy.send_event(EventPayload::all(UserEvent::ProcessLaunchError {
                         message: msg,
                     }));
                     return;
@@ -2085,6 +2275,14 @@ impl WinitWindowWrapper {
         if self.routes.is_empty() {
             self.ui_state = UIState::Initing;
         }
+    }
+
+    pub fn handle_process_exit_route(
+        &mut self,
+        route_id: RouteId,
+        proxy: &EventLoopProxy<EventPayload>,
+    ) {
+        self.handle_neovim_exit_route(route_id, proxy);
     }
 
     pub fn handle_neovim_exit_route(
@@ -2707,9 +2905,20 @@ impl WinitWindowWrapper {
 
         if let Some(terminal_handle) = terminal_handle {
             if let Some(runtime) = self.terminal_runtime.as_ref() {
+                // Forward the drawable content area in pixels so PTY backends that support
+                // pixel-aware resizing can propagate the actual terminal surface dimensions.
                 runtime.resize(
                     terminal_handle,
-                    PtySize::new(grid_size.width as u16, grid_size.height as u16),
+                    pty_size_with_pixels(
+                        grid_size,
+                        self.get_content_pixel_rect_from_window(window_id)
+                            .size()
+                            .try_cast()
+                            .unwrap_or(PixelSize::new(
+                                saved_inner_size.width,
+                                saved_inner_size.height,
+                            )),
+                    ),
                 );
             }
         } else {

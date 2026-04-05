@@ -1,4 +1,4 @@
-use rmpv::Value;
+use serde_json::Value;
 
 use crate::{error_msg, settings::*};
 
@@ -12,7 +12,7 @@ pub enum OptionAsMeta {
 
 impl ParseFromValue for OptionAsMeta {
     fn parse_from_value(&mut self, value: Value) {
-        if value.is_str() {
+        if value.is_string() {
             *self = match value.as_str().unwrap() {
                 "only_left" => OptionAsMeta::OnlyLeft,
                 "only_right" => OptionAsMeta::OnlyRight,

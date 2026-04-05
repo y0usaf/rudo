@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    bridge::{NeovimHandler, SerialCommand, send_ui},
     settings::Settings,
+    terminal::input::{KittyKeyboardFlags, TerminalInputSettings},
 };
 
 #[allow(unused_imports)]
@@ -45,7 +45,7 @@ impl KeyboardManager {
         self.modifiers
     }
 
-    pub fn handle_event(&mut self, event: &WindowEvent, neovim_handler: &NeovimHandler) {
+    pub fn handle_event<T>(&mut self, event: &WindowEvent, _target: &T) {
         match event {
             WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. }
                 if self.ime_preedit.0.is_empty() =>
@@ -55,42 +55,32 @@ impl KeyboardManager {
                     if let Some(text) = self.format_key(key_event) {
                         log::trace!("Key pressed {} {:?}", text, self.modifiers.state());
                         tracy_named_frame!("keyboard input");
-                        send_ui(SerialCommand::Keyboard(text), neovim_handler);
                     }
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 log::trace!("Ime commit {text}");
-                send_ui(
-                    SerialCommand::KeyboardImeCommit {
-                        formatted: self.format_key_text(text, false),
-                        raw: text.to_owned(),
-                    },
-                    neovim_handler,
-                );
+                let _ = self.format_key_text(text, false);
             }
             WindowEvent::Ime(Ime::Preedit(text, cursor_offset)) => {
                 self.ime_preedit = (text.to_string(), *cursor_offset);
-                send_ui(
-                    SerialCommand::KeyboardImePreedit {
-                        raw: text.to_owned(),
-                        cursor_offset: *cursor_offset,
-                    },
-                    neovim_handler,
-                );
             }
             WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(*modifiers),
             _ => {}
         }
     }
 
-    pub fn handle_terminal_event(&mut self, event: &WindowEvent) -> Option<Vec<u8>> {
+    pub fn handle_terminal_event(
+        &mut self,
+        event: &WindowEvent,
+        input: TerminalInputSettings,
+    ) -> Option<Vec<u8>> {
         match event {
             WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. }
                 if self.ime_preedit.0.is_empty() =>
             {
                 if key_event.state == ElementState::Pressed {
-                    self.encode_terminal_key_event(key_event)
+                    self.encode_terminal_key_event(key_event, input)
                 } else {
                     None
                 }
@@ -219,30 +209,39 @@ impl KeyboardManager {
             .map(|text| self.format_key_text(text.as_str(), false))
     }
 
-    fn encode_terminal_key_event(&self, key_event: &KeyEvent) -> Option<Vec<u8>> {
+    fn encode_terminal_key_event(
+        &self,
+        key_event: &KeyEvent,
+        input: TerminalInputSettings,
+    ) -> Option<Vec<u8>> {
         let state = self.modifiers.state();
-        let mut bytes =
-            if let Some(special) = encode_special_terminal_key(key_event, state.shift_key()) {
-                special
-            } else if let Some(text) = key_event
-                .text
-                .as_ref()
-                .or(match &key_event.logical_key {
-                    Key::Character(text) => Some(text),
-                    _ => None,
-                })
-                .filter(|_| !state.super_key())
-            {
-                if state.control_key() {
-                    encode_control_text(text.as_str())?
-                } else {
-                    text.as_bytes().to_vec()
-                }
+        let special = encode_special_terminal_key(key_event, input, state);
+        let special_encoded = special.is_some();
+        let kitty_encoded = encode_kitty_printable_or_ctrl(key_event, state, input);
+        let kitty_used = kitty_encoded.is_some();
+        let mut bytes = if let Some(special) = special {
+            special
+        } else if let Some(kitty) = kitty_encoded {
+            kitty
+        } else if let Some(text) = key_event
+            .text
+            .as_ref()
+            .or(match &key_event.logical_key {
+                Key::Character(text) => Some(text),
+                _ => None,
+            })
+            .filter(|_| !state.super_key())
+        {
+            if state.control_key() {
+                encode_control_text(text.as_str())?
             } else {
-                return None;
-            };
+                text.as_bytes().to_vec()
+            }
+        } else {
+            return None;
+        };
 
-        if self.meta_is_pressed {
+        if self.meta_is_pressed && !special_encoded && !kitty_used {
             let mut prefixed = vec![0x1b];
             prefixed.append(&mut bytes);
             bytes = prefixed;
@@ -252,8 +251,6 @@ impl KeyboardManager {
     }
 
     fn format_key_text(&self, text: &str, is_special: bool) -> String {
-        // Neovim always converts shifted ascii alpha characters to uppercase, so do it here already
-        // This fixes some bugs where winit does not report the uppercase text as it should
         let text = if self.modifiers.state().shift_key() && is_ascii_alphabetic_char(text) {
             text.to_uppercase()
         } else {
@@ -261,8 +258,6 @@ impl KeyboardManager {
         };
 
         let modifiers = self.format_modifier_string(&text, is_special);
-        // < needs to be formatted as a special character, but note that it's not treated as a
-        // special key for the modifier formatting, so S- and -M are still potentially stripped
         let (text, is_special) =
             if text == "<" { ("lt".to_string(), true) } else { (text, is_special) };
         if modifiers.is_empty() {
@@ -273,22 +268,11 @@ impl KeyboardManager {
     }
 
     pub fn format_modifier_string(&self, text: &str, is_special: bool) -> String {
-        // Shift should always be sent together with special keys (Enter, Space, F keys and so on).
-        // And as a special case together with CTRL and standard a-z characters.
-        // In all other cases the resulting character is enough.
-        // Note that, in Neovim <C-a> and <C-A> are the same, but <C-S-A> is different.
-        // Actually, <C-S-a> is the same as <C-S-A>, since Neovim converts all shifted
-        // lowercase alphas to uppercase internally in its mappings.
-        // Also note that mappings that do not include CTRL work differently, they are always
-        // normalized in combination with ascii alphas. For example <M-S-a> is normalized to
-        // uppercase without shift, or <M-A> .
-        // But in combination with other characters, such as <M-S-$> they are not,
-        // so we don't want to send shift when that's the case.
         let state = self.modifiers.state();
         let include_shift = is_special || (state.control_key() && is_ascii_alphabetic_char(text));
 
         #[cfg(target_os = "macos")]
-        let have_meta = self.meta_is_pressed || is_special && state.alt_key(); // e.g. non-meta 'option' with <F1> yeilds <M-F1>
+        let have_meta = self.meta_is_pressed || is_special && state.alt_key();
 
         #[cfg(not(target_os = "macos"))]
         let have_meta = self.meta_is_pressed;
@@ -325,49 +309,365 @@ fn encode_control_text(text: &str) -> Option<Vec<u8>> {
     Some(vec![byte])
 }
 
-fn encode_special_terminal_key(key_event: &KeyEvent, shift: bool) -> Option<Vec<u8>> {
+fn kitty_keyboard_disambiguation_enabled(input: TerminalInputSettings) -> bool {
+    input.kitty_keyboard_flags.bits() & KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES != 0
+}
+
+fn kitty_modifier_param(state: winit::keyboard::ModifiersState) -> Option<u8> {
+    let mut param = 1;
+    if state.shift_key() {
+        param += 1;
+    }
+    if state.alt_key() {
+        param += 2;
+    }
+    if state.control_key() {
+        param += 4;
+    }
+    if state.super_key() {
+        param += 8;
+    }
+    (param > 1).then_some(param)
+}
+
+fn encode_kitty_csi_u(codepoint: u32, modifier_param: Option<u8>) -> Vec<u8> {
+    if let Some(param) = modifier_param {
+        format!("\x1b[{codepoint};{param}u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint}u").into_bytes()
+    }
+}
+
+fn kitty_base_character(key_event: &KeyEvent) -> Option<char> {
+    let text = match &key_event.logical_key {
+        Key::Character(text) => text,
+        _ => return None,
+    };
+
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    (chars.next().is_none()).then_some(ch)
+}
+
+fn encode_kitty_printable_or_ctrl(
+    key_event: &KeyEvent,
+    state: winit::keyboard::ModifiersState,
+    input: TerminalInputSettings,
+) -> Option<Vec<u8>> {
+    if !kitty_keyboard_disambiguation_enabled(input) || state.super_key() {
+        return None;
+    }
+
+    let modifier_param = kitty_modifier_param(state);
+
+    if state.control_key() {
+        let base = kitty_base_character(key_event)?;
+        return match base {
+            'a'..='z' | 'A'..='Z' | '@' | '[' | '\\' | ']' | '^' | '_' | '?' => {
+                Some(encode_kitty_csi_u(base as u32, modifier_param))
+            }
+            _ => None,
+        };
+    }
+
+    if !state.shift_key() && !state.alt_key() {
+        return None;
+    }
+
+    let text = key_event
+        .text
+        .as_ref()
+        .or(match &key_event.logical_key {
+            Key::Character(text) => Some(text),
+            _ => None,
+        })?;
+
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_control() {
+        return None;
+    }
+
+    Some(encode_kitty_csi_u(ch as u32, modifier_param))
+}
+
+fn xterm_modifier_param(state: winit::keyboard::ModifiersState) -> Option<u8> {
+    let mut param = 1;
+    if state.shift_key() {
+        param += 1;
+    }
+    if state.alt_key() {
+        param += 2;
+    }
+    if state.control_key() {
+        param += 4;
+    }
+    (param > 1).then_some(param)
+}
+
+fn encode_xterm_csi_modifier(final_char: char, modifier_param: u8) -> Vec<u8> {
+    format!("\x1b[1;{modifier_param}{final_char}").into_bytes()
+}
+
+fn encode_xterm_ss3(final_char: char) -> Vec<u8> {
+    format!("\x1bO{final_char}").into_bytes()
+}
+
+fn encode_xterm_tilde_modifier(number: u8, modifier_param: u8) -> Vec<u8> {
+    format!("\x1b[{number};{modifier_param}~").into_bytes()
+}
+
+fn encode_xterm_function_modifier(final_char: char, modifier_param: u8) -> Vec<u8> {
+    format!("\x1b[1;{modifier_param}{final_char}").into_bytes()
+}
+
+fn application_keypad_symbol(code: KeyCode) -> Option<char> {
+    match code {
+        KeyCode::NumpadEnter => Some('M'),
+        KeyCode::NumpadDivide => Some('o'),
+        KeyCode::NumpadStar => Some('j'),
+        KeyCode::NumpadSubtract => Some('m'),
+        KeyCode::NumpadAdd => Some('k'),
+        KeyCode::NumpadComma => Some('l'),
+        KeyCode::NumpadDecimal => Some('n'),
+        KeyCode::Numpad0 => Some('p'),
+        KeyCode::Numpad1 => Some('q'),
+        KeyCode::Numpad2 => Some('r'),
+        KeyCode::Numpad3 => Some('s'),
+        KeyCode::Numpad4 => Some('t'),
+        KeyCode::Numpad5 => Some('u'),
+        KeyCode::Numpad6 => Some('v'),
+        KeyCode::Numpad7 => Some('w'),
+        KeyCode::Numpad8 => Some('x'),
+        KeyCode::Numpad9 => Some('y'),
+        _ => None,
+    }
+}
+
+fn encode_application_keypad_symbol(symbol: char, modifier_param: Option<u8>) -> Vec<u8> {
+    if let Some(param) = modifier_param {
+        format!("\x1bO{param}{symbol}").into_bytes()
+    } else {
+        format!("\x1bO{symbol}").into_bytes()
+    }
+}
+
+fn encode_application_keypad_sequence(
+    key_event: &KeyEvent,
+    modifier_param: Option<u8>,
+) -> Option<Vec<u8>> {
+    let PhysicalKey::Code(code) = key_event.physical_key else {
+        return None;
+    };
+
+    application_keypad_symbol(code)
+        .map(|symbol| encode_application_keypad_symbol(symbol, modifier_param))
+}
+
+fn encode_cursor_key(
+    final_char: char,
+    application_cursor: bool,
+    modifier_param: Option<u8>,
+) -> Vec<u8> {
+    if let Some(param) = modifier_param {
+        encode_xterm_csi_modifier(final_char, param)
+    } else if application_cursor {
+        encode_xterm_ss3(final_char)
+    } else {
+        format!("\x1b[{final_char}").into_bytes()
+    }
+}
+
+fn encode_home_key(application_cursor: bool, modifier_param: Option<u8>) -> Vec<u8> {
+    if let Some(param) = modifier_param {
+        encode_xterm_csi_modifier('H', param)
+    } else if application_cursor {
+        encode_xterm_ss3('H')
+    } else {
+        b"\x1b[H".to_vec()
+    }
+}
+
+fn encode_end_key(application_cursor: bool, modifier_param: Option<u8>) -> Vec<u8> {
+    if let Some(param) = modifier_param {
+        encode_xterm_csi_modifier('F', param)
+    } else if application_cursor {
+        encode_xterm_ss3('F')
+    } else {
+        b"\x1b[F".to_vec()
+    }
+}
+
+fn encode_special_terminal_key(
+    key_event: &KeyEvent,
+    input: TerminalInputSettings,
+    state: winit::keyboard::ModifiersState,
+) -> Option<Vec<u8>> {
     if key_event.location == KeyLocation::Numpad {
+        let modifier_param = xterm_modifier_param(state);
+
+        if input.application_keypad {
+            if let Some(sequence) = encode_application_keypad_sequence(key_event, modifier_param) {
+                return Some(sequence);
+            }
+        }
+
         if let Some(text) = key_event.text.as_ref() {
             return Some(text.as_bytes().to_vec());
         }
+
+        let Key::Named(key) = &key_event.logical_key else {
+            return None;
+        };
+
+        return match key {
+            NamedKey::Enter => Some(b"\r".to_vec()),
+            NamedKey::Tab if state.shift_key() => Some(b"\x1b[Z".to_vec()),
+            NamedKey::Tab => Some(b"\t".to_vec()),
+            NamedKey::ArrowUp => {
+                Some(encode_cursor_key('A', input.application_cursor, modifier_param))
+            }
+            NamedKey::ArrowDown => {
+                Some(encode_cursor_key('B', input.application_cursor, modifier_param))
+            }
+            NamedKey::ArrowRight => {
+                Some(encode_cursor_key('C', input.application_cursor, modifier_param))
+            }
+            NamedKey::ArrowLeft => {
+                Some(encode_cursor_key('D', input.application_cursor, modifier_param))
+            }
+            NamedKey::Home => Some(encode_home_key(input.application_cursor, modifier_param)),
+            NamedKey::End => Some(encode_end_key(input.application_cursor, modifier_param)),
+            NamedKey::Insert => Some(if let Some(param) = modifier_param {
+                encode_xterm_tilde_modifier(2, param)
+            } else {
+                b"\x1b[2~".to_vec()
+            }),
+            NamedKey::Delete => Some(if let Some(param) = modifier_param {
+                encode_xterm_tilde_modifier(3, param)
+            } else {
+                b"\x1b[3~".to_vec()
+            }),
+            NamedKey::PageUp => Some(if let Some(param) = modifier_param {
+                encode_xterm_tilde_modifier(5, param)
+            } else {
+                b"\x1b[5~".to_vec()
+            }),
+            NamedKey::PageDown => Some(if let Some(param) = modifier_param {
+                encode_xterm_tilde_modifier(6, param)
+            } else {
+                b"\x1b[6~".to_vec()
+            }),
+            _ => None,
+        };
     }
 
     let Key::Named(key) = &key_event.logical_key else {
         return None;
     };
 
-    let sequence = match key {
-        NamedKey::ArrowUp => "\x1b[A",
-        NamedKey::ArrowDown => "\x1b[B",
-        NamedKey::ArrowRight => "\x1b[C",
-        NamedKey::ArrowLeft => "\x1b[D",
-        NamedKey::Home => "\x1b[H",
-        NamedKey::End => "\x1b[F",
-        NamedKey::Insert => "\x1b[2~",
-        NamedKey::Delete => "\x1b[3~",
-        NamedKey::PageUp => "\x1b[5~",
-        NamedKey::PageDown => "\x1b[6~",
-        NamedKey::Enter => "\r",
-        NamedKey::Tab if shift => "\x1b[Z",
-        NamedKey::Tab => "\t",
-        NamedKey::Escape => "\x1b",
-        NamedKey::Backspace => "\x7f",
-        NamedKey::F1 => "\x1bOP",
-        NamedKey::F2 => "\x1bOQ",
-        NamedKey::F3 => "\x1bOR",
-        NamedKey::F4 => "\x1bOS",
-        NamedKey::F5 => "\x1b[15~",
-        NamedKey::F6 => "\x1b[17~",
-        NamedKey::F7 => "\x1b[18~",
-        NamedKey::F8 => "\x1b[19~",
-        NamedKey::F9 => "\x1b[20~",
-        NamedKey::F10 => "\x1b[21~",
-        NamedKey::F11 => "\x1b[23~",
-        NamedKey::F12 => "\x1b[24~",
-        _ => return None,
-    };
+    let modifier_param = xterm_modifier_param(state);
 
-    Some(sequence.as_bytes().to_vec())
+    match key {
+        NamedKey::ArrowUp => Some(encode_cursor_key('A', input.application_cursor, modifier_param)),
+        NamedKey::ArrowDown => {
+            Some(encode_cursor_key('B', input.application_cursor, modifier_param))
+        }
+        NamedKey::ArrowRight => {
+            Some(encode_cursor_key('C', input.application_cursor, modifier_param))
+        }
+        NamedKey::ArrowLeft => {
+            Some(encode_cursor_key('D', input.application_cursor, modifier_param))
+        }
+        NamedKey::Home => Some(encode_home_key(input.application_cursor, modifier_param)),
+        NamedKey::End => Some(encode_end_key(input.application_cursor, modifier_param)),
+        NamedKey::Insert => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(2, param)
+        } else {
+            b"\x1b[2~".to_vec()
+        }),
+        NamedKey::Delete => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(3, param)
+        } else {
+            b"\x1b[3~".to_vec()
+        }),
+        NamedKey::PageUp => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(5, param)
+        } else {
+            b"\x1b[5~".to_vec()
+        }),
+        NamedKey::PageDown => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(6, param)
+        } else {
+            b"\x1b[6~".to_vec()
+        }),
+        NamedKey::Enter => Some(b"\r".to_vec()),
+        NamedKey::Tab if state.shift_key() => Some(b"\x1b[Z".to_vec()),
+        NamedKey::Tab => Some(b"\t".to_vec()),
+        NamedKey::Escape => Some(b"\x1b".to_vec()),
+        NamedKey::Backspace => Some(b"\x7f".to_vec()),
+        NamedKey::F1 => Some(if let Some(param) = modifier_param {
+            encode_xterm_function_modifier('P', param)
+        } else {
+            b"\x1bOP".to_vec()
+        }),
+        NamedKey::F2 => Some(if let Some(param) = modifier_param {
+            encode_xterm_function_modifier('Q', param)
+        } else {
+            b"\x1bOQ".to_vec()
+        }),
+        NamedKey::F3 => Some(if let Some(param) = modifier_param {
+            encode_xterm_function_modifier('R', param)
+        } else {
+            b"\x1bOR".to_vec()
+        }),
+        NamedKey::F4 => Some(if let Some(param) = modifier_param {
+            encode_xterm_function_modifier('S', param)
+        } else {
+            b"\x1bOS".to_vec()
+        }),
+        NamedKey::F5 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(15, param)
+        } else {
+            b"\x1b[15~".to_vec()
+        }),
+        NamedKey::F6 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(17, param)
+        } else {
+            b"\x1b[17~".to_vec()
+        }),
+        NamedKey::F7 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(18, param)
+        } else {
+            b"\x1b[18~".to_vec()
+        }),
+        NamedKey::F8 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(19, param)
+        } else {
+            b"\x1b[19~".to_vec()
+        }),
+        NamedKey::F9 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(20, param)
+        } else {
+            b"\x1b[20~".to_vec()
+        }),
+        NamedKey::F10 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(21, param)
+        } else {
+            b"\x1b[21~".to_vec()
+        }),
+        NamedKey::F11 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(23, param)
+        } else {
+            b"\x1b[23~".to_vec()
+        }),
+        NamedKey::F12 => Some(if let Some(param) = modifier_param {
+            encode_xterm_tilde_modifier(24, param)
+        } else {
+            b"\x1b[24~".to_vec()
+        }),
+        _ => None,
+    }
 }
 
 fn get_special_key(key_event: &KeyEvent) -> Option<&str> {
@@ -427,8 +727,6 @@ fn get_special_key(key_event: &KeyEvent) -> Option<&str> {
         NamedKey::PageDown => Some("PageDown"),
         NamedKey::PageUp => Some("PageUp"),
         NamedKey::Space => {
-            // Space can finish a dead key sequence, so treat space as a special key only when
-            // that doesn't happen.
             if key_event.text == Some(" ".into()) || key_event.text.is_none() {
                 Some("Space")
             } else {
@@ -440,57 +738,156 @@ fn get_special_key(key_event: &KeyEvent) -> Option<&str> {
     }
 }
 
-// N.B. on 'meta', and on the macintosh key 'option':
-//
-// 'Meta' can be thought of as a virtual key. On a Mac, either or both of
-// the physical keys labeled 'option' (⌥) may be configured to map to the
-// virtual key 'meta' by using the neovide setting:
-//
-//     vim.g.neovide_input_macos_option_key_is_meta
-//
-// ...where possible values are:
-//
-//    "both"
-//    "only_left"
-//    "only_right"
-//    "none"
-//
-// (On a Windows PC, or on non-mac POSIX platforms with a Windows PC keyboard,
-// the physical key labeled 'alt' always maps to the virtual key 'meta'.)
-//
-// When an 'option' key is:
-//
-//     - not mapped to meta, and
-//     - used with a printable character (like "y")
-//
-// ...the option key behaves like a second kind of 'shift' key in the sense that
-// it transforms the printable character into a different printable character;
-// for example, just as shift+y transforms 'y' into 'Y', option+y (on a US english
-// layout) transforms 'y' into '¥' (U+00A5 YEN SIGN), and shift+option+y
-// transforms 'y' into 'Á' (U+00C1 LATIN CAPITAL LETTER A WITH ACUTE). See also:
-//
-// https://en.wikipedia.org/wiki/Option_key
-//
-// And like the 'shift' key, the non-meta 'option' key is not represented in the
-// string returned by format_modifier_string() (because it would be redundant
-// next to the transformed printable character).
-//
-// But when a non-meta 'option' key is used with a special key (see
-// get_special_key() above), we may as well treat it as 'meta' because:
-//
-//    - This is how we behaved before the behavior was documented (so a user
-//      could have had alt_is_meta=false and still have used <M-CR>, <M-F1>,
-//      etc.); and
-//    - There is no secondary layer of special keys.
-//
-// Note on 'option' vs 'alt':
-//
-// On Macintosh keyboards made until 2018, the 'option' key additionally bears
-// the label 'alt'. But from 2018 on, 'alt' no longer appears on this key; it is
-// labeled only with the word 'option' and the symbol '⌥' (U+2325 OPTION KEY).
-//
-// Both before and after 2018, this key has been consistently labeled 'option'
-// (at least as far back as the earliest macintosh that neovide supports). So to
-// avoid confusing users who have a post-2017 keyboard and are not aware of this
-// history, it is probably best to refer to this physical key as the 'option'
-// key, and not as the 'alt' key.
+#[cfg(test)]
+mod tests {
+    use super::{
+        application_keypad_symbol, encode_application_keypad_symbol, encode_control_text,
+        encode_cursor_key, encode_end_key, encode_home_key, encode_kitty_csi_u,
+        encode_special_terminal_key, encode_xterm_csi_modifier, encode_xterm_function_modifier,
+        encode_xterm_ss3, encode_xterm_tilde_modifier, kitty_modifier_param,
+        xterm_modifier_param,
+    };
+    use crate::terminal::input::{KittyKeyboardFlags, TerminalInputSettings};
+    use winit::keyboard::{KeyCode, ModifiersState};
+
+    fn input_with_kitty() -> TerminalInputSettings {
+        TerminalInputSettings {
+            kitty_keyboard_flags: KittyKeyboardFlags::new(
+                KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ),
+            ..TerminalInputSettings::default()
+        }
+    }
+
+    #[test]
+    fn xterm_modifier_values_match_common_encoding() {
+        assert_eq!(xterm_modifier_param(ModifiersState::empty()), None);
+        assert_eq!(xterm_modifier_param(ModifiersState::SHIFT), Some(2));
+        assert_eq!(xterm_modifier_param(ModifiersState::ALT), Some(3));
+        assert_eq!(xterm_modifier_param(ModifiersState::CONTROL), Some(5));
+        assert_eq!(xterm_modifier_param(ModifiersState::SHIFT | ModifiersState::ALT), Some(4));
+        assert_eq!(xterm_modifier_param(ModifiersState::SHIFT | ModifiersState::CONTROL), Some(6));
+        assert_eq!(
+            xterm_modifier_param(
+                ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL
+            ),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn csi_modifier_sequences_match_xterm_conventions() {
+        assert_eq!(encode_xterm_csi_modifier('A', 2), b"\x1b[1;2A");
+        assert_eq!(encode_xterm_csi_modifier('H', 5), b"\x1b[1;5H");
+        assert_eq!(encode_xterm_csi_modifier('B', 3), b"\x1b[1;3B");
+    }
+
+    #[test]
+    fn tilde_modifier_sequences_match_xterm_conventions() {
+        assert_eq!(encode_xterm_tilde_modifier(3, 2), b"\x1b[3;2~");
+        assert_eq!(encode_xterm_tilde_modifier(6, 7), b"\x1b[6;7~");
+        assert_eq!(encode_xterm_tilde_modifier(24, 8), b"\x1b[24;8~");
+    }
+
+    #[test]
+    fn function_modifier_sequences_match_xterm_conventions() {
+        assert_eq!(encode_xterm_function_modifier('P', 2), b"\x1b[1;2P");
+        assert_eq!(encode_xterm_function_modifier('S', 5), b"\x1b[1;5S");
+    }
+
+    #[test]
+    fn ss3_sequences_match_xterm_conventions() {
+        assert_eq!(encode_xterm_ss3('A'), b"\x1bOA");
+        assert_eq!(encode_xterm_ss3('H'), b"\x1bOH");
+        assert_eq!(encode_xterm_ss3('P'), b"\x1bOP");
+    }
+
+    #[test]
+    fn home_and_end_follow_application_cursor_mode() {
+        assert_eq!(encode_home_key(false, None), b"\x1b[H");
+        assert_eq!(encode_end_key(false, None), b"\x1b[F");
+        assert_eq!(encode_home_key(true, None), b"\x1bOH");
+        assert_eq!(encode_end_key(true, None), b"\x1bOF");
+        assert_eq!(encode_home_key(true, Some(5)), b"\x1b[1;5H");
+        assert_eq!(encode_end_key(true, Some(3)), b"\x1b[1;3F");
+    }
+
+    #[test]
+    fn cursor_keys_use_ss3_only_without_modifiers() {
+        assert_eq!(encode_cursor_key('A', false, None), b"\x1b[A");
+        assert_eq!(encode_cursor_key('A', true, None), b"\x1bOA");
+        assert_eq!(encode_cursor_key('D', true, Some(2)), b"\x1b[1;2D");
+    }
+
+    #[test]
+    fn application_keypad_encodes_common_operator_and_digit_keys() {
+        assert_eq!(application_keypad_symbol(KeyCode::NumpadEnter), Some('M'));
+        assert_eq!(application_keypad_symbol(KeyCode::NumpadDecimal), Some('n'));
+        assert_eq!(application_keypad_symbol(KeyCode::Numpad8), Some('x'));
+        assert_eq!(application_keypad_symbol(KeyCode::Numpad3), Some('s'));
+
+        assert_eq!(encode_application_keypad_symbol('M', None), b"\x1bOM");
+        assert_eq!(encode_application_keypad_symbol('n', None), b"\x1bOn");
+        assert_eq!(encode_application_keypad_symbol('x', Some(3)), b"\x1bO3x");
+        assert_eq!(encode_application_keypad_symbol('s', None), b"\x1bOs");
+    }
+
+    #[test]
+    fn kitty_modifier_values_include_super() {
+        assert_eq!(kitty_modifier_param(ModifiersState::empty()), None);
+        assert_eq!(kitty_modifier_param(ModifiersState::SHIFT), Some(2));
+        assert_eq!(kitty_modifier_param(ModifiersState::ALT), Some(3));
+        assert_eq!(kitty_modifier_param(ModifiersState::CONTROL), Some(5));
+        assert_eq!(kitty_modifier_param(ModifiersState::SUPER), Some(9));
+        assert_eq!(kitty_modifier_param(ModifiersState::ALT | ModifiersState::CONTROL), Some(7));
+    }
+
+    #[test]
+    fn kitty_csi_u_sequences_encode_codepoint_and_modifiers() {
+        assert_eq!(encode_kitty_csi_u('a' as u32, None), b"\x1b[97u");
+        assert_eq!(encode_kitty_csi_u('A' as u32, Some(6)), b"\x1b[65;6u");
+        assert_eq!(encode_kitty_csi_u('?' as u32, Some(5)), b"\x1b[63;5u");
+    }
+
+    #[test]
+    fn kitty_mode_formats_modified_printable_sequences() {
+        assert_eq!(
+            encode_kitty_csi_u(
+                'A' as u32,
+                kitty_modifier_param(ModifiersState::SHIFT | ModifiersState::ALT)
+            ),
+            b"\x1b[65;4u"
+        );
+        assert_eq!(
+            encode_kitty_csi_u('a' as u32, kitty_modifier_param(ModifiersState::ALT)),
+            b"\x1b[97;3u"
+        );
+    }
+
+    #[test]
+    fn kitty_mode_formats_ambiguous_ctrl_sequences() {
+        assert_eq!(
+            encode_kitty_csi_u('_' as u32, kitty_modifier_param(ModifiersState::CONTROL)),
+            b"\x1b[95;5u"
+        );
+        assert_eq!(
+            encode_kitty_csi_u('?' as u32, kitty_modifier_param(ModifiersState::CONTROL)),
+            b"\x1b[63;5u"
+        );
+    }
+
+    #[test]
+    fn plain_mode_control_encoding_remains_legacy_single_byte() {
+        assert_eq!(encode_control_text("_"), Some(vec![0x1f]));
+        assert_eq!(encode_control_text("?"), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn special_keys_continue_to_use_xterm_sequences_in_kitty_mode() {
+        assert_eq!(
+            encode_cursor_key('A', false, xterm_modifier_param(ModifiersState::ALT)),
+            b"\x1b[1;3A"
+        );
+        assert_eq!(input_with_kitty().kitty_keyboard_flags.bits(), 1);
+    }
+}

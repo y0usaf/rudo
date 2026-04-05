@@ -42,7 +42,6 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    bridge::RestartDetails,
     cmd_line::{CmdLineSettings, GeometryArgs},
     frame::Frame,
     renderer::{DrawCommand, WindowConfig, build_window_config},
@@ -50,7 +49,7 @@ use crate::{
         HotReloadConfigs, PersistentWindowSettings, Settings, SettingsChanged, clamped_grid_size,
         load_last_window_settings, save_window_size,
     },
-    terminal::input::TerminalInputSettings,
+    terminal::{ClipboardRequest, ClipboardSelection, input::TerminalInputSettings},
     units::{Grid, GridSize},
     utils::expand_tilde,
 };
@@ -99,6 +98,9 @@ pub enum WindowCommand {
     TitleChanged(String),
     SetMouseEnabled(bool),
     TerminalInputChanged(TerminalInputSettings),
+    ClipboardSet(ClipboardRequest),
+    ClipboardQuery(ClipboardSelection),
+    OpenHyperlink(String),
     ListAvailableFonts,
     FocusWindow,
     #[cfg(target_os = "macos")]
@@ -147,11 +149,10 @@ pub enum UserEvent {
     ConfigsChanged(Box<HotReloadConfigs>),
     #[allow(dead_code)]
     RedrawRequested,
-    NeovimExited,
-    NeovimLaunchError {
+    ProcessExited,
+    ProcessLaunchError {
         message: String,
     },
-    NeovimRestart(RestartDetails),
     ShowProgressBar {
         percent: f32,
     },
@@ -289,7 +290,6 @@ pub fn create_window(
     #[cfg(target_os = "macos")]
     let title_hidden = cmd_line_settings.title_hidden;
 
-    // There is only two options for windows & linux, no need to match more options.
     #[cfg(not(target_os = "macos"))]
     let mut window_attributes = window_attributes.with_decorations(frame_decoration == Frame::Full);
 
@@ -351,7 +351,7 @@ pub enum WindowSize {
     Size(PhysicalSize<u32>),
     Maximized,
     Grid(GridSize<u32>),
-    NeovimGrid, // The geometry is read from init.vim/lua
+    NeovimGrid,
 }
 
 pub fn determine_window_size(
@@ -396,7 +396,6 @@ pub fn determine_grid_size(
 ) -> Option<Size2<Grid<u32>>> {
     match window_size {
         WindowSize::Grid(grid_size) => Some(*grid_size),
-        // Clippy wrongly suggests to use unwrap or default here
         #[allow(clippy::manual_unwrap_or_default)]
         _ => match window_settings {
             Some(PersistentWindowSettings::Maximized { grid_size, .. }) => grid_size,

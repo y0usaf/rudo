@@ -1,4 +1,4 @@
-use rmpv::Value;
+use serde_json::Value;
 
 use crate::error_msg;
 use crate::settings::*;
@@ -116,7 +116,7 @@ pub enum ThemeSettings {
 
 impl ParseFromValue for ThemeSettings {
     fn parse_from_value(&mut self, value: Value) {
-        if value.is_str() {
+        if value.is_string() {
             *self = match value.as_str().unwrap() {
                 "auto" => ThemeSettings::Auto,
                 "dark" => ThemeSettings::Dark,
@@ -158,7 +158,7 @@ pub enum CornerPreference {
 #[cfg(target_os = "windows")]
 impl ParseFromValue for CornerPreference {
     fn parse_from_value(&mut self, value: Value) {
-        if value.is_str() {
+        if value.is_string() {
             *self = match value.as_str().unwrap() {
                 "default" => CornerPreference::Default,
                 "round" => CornerPreference::Round,

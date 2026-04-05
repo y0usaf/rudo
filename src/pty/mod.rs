@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    env,
     ffi::OsString,
     io::{Read, Write},
     path::PathBuf,
@@ -95,9 +96,90 @@ pub fn platform_default_shell(configured_shell: Option<&str>) -> OsString {
     platform_default_shell_impl()
 }
 
+pub const TERMVIDE_TERM_ENV_VAR: &str = "TERMVIDE_TERM";
+const DEFAULT_TERM: &str = "xterm-256color";
+const TERMVIDE_TERM: &str = "termvide";
+
+fn configured_term() -> OsString {
+    match env::var_os(TERMVIDE_TERM_ENV_VAR) {
+        Some(value) if !value.is_empty() => value,
+        _ if bundled_terminfo_is_available() => OsString::from(TERMVIDE_TERM),
+        _ => OsString::from(DEFAULT_TERM),
+    }
+}
+
+fn bundled_terminfo_is_available() -> bool {
+    terminfo_entry_exists(TERMVIDE_TERM)
+}
+
+fn terminfo_entry_exists(term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+
+    for directory in candidate_terminfo_dirs() {
+        if terminfo_entry_exists_in_dir(&directory, term) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn candidate_terminfo_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(terminfo) = env::var_os("TERMINFO") {
+        push_non_empty_path_list_entry(&mut dirs, PathBuf::from(terminfo));
+    }
+
+    if let Some(term_info_dirs) = env::var_os("TERMINFO_DIRS") {
+        dirs.extend(env::split_paths(&term_info_dirs).filter(|path| !path.as_os_str().is_empty()));
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let mut home_terminfo = PathBuf::from(home);
+        home_terminfo.push(".terminfo");
+        dirs.push(home_terminfo);
+    }
+
+    #[cfg(unix)]
+    dirs.extend([
+        PathBuf::from("/etc/terminfo"),
+        PathBuf::from("/lib/terminfo"),
+        PathBuf::from("/usr/share/terminfo"),
+    ]);
+
+    dirs
+}
+
+fn push_non_empty_path_list_entry(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.as_os_str().is_empty() {
+        dirs.push(path);
+    }
+}
+
+fn terminfo_entry_exists_in_dir(base_dir: &std::path::Path, term: &str) -> bool {
+    for candidate in terminfo_entry_paths(base_dir, term) {
+        if candidate.is_file() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn terminfo_entry_paths(base_dir: &std::path::Path, term: &str) -> [PathBuf; 2] {
+    let first = term.as_bytes()[0] as char;
+    [
+        base_dir.join(first.to_string()).join(term),
+        base_dir.join(format!("{:x}", term.as_bytes()[0])).join(term),
+    ]
+}
+
 pub fn terminal_environment() -> Vec<(OsString, OsString)> {
     vec![
-        (OsString::from("TERM"), OsString::from("xterm-256color")),
+        (OsString::from("TERM"), configured_term()),
         (OsString::from("COLORTERM"), OsString::from("truecolor")),
         (OsString::from("TERM_PROGRAM"), OsString::from("termvide")),
     ]
@@ -228,14 +310,116 @@ mod tests {
 
     #[test]
     fn terminal_environment_sets_expected_term() {
-        let env = terminal_environment();
-        assert!(env.iter().any(|(key, value)| {
-            key == &OsString::from("TERM") && value == &OsString::from("xterm-256color")
-        }));
+        with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
+            let env = terminal_environment();
+            assert!(env.iter().any(|(key, value)| {
+                key == &OsString::from("TERM") && value == &OsString::from(DEFAULT_TERM)
+            }));
+        });
+    }
+
+    #[test]
+    fn terminal_environment_prefers_bundled_term_when_available() {
+        with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
+            let temp_dir = temp_test_dir("bundled-term");
+            let entry_path = temp_dir.join("74").join(TERMVIDE_TERM);
+            std::fs::create_dir_all(entry_path.parent().unwrap()).unwrap();
+            std::fs::write(&entry_path, b"compiled-terminfo").unwrap();
+
+            std::env::set_var("TERMINFO", &temp_dir);
+            let env = terminal_environment();
+
+            assert!(env.iter().any(|(key, value)| {
+                key == &OsString::from("TERM") && value == &OsString::from(TERMVIDE_TERM)
+            }));
+        });
+    }
+
+    #[test]
+    fn terminal_environment_allows_term_override() {
+        with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
+            std::env::set_var(TERMVIDE_TERM_ENV_VAR, "termvide");
+            let env = terminal_environment();
+
+            assert!(env.iter().any(|(key, value)| {
+                key == &OsString::from("TERM") && value == &OsString::from("termvide")
+            }));
+        });
+    }
+
+    #[test]
+    fn terminal_environment_override_wins_even_without_bundled_terminfo() {
+        with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
+            std::env::set_var(TERMVIDE_TERM_ENV_VAR, "screen-256color");
+            let env = terminal_environment();
+
+            assert!(env.iter().any(|(key, value)| {
+                key == &OsString::from("TERM") && value == &OsString::from("screen-256color")
+            }));
+        });
+    }
+
+    #[test]
+    fn terminal_environment_ignores_empty_term_override() {
+        with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
+            std::env::set_var(TERMVIDE_TERM_ENV_VAR, "");
+            let env = terminal_environment();
+
+            assert!(env.iter().any(|(key, value)| {
+                key == &OsString::from("TERM") && value == &OsString::from(DEFAULT_TERM)
+            }));
+        });
+    }
+
+    #[test]
+    fn terminfo_entry_exists_supports_hashed_and_letter_layouts() {
+        let hashed_dir = temp_test_dir("hashed-layout");
+        let hashed_entry = hashed_dir.join("74").join(TERMVIDE_TERM);
+        std::fs::create_dir_all(hashed_entry.parent().unwrap()).unwrap();
+        std::fs::write(&hashed_entry, b"compiled-terminfo").unwrap();
+        assert!(terminfo_entry_exists_in_dir(&hashed_dir, TERMVIDE_TERM));
+
+        let letter_dir = temp_test_dir("letter-layout");
+        let letter_entry = letter_dir.join("t").join(TERMVIDE_TERM);
+        std::fs::create_dir_all(letter_entry.parent().unwrap()).unwrap();
+        std::fs::write(&letter_entry, b"compiled-terminfo").unwrap();
+        assert!(terminfo_entry_exists_in_dir(&letter_dir, TERMVIDE_TERM));
+    }
+
+    fn with_env_vars_cleared<T>(keys: &[&str], f: impl FnOnce() -> T) -> T {
+        let saved: Vec<_> =
+            keys.iter().map(|key| ((*key).to_string(), std::env::var_os(key))).collect();
+
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        let result = f();
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(&key, value),
+                None => std::env::remove_var(&key),
+            }
+        }
+
+        result
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let unique = format!(
+            "termvide-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_pty_can_spawn_and_capture_output() -> Result<()> {
         let system = NativePtySystem;
         let mut process = system.spawn(PtySpawnConfig {
