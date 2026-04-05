@@ -14,16 +14,12 @@ extern crate approx;
 #[macro_use]
 extern crate clap;
 
-mod bridge;
 mod channel_utils;
 mod clipboard;
 mod cmd_line;
 mod dimensions;
-mod editor;
 mod error_handling;
 mod frame;
-#[cfg(target_os = "macos")]
-mod ipc;
 mod platform;
 mod profiling;
 mod pty;
@@ -32,6 +28,7 @@ mod renderer;
 mod running_tracker;
 mod settings;
 mod terminal;
+mod ui;
 mod units;
 mod utils;
 mod version;
@@ -79,9 +76,6 @@ pub use channel_utils::*;
 pub use windows_utils::*;
 
 use crate::settings::{Config, Settings, load_last_window_settings};
-
-#[cfg(target_os = "macos")]
-use crate::utils::resolved_cwd;
 
 pub use profiling::startup_profiler;
 
@@ -145,15 +139,6 @@ fn main() -> ExitCode {
         clipboard,
         clipboard_handle,
     );
-
-    #[cfg(target_os = "macos")]
-    let _handoff_listener = match ipc::handoff::start_listener(event_loop.create_proxy()) {
-        Ok(listener) => Some(listener),
-        Err(error) => {
-            log::warn!("failed to start handoff listener: {error:#}");
-            None
-        }
-    };
 
     let result = application.run(event_loop);
     match result {
@@ -253,20 +238,7 @@ fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result
         }
     }));
 
-    //Will exit if -h or -v
     cmd_line::handle_command_line_arguments(args().collect(), settings.as_ref())?;
-    {
-        let cmdline_settings = settings.get::<CmdLineSettings>();
-        if let Some(status) = cmd_line::maybe_passthrough_to_neovim(&cmdline_settings)? {
-            std::process::exit(cmd_line::exit_status_code(status));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    match maybe_handoff(settings.as_ref()) {
-        HandoffOutcome::Continue => {}
-        HandoffOutcome::Exit => std::process::exit(0),
-        HandoffOutcome::Error(error) => return Err(anyhow::anyhow!(error)),
-    }
     #[cfg(not(target_os = "windows"))]
     maybe_disown(&settings);
 
@@ -280,56 +252,18 @@ fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result
     Ok(config)
 }
 
-#[cfg(target_os = "macos")]
-enum HandoffOutcome {
-    Continue,
-    Exit,
-    Error(String),
-}
-
-#[cfg(target_os = "macos")]
-fn maybe_handoff(settings: &Settings) -> HandoffOutcome {
-    let cmdline_settings = settings.get::<CmdLineSettings>();
-    if !cmdline_settings.reuse_instance
-        || cmdline_settings.server.is_some()
-        || (cmdline_settings.files_to_open.is_empty() && !cmdline_settings.new_window)
-    {
-        return HandoffOutcome::Continue;
-    }
-
-    let request = ipc::handoff::HandoffRequest {
-        version: BUILD_VERSION.to_owned(),
-        files_to_open: cmdline_settings.files_to_open.clone(),
-        cwd: resolved_cwd(cmd_line::argv_chdir().as_deref()),
-        caller_cwd: resolved_cwd(None),
-        tabs: cmdline_settings.tabs,
-        new_window: cmdline_settings.new_window,
-    };
-
-    match ipc::handoff::try_handoff(&request) {
-        ipc::handoff::HandoffResult::Accepted => HandoffOutcome::Exit,
-        ipc::handoff::HandoffResult::NoListener => HandoffOutcome::Continue,
-        ipc::handoff::HandoffResult::Rejected(error) => {
-            HandoffOutcome::Error(format!("reuse-instance request was rejected: {error}"))
-        }
-        ipc::handoff::HandoffResult::Failed(error) => {
-            HandoffOutcome::Error(format!("reuse-instance request failed: {error}"))
-        }
-    }
-}
-
 #[cfg(not(test))]
 pub fn init_logger(settings: &Settings) {
     let cmdline_settings = settings.get::<CmdLineSettings>();
 
     let logger = if cmdline_settings.log_to_file {
-        Logger::try_with_env_or_str("neovide")
+        Logger::try_with_env_or_str("termvide")
             .expect("Could not init logger")
-            .log_to_file(FileSpec::default())
+            .log_to_file(FileSpec::default().basename("termvide").directory("."))
             .rotate(Criterion::Size(10_000_000), Naming::Timestamps, Cleanup::KeepLogFiles(1))
             .duplicate_to_stderr(Duplicate::Error)
     } else {
-        Logger::try_with_env_or_str("neovide = error").expect("Could not init logger")
+        Logger::try_with_env_or_str("termvide = error").expect("Could not init logger")
     };
 
     logger.start().expect("Could not start logger");

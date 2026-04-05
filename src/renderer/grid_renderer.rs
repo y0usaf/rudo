@@ -6,13 +6,13 @@ use skia_safe::{
 };
 
 use crate::{
-    editor::{Colors, LineFragment, Style, UnderlineStyle},
     profiling::tracy_zone,
     renderer::{
         CachingShaper, RendererSettings,
         box_drawing::{self},
     },
     settings::*,
+    ui::{Colors, LineFragment, Style, UnderlineStyle},
     units::{
         GridPos, GridScale, GridSize, PixelPos, PixelRect, PixelVec, to_skia_point, to_skia_rect,
     },
@@ -118,7 +118,7 @@ impl GridRenderer {
     }
 
     pub fn get_default_background(&self, opacity: f32) -> Color {
-        log::info!("blend {}", self.default_style.blend);
+        log::trace!("blend {}", self.default_style.blend);
         let alpha = opacity * (100 - self.default_style.blend) as f32 / 100.0;
         self.get_default_background_color().with_a((alpha * 255.0) as u8)
     }
