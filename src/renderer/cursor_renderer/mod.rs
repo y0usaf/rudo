@@ -9,11 +9,11 @@ use skia_safe::{Canvas, Paint, Path, PathBuilder, op};
 use winit::event::WindowEvent;
 
 use crate::{
-    bridge::EditorMode,
-    editor::{Cursor, CursorShape, Word},
     profiling::{tracy_plot, tracy_zone},
     renderer::{GridRenderer, RenderedWindow, animation_utils::*},
-    settings::{ParseFromValue, Settings},
+    settings::Settings,
+    ui::EditorMode,
+    ui::{Cursor, CursorShape, Word},
     units::{
         GridPos, GridScale, GridSize, PixelPos, PixelRect, PixelSize, PixelVec, to_skia_point,
     },

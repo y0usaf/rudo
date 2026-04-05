@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::{renderer::GridRenderer, settings::ParseFromValue};
+use crate::renderer::GridRenderer;
 use neovide_derive::SettingGroup;
 use skia_safe::{Canvas, Color4f, Paint, Rect};
 

@@ -1,4 +1,4 @@
-use crate::editor::CursorShape;
+use crate::ui::CursorShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalCursor {

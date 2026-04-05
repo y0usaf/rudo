@@ -1,12 +1,12 @@
 use log::error;
-use nvim_rs::Value;
+use serde_json::Value;
 use skia_safe::{BlendMode, Canvas, Color, Paint, Rect, paint::Style};
 
 use crate::{
-    editor::Cursor,
     renderer::cursor_renderer::CursorSettings,
     renderer::{animation_utils::*, grid_renderer::GridRenderer},
     settings::*,
+    ui::Cursor,
     units::{GridSize, PixelPos, PixelSize, PixelVec},
 };
 
@@ -57,7 +57,7 @@ pub struct VfxModeList(Vec<VfxMode>);
 
 impl ParseFromValue for VfxMode {
     fn parse_from_value(&mut self, value: Value) {
-        if value.is_str() {
+        if value.is_string() {
             *self = match value.as_str().unwrap() {
                 "sonicboom" => VfxMode::Highlight(HighlightMode::SonicBoom),
                 "ripple" => VfxMode::Highlight(HighlightMode::Ripple),
@@ -80,13 +80,13 @@ impl ParseFromValue for VfxMode {
 impl ParseFromValue for VfxModeList {
     fn parse_from_value(&mut self, value: Value) {
         self.0.clear();
-        if value.is_str() {
+        if value.is_string() {
             let mut vfx_mode = VfxMode::Disabled;
             vfx_mode.parse_from_value(value);
             self.0.push(vfx_mode);
         } else if value.is_array() {
             for item in value.as_array().unwrap() {
-                if item.is_str() {
+                if item.is_string() {
                     let mut vfx_mode = VfxMode::Disabled;
                     vfx_mode.parse_from_value(item.clone());
                     self.0.push(vfx_mode);

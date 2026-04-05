@@ -2,14 +2,14 @@ use std::{collections::HashMap, fmt, iter, num::ParseFloatError, sync::Arc};
 
 use itertools::Itertools;
 use log::warn;
-use rmpv::Value;
 use serde::Deserialize;
+use serde_json::Value;
 use skia_safe::{
     FontStyle,
     font_style::{Slant, Weight, Width},
 };
 
-use crate::{editor, error_msg, settings::ParseFromValue};
+use crate::{error_msg, settings::ParseFromValue, ui};
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 const FONT_OPTS_SEPARATOR: char = ':';
@@ -80,15 +80,15 @@ impl From<CoarseStyle> for FontStyle {
     }
 }
 
-impl From<&editor::Style> for CoarseStyle {
-    fn from(fine_style: &editor::Style) -> Self {
+impl From<&ui::Style> for CoarseStyle {
+    fn from(fine_style: &ui::Style) -> Self {
         Self { bold: fine_style.bold, italic: fine_style.italic }
     }
 }
 
 // essentially just a convenience impl
-impl From<&Arc<editor::Style>> for CoarseStyle {
-    fn from(fine_style: &Arc<editor::Style>) -> Self {
+impl From<&Arc<ui::Style>> for CoarseStyle {
+    fn from(fine_style: &Arc<ui::Style>) -> Self {
         Self::from(&**fine_style)
     }
 }

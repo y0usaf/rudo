@@ -35,15 +35,15 @@ use winit::{
 
 use crate::{
     WindowSettings,
-    bridge::EditorMode,
     cmd_line::CmdLineSettings,
-    editor::{Cursor, Style, WindowType},
     profiling::{tracy_create_gpu_context, tracy_named_frame, tracy_zone},
     renderer::{
         fonts::font_options::PixelGeometry,
         rendered_layer::{FloatingLayer, group_windows},
     },
     settings::*,
+    ui::EditorMode,
+    ui::{Cursor, Style, WindowType},
     units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, to_skia_rect},
     window::{EventPayload, ShouldRender},
 };

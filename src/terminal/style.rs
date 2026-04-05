@@ -3,8 +3,8 @@ use std::sync::Arc;
 use skia_safe::Color4f;
 
 use crate::{
-    editor::{Colors, Style, UnderlineStyle},
     terminal::theme::TerminalTheme,
+    ui::{Colors, Style, UnderlineStyle},
 };
 
 #[derive(Clone, Debug, PartialEq)]

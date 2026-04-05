@@ -6,7 +6,7 @@ use std::{
 use serde::Deserialize;
 use skia_safe::Color4f;
 
-use crate::editor::Colors;
+use crate::ui::Colors;
 
 const WALLUST_THEME_PATH: &str = ".cache/wallust/termvide-theme.toml";
 const TERMVIDE_THEME_PATH: &str = ".config/termvide/theme.toml";
@@ -87,6 +87,7 @@ impl TerminalTheme {
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     pub fn load_from_path(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path)
             .map_err(|error| format!("could not read theme file: {error}"))?;
@@ -135,6 +136,10 @@ impl TerminalTheme {
 
     pub fn set_palette_color(&mut self, index: u8, color: Color4f) {
         self.palette[index as usize] = color;
+    }
+
+    pub fn copy_palette_from(&mut self, other: &TerminalTheme) {
+        self.palette = other.palette;
     }
 
     pub fn set_foreground(&mut self, color: Color4f) {

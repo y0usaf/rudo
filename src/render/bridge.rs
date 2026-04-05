@@ -1,14 +1,16 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    bridge::EditorMode,
-    editor::{Cursor, Style, WindowType, line_from_cells},
     renderer::{DrawCommand, WindowDrawCommand},
     terminal::{
         cell::CellWidth,
+        screen::TerminalScreen,
         state::{TerminalDamage, TerminalState},
+        style::TerminalStyle,
         theme::TerminalTheme,
     },
+    ui::EditorMode,
+    ui::{Cursor, Hyperlink, Line, LineFragmentData, Style, WindowType, WordData},
 };
 
 const PRIMARY_GRID_ID: u64 = 1;
@@ -43,6 +45,7 @@ impl TerminalRenderBridge {
     pub fn full_draw_commands(&self, state: &TerminalState) -> Vec<DrawCommand> {
         let screen = state.screen();
         let mut commands = Vec::with_capacity(screen.rows() + 6);
+        let mut style_cache = StyleCache::new();
 
         commands.push(DrawCommand::DefaultStyleChanged(Style::new(default_colors(state.theme()))));
         commands.push(DrawCommand::ModeChanged(EditorMode::Unknown("terminal".to_string())));
@@ -57,8 +60,13 @@ impl TerminalRenderBridge {
         });
         commands
             .push(DrawCommand::Window { grid_id: self.grid_id, command: WindowDrawCommand::Clear });
-        self.push_row_draw_commands(&mut commands, state, (0..screen.rows()).rev());
-        commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state)));
+        self.push_row_draw_commands(
+            &mut commands,
+            state,
+            (0..screen.rows()).rev(),
+            &mut style_cache,
+        );
+        commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state, &mut style_cache)));
         commands
             .push(DrawCommand::Window { grid_id: self.grid_id, command: WindowDrawCommand::Show });
         commands.push(DrawCommand::UIReady);
@@ -68,11 +76,16 @@ impl TerminalRenderBridge {
     pub fn draw_commands(&self, state: &TerminalState, damage: TerminalDamage) -> Vec<DrawCommand> {
         match damage {
             TerminalDamage::Full => self.full_draw_commands(state),
-            TerminalDamage::None => vec![DrawCommand::UpdateCursor(self.cursor_from_state(state))],
+            TerminalDamage::None => {
+                let mut sc = StyleCache::new();
+                vec![DrawCommand::UpdateCursor(self.cursor_from_state(state, &mut sc))]
+            }
             TerminalDamage::Rows(rows) => {
-                let mut commands = Vec::with_capacity(rows.len() + 1);
-                self.push_row_draw_commands(&mut commands, state, rows.into_iter().rev());
-                commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state)));
+                let dirty: Vec<usize> = rows.iter().collect();
+                let mut commands = Vec::with_capacity(dirty.len() + 1);
+                let mut sc = StyleCache::new();
+                self.push_row_draw_commands(&mut commands, state, dirty.into_iter().rev(), &mut sc);
+                commands.push(DrawCommand::UpdateCursor(self.cursor_from_state(state, &mut sc)));
                 commands
             }
         }
@@ -83,26 +96,29 @@ impl TerminalRenderBridge {
         commands: &mut Vec<DrawCommand>,
         state: &TerminalState,
         rows: I,
+        style_cache: &mut StyleCache,
     ) where
         I: IntoIterator<Item = usize>,
     {
         let screen = state.screen();
+        let theme = state.theme();
         for row in rows {
             commands.push(DrawCommand::Window {
                 grid_id: self.grid_id,
                 command: WindowDrawCommand::DrawLine {
                     row,
-                    line: line_for_row(screen, row, state.theme()),
+                    line: line_for_row(screen, row, theme, style_cache),
                 },
             });
         }
     }
 
-    fn cursor_from_state(&self, state: &TerminalState) -> Cursor {
+    fn cursor_from_state(&self, state: &TerminalState, style_cache: &mut StyleCache) -> Cursor {
         let screen = state.screen();
         let terminal_cursor = state.cursor();
+        let theme = state.theme();
         let (text, style, double_width) =
-            cursor_cell(screen, terminal_cursor.column, terminal_cursor.row, state.theme());
+            cursor_cell(screen, terminal_cursor.column, terminal_cursor.row, theme, style_cache);
 
         Cursor {
             grid_position: (terminal_cursor.column as u64, terminal_cursor.row as u64),
@@ -120,28 +136,133 @@ impl TerminalRenderBridge {
     }
 }
 
+struct StyleCache {
+    map: HashMap<*const TerminalStyle, Arc<Style>>,
+}
+
+impl StyleCache {
+    fn new() -> Self {
+        Self { map: HashMap::with_capacity(8) }
+    }
+
+    fn resolve(&mut self, style: &Arc<TerminalStyle>, theme: &TerminalTheme) -> Arc<Style> {
+        let ptr = Arc::as_ptr(style);
+        self.map.entry(ptr).or_insert_with(|| style.resolve(theme)).clone()
+    }
+
+    fn resolve_opt(
+        &mut self,
+        style: Option<&Arc<TerminalStyle>>,
+        theme: &TerminalTheme,
+    ) -> Option<Arc<Style>> {
+        style.map(|s| self.resolve(s, theme))
+    }
+}
+
 fn line_for_row(
-    screen: &crate::terminal::screen::TerminalScreen,
+    screen: &TerminalScreen,
     row: usize,
     theme: &TerminalTheme,
-) -> crate::editor::Line {
+    style_cache: &mut StyleCache,
+) -> Line {
     let cells = screen.row(row).expect("row draw requested for valid terminal row");
+    let width = cells.len();
 
-    let row_cells = cells
-        .iter()
-        .map(|cell| {
-            let style = cell.style.as_ref().map(|style| style.resolve(theme));
-            (cell.text.clone(), style)
-        })
-        .collect::<Vec<_>>();
-    line_from_cells(&row_cells)
+    let mut text = String::with_capacity(width);
+    let mut fragments = Vec::new();
+    let mut cell_strings: Vec<String> = Vec::with_capacity(width);
+    let mut hyperlinks: Vec<Option<Arc<Hyperlink>>> = Vec::with_capacity(width);
+    let mut start = 0;
+
+    while start < width {
+        let resolved_style = style_cache.resolve_opt(cells[start].style.as_ref(), theme);
+        let text_start = text.len() as u32;
+        let frag_start = start as u32;
+        let mut words = Vec::new();
+        let mut current_word = WordData::default();
+        let mut consumed = 0u32;
+        let mut last_box_char: Option<&str> = None;
+
+        for cell in cells.iter().skip(start) {
+            let cell_style = style_cache.resolve_opt(cell.style.as_ref(), theme);
+            if cell_style != resolved_style {
+                break;
+            }
+
+            let cluster = cell.text();
+
+            if crate::renderer::box_drawing::is_box_char(cluster) {
+                if text_start == text.len() as u32 && consumed == 0 {
+                    last_box_char = Some(cluster);
+                }
+                if (text.len() as u32 > text_start && last_box_char.is_none())
+                    || last_box_char != Some(cluster)
+                {
+                    break;
+                }
+            } else if last_box_char.is_some() {
+                break;
+            }
+
+            consumed += 1;
+            let cluster = if cluster.len() > 255 { " " } else { cluster };
+
+            if cluster.is_empty() {
+                if !current_word.cluster_sizes.is_empty() {
+                    current_word.cluster_sizes.push(0);
+                }
+                cell_strings.push(String::new());
+                hyperlinks.push(cell.hyperlink.as_ref().map(|link| {
+                    Arc::new(Hyperlink { id: link.id.clone(), uri: link.uri.clone() })
+                }));
+                continue;
+            }
+
+            let is_ws = cluster.chars().next().is_some_and(|c| c.is_whitespace());
+            if is_ws {
+                if !current_word.cluster_sizes.is_empty() {
+                    words.push(current_word);
+                    current_word = WordData::default();
+                }
+            } else if current_word.cluster_sizes.is_empty() {
+                current_word.cell = consumed - 1;
+                current_word.cluster_sizes.push(cluster.len() as u8);
+                current_word.text_offset = text.len() as u32 - text_start;
+            } else {
+                current_word.cluster_sizes.push(cluster.len() as u8);
+            }
+
+            text.push_str(cluster);
+            cell_strings.push(cluster.to_string());
+            hyperlinks.push(
+                cell.hyperlink
+                    .as_ref()
+                    .map(|link| Arc::new(Hyperlink { id: link.id.clone(), uri: link.uri.clone() })),
+            );
+        }
+
+        if !current_word.cluster_sizes.is_empty() {
+            words.push(current_word);
+        }
+
+        fragments.push(LineFragmentData::new(
+            text_start..text.len() as u32,
+            frag_start..frag_start + consumed,
+            resolved_style,
+            words,
+        ));
+        start += consumed as usize;
+    }
+
+    Line::new(text, fragments, Some(cell_strings), Some(hyperlinks))
 }
 
 fn cursor_cell(
-    screen: &crate::terminal::screen::TerminalScreen,
+    screen: &TerminalScreen,
     col: usize,
     row: usize,
     theme: &TerminalTheme,
+    style_cache: &mut StyleCache,
 ) -> (String, Option<Arc<Style>>, bool) {
     let Some(cell) = screen.get(col, row) else {
         return (" ".to_string(), None, false);
@@ -150,16 +271,21 @@ fn cursor_cell(
     match cell.width {
         CellWidth::Continuation if col > 0 => {
             let left = screen.get(col - 1, row).unwrap_or(cell);
-            (left.text.clone(), left.style.as_ref().map(|style| style.resolve(theme)), true)
+            let style = style_cache.resolve_opt(left.style.as_ref(), theme);
+            (left.text().to_string(), style, true)
         }
         CellWidth::Double => {
-            (cell.text.clone(), cell.style.as_ref().map(|style| style.resolve(theme)), true)
+            let style = style_cache.resolve_opt(cell.style.as_ref(), theme);
+            (cell.text().to_string(), style, true)
         }
-        _ => (cell.text.clone(), cell.style.as_ref().map(|style| style.resolve(theme)), false),
+        _ => {
+            let style = style_cache.resolve_opt(cell.style.as_ref(), theme);
+            (cell.text().to_string(), style, false)
+        }
     }
 }
 
-fn default_colors(theme: &TerminalTheme) -> crate::editor::Colors {
+fn default_colors(theme: &TerminalTheme) -> crate::ui::Colors {
     theme.default_colors()
 }
 
@@ -191,8 +317,8 @@ mod tests {
                 ..
             }
         )));
-        assert!(commands.iter().any(|command| matches!(command, DrawCommand::Window { command: WindowDrawCommand::DrawLine { row: 0, line }, .. } if line.text == "ab")));
-        assert!(commands.iter().any(|command| matches!(command, DrawCommand::Window { command: WindowDrawCommand::DrawLine { row: 1, line }, .. } if line.text == "cd")));
+        assert!(commands.iter().any(|command| matches!(command, DrawCommand::Window { command: WindowDrawCommand::DrawLine { row: 0, line }, .. } if line.text == "ab  ")));
+        assert!(commands.iter().any(|command| matches!(command, DrawCommand::Window { command: WindowDrawCommand::DrawLine { row: 1, line }, .. } if line.text == "cd  ")));
         assert!(commands.iter().any(|command| matches!(command, DrawCommand::UpdateCursor(cursor) if cursor.grid_position == (2, 1))));
         assert!(matches!(commands.last(), Some(DrawCommand::UIReady)));
     }
@@ -217,7 +343,9 @@ mod tests {
         let mut state = TerminalState::new(4, 2);
         parser.advance(&mut state, b"ab\r\ncd");
 
-        let commands = bridge.draw_commands(&state, TerminalDamage::Rows(vec![1]));
+        let mut dirty = crate::terminal::state::DirtyRows::new();
+        dirty.set(1);
+        let commands = bridge.draw_commands(&state, TerminalDamage::Rows(dirty));
 
         assert_eq!(
             commands
@@ -230,5 +358,29 @@ mod tests {
             1
         );
         assert!(commands.iter().any(|command| matches!(command, DrawCommand::UpdateCursor(_))));
+    }
+
+    #[test]
+    fn line_carries_hyperlink_metadata() {
+        let bridge = TerminalRenderBridge::default();
+        let mut parser = TerminalParser::new();
+        let mut state = TerminalState::new(6, 1);
+        parser.advance(&mut state, b"\x1b]8;id=link1;https://example.com\x07hi\x1b]8;;\x07");
+
+        let commands = bridge.full_draw_commands(&state);
+        let line = commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Window {
+                    command: WindowDrawCommand::DrawLine { row: 0, line },
+                    ..
+                } => Some(line),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(line.hyperlink_at_cell(0).unwrap().uri, "https://example.com");
+        assert_eq!(line.hyperlink_at_cell(1).unwrap().id.as_deref(), Some("link1"));
+        assert!(line.hyperlink_at_cell(2).is_none());
     }
 }

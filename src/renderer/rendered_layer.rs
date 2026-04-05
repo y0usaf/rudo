@@ -9,7 +9,7 @@ use skia_safe::{
 use glamour::Intersection;
 
 use crate::{
-    editor::WindowType,
+    ui::WindowType,
     units::{GridScale, PixelRect, to_skia_rect},
 };
 

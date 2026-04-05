@@ -17,10 +17,10 @@ use swash::{
 };
 
 use crate::{
-    editor::Word,
     error_msg,
     profiling::tracy_zone,
     renderer::fonts::{font_loader::*, font_options::*},
+    ui::Word,
     units::PixelSize,
 };
 

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{editor::Cursor, window::ShouldRender};
+use crate::{ui::Cursor, window::ShouldRender};
 
 #[derive(Debug, PartialEq)]
 pub enum BlinkState {

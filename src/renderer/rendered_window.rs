@@ -1,16 +1,16 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use skia_safe::{
     Canvas, Color, Color4f, Matrix, Paint, Path, PathBuilder, Picture, PictureRecorder, Rect,
 };
 
 use crate::{
-    bridge::WindowAnchor,
     cmd_line::CmdLineSettings,
-    editor::{AnchorInfo, Line, LineFragment, SortOrder, WindowType},
     profiling::{tracy_plot, tracy_zone},
     renderer::{GridRenderer, RendererSettings, animation_utils::*},
     settings::Settings,
+    ui::WindowAnchor,
+    ui::{AnchorInfo, Hyperlink, Line, LineFragment, SortOrder, WindowType},
     units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelVec, to_skia_rect},
     utils::RingBuffer,
 };
@@ -19,11 +19,6 @@ use crate::{
 pub const BASE_GRID_ID: u64 = 1;
 pub const NO_MULTIGRID_GRID_ID: u64 = 0;
 
-// Window layouts can leave a tiny remainder to the right of the last full
-// grid cell when the content width is not an exact multiple of the cell
-// width. We extend the last column's background slightly into that gap, capped
-// to a few cell widths so the line never appears visibly stretched if the grid
-// briefly lags a resize.
 const MAX_TRAILING_FILL_CELLS: f32 = 1.0;
 
 #[derive(Debug)]
@@ -131,26 +126,20 @@ impl RenderedWindow {
             hidden: false,
             anchor_info: None,
             window_type: WindowType::Editor,
-
             grid_size,
-
             actual_lines: RingBuffer::new(grid_size.height as usize, None),
             scrollback_lines: RingBuffer::new(2 * grid_size.height as usize, None),
             scroll_delta: 0,
             viewport_margins: ViewportMargins { top: 0, bottom: 0 },
-
             grid_start_position: grid_position,
             grid_current_position: grid_position,
             grid_destination: grid_position,
-            position_t: 2.0, // 2.0 is out of the 0.0 to 1.0 range and stops animation.
-
+            position_t: 2.0,
             scroll_animation: CriticallyDampedSpringAnimation::new(),
         }
     }
 
     pub fn pixel_region(&self, grid_scale: GridScale) -> PixelRect<f32> {
-        // Round to the same fraction as the desination to avoid glitches when rendering box
-        // characters.
         let fract = (self.grid_destination * grid_scale).fract();
         let pos = (self.grid_current_position * grid_scale - fract).round() + fract.to_vector();
         PixelRect::<f32>::from_origin_and_size(pos.into(), self.grid_size() * grid_scale)
@@ -159,9 +148,6 @@ impl RenderedWindow {
     fn grid_size(&self) -> GridSize<u32> {
         let mut size = self.grid_size;
         if matches!(self.window_type, WindowType::Message { .. }) {
-            // Neovim reports message grids with the full default-grid height even
-            // when they are anchored near the bottom. Only the rows from the
-            // message start row down to the bottom edge are actually visible.
             size.height = size.height.saturating_sub(self.grid_destination.y.max(0.0) as u32);
         }
         size
@@ -175,12 +161,7 @@ impl RenderedWindow {
             Some(AnchorInfo { anchor_type: WindowAnchor::Absolute, .. }) => destination,
             _ => {
                 let grid_size: GridSize<f32> = self.grid_size().try_cast().unwrap();
-                // If a floating window is partially outside the grid, then move it in from the right, but
-                // ensure that the left edge is always visible.
                 let x = destination.x.min(grid_rect.max.x - grid_size.width).max(grid_rect.min.x);
-
-                // For messages the last line is most important, (it shows press enter), so let the position go negative
-                // Otherwise ensure that the window start row is within the screen
                 let mut y = destination.y.min(grid_rect.max.y - grid_size.height);
                 if !matches!(self.window_type, WindowType::Message { .. }) {
                     y = y.max(grid_rect.min.y)
@@ -190,7 +171,6 @@ impl RenderedWindow {
         }
     }
 
-    /// Returns `true` if the window has been animated in this step.
     pub fn animate(
         &mut self,
         settings: &RendererSettings,
@@ -200,7 +180,6 @@ impl RenderedWindow {
         let mut animating = false;
 
         if self.position_t > 1.0 - f32::EPSILON {
-            // We are at destination, move t out of 0-1 range to stop the animation.
             self.position_t = 2.0;
         } else {
             animating = true;
@@ -396,12 +375,6 @@ impl RenderedWindow {
         paint.set_anti_alias(false);
         paint.set_blend_mode(skia_safe::BlendMode::SrcOver);
 
-        // the trailing fill follows the same clipping model as the normal
-        // background pass. fixed rows like border and margins rows can
-        // paint across the full window region, but scrollable rows need
-        // stay inside the inner viewport. So keeping those as separate
-        // clip scopes prevents the buffered scroll rows from leaking into
-        // fixed UI rows.
         canvas.save();
         canvas.clip_rect(to_skia_rect(&pixel_region), None, false);
 
@@ -460,12 +433,6 @@ impl RenderedWindow {
             });
         }
 
-        // this fill is part of the rendered grid background, not a separete
-        // overlay. when the window is mid-scroll, the scrollable rows can
-        // sit at a fractional cell offset, so this fill has to use that
-        // same pixel offset too.
-        //
-        // See https://github.com/neovide/neovide/pull/3387
         let scroll_offset_lines = self.scroll_animation.position.floor();
         let scroll_offset = scroll_offset_lines - self.scroll_animation.position;
         let scroll_offset_pixels = (scroll_offset * grid_scale.height()).round();
@@ -568,6 +535,12 @@ impl RenderedWindow {
         Some(text)
     }
 
+    pub fn hyperlink_at_cell(&self, row: u32, col: u32) -> Option<Arc<Hyperlink>> {
+        let line = self.line_for_row(row)?;
+        let line = line.borrow();
+        line.line.hyperlink_at_cell(col as usize).cloned()
+    }
+
     pub fn grid_row_rect(
         &self,
         row: u32,
@@ -628,11 +601,9 @@ impl RenderedWindow {
                     if self.grid_start_position.x.abs() > f32::EPSILON
                         || self.grid_start_position.y.abs() > f32::EPSILON
                     {
-                        self.position_t = 0.0; // Reset animation as we have a new destination.
+                        self.position_t = 0.0;
                         self.grid_start_position = self.grid_current_position;
                     } else {
-                        // We don't want to animate since the window is animating out of the start location,
-                        // so we set t to 2.0 to stop animations.
                         self.position_t = 2.0;
                         self.grid_start_position = grid_position;
                     }
@@ -656,8 +627,7 @@ impl RenderedWindow {
 
                 if self.hidden {
                     self.hidden = false;
-                    self.position_t = 2.0; // We don't want to animate since the window is becoming visible,
-                    // so we set t to 2.0 to stop animations.
+                    self.position_t = 2.0;
                     self.grid_start_position = grid_position;
                     self.grid_destination = grid_position;
                 }
@@ -707,8 +677,7 @@ impl RenderedWindow {
                 tracy_zone!("show_cmd", 0);
                 if self.hidden {
                     self.hidden = false;
-                    self.position_t = 2.0; // We don't want to animate since the window is becoming visible,
-                    // so we set t to 2.0 to stop animations.
+                    self.position_t = 2.0;
                     self.grid_start_position = self.grid_destination;
                     self.scroll_animation.reset();
                 }
@@ -737,7 +706,6 @@ impl RenderedWindow {
         if !self.valid {
             return;
         }
-        // If the borders are changed, reset the scrollback to only fit the inner view
         let inner_range = self.viewport_margins.top as isize
             ..(self.actual_lines.len() - self.viewport_margins.bottom as usize) as isize;
         let inner_size = inner_range.len();
@@ -763,7 +731,6 @@ impl RenderedWindow {
             log::trace!(
                 "Scroll offset {scroll_offset}, delta {scroll_delta}, max_delta {max_delta}"
             );
-            // Do a limited scroll with empty lines when scrolling far
             if scroll_delta.unsigned_abs() > max_delta {
                 let far_lines = renderer_settings
                     .scroll_animation_far_lines
@@ -778,8 +745,6 @@ impl RenderedWindow {
                 for i in empty_lines {
                     self.scrollback_lines[i] = None;
                 }
-            // And even when scrolling in steps, we can't let it drift too far, since the
-            // buffer size is limited
             } else {
                 scroll_offset -= scroll_delta as f32;
                 scroll_offset = scroll_offset.clamp(-(max_delta as f32), max_delta as f32);
@@ -801,8 +766,6 @@ impl RenderedWindow {
             .filter_map(move |i| self.actual_lines[i].as_ref().map(|line| (i, line)))
     }
 
-    // Iterates over the scrollable lines (excluding the viewport margins). Includes the index for
-    // the given line being scrolled
     fn iter_scrollable_lines(&self) -> impl Iterator<Item = (isize, &Rc<RefCell<RenderedLine>>)> {
         let scroll_offset_lines = self.scroll_animation.position.floor();
         let scroll_offset_lines = scroll_offset_lines as isize;
@@ -853,9 +816,6 @@ impl RenderedWindow {
         })
     }
 
-    /// Returns the rect containing the region of the window that does not have borders above and
-    /// below it. Note: This does not take into account the borders on the left and the right of
-    /// the window.
     pub fn inner_region(&self, pixel_region: PixelRect<f32>, grid_scale: GridScale) -> Rect {
         let line_height = grid_scale.height();
 
@@ -883,7 +843,6 @@ impl RenderedWindow {
                 Some((_, p)) if p == position => false,
                 _ => true,
             };
-            // This can be optimized, only the boxchars need to be redrawn when the window moves
             if line.is_valid && !force && !boxchar_moved {
                 return;
             }
@@ -967,5 +926,44 @@ impl RenderedWindow {
         {
             prepare_line(line)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderedWindow, WindowDrawCommand};
+    use crate::ui::{Hyperlink, Line, LineFragmentData, WindowType};
+    use std::sync::Arc;
+
+    #[test]
+    fn hyperlink_lookup_returns_cell_metadata() {
+        let mut window = RenderedWindow::new(1);
+        window.handle_window_draw_command(WindowDrawCommand::Position {
+            grid_position: (0.0, 0.0),
+            grid_size: (3, 1),
+            anchor_info: None,
+            window_type: WindowType::Editor,
+        });
+        window.handle_window_draw_command(WindowDrawCommand::DrawLine {
+            row: 0,
+            line: Line::new(
+                "abc".into(),
+                vec![LineFragmentData::new(0..3, 0..3, None, Vec::new())],
+                Some(vec!["a".into(), "b".into(), "c".into()]),
+                Some(vec![
+                    Some(Arc::new(Hyperlink {
+                        id: Some("x".into()),
+                        uri: "https://example.com".into(),
+                    })),
+                    None,
+                    None,
+                ]),
+            ),
+        });
+        window.flush(&crate::renderer::RendererSettings::default());
+
+        let link = window.hyperlink_at_cell(0, 0).unwrap();
+        assert_eq!(link.uri, "https://example.com");
+        assert!(window.hyperlink_at_cell(0, 1).is_none());
     }
 }
