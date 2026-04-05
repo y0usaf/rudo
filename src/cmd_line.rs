@@ -1,11 +1,8 @@
 use std::{iter, process::ExitStatus};
 
-use crate::{
-    bridge::create_blocking_nvim_command, dimensions::Dimensions, frame::Frame, settings::*,
-    version::BUILD_VERSION,
-};
+use crate::{dimensions::Dimensions, frame::Frame, settings::*, version::BUILD_VERSION};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{
     ArgAction, Parser, ValueEnum,
     builder::{FalseyValueParser, Styles, styling},
@@ -294,19 +291,9 @@ pub fn argv_chdir() -> Option<String> {
 }
 
 pub fn maybe_passthrough_to_neovim(
-    cmdline_settings: &CmdLineSettings,
+    _cmdline_settings: &CmdLineSettings,
 ) -> Result<Option<ExitStatus>> {
-    if !neovim_passthrough_requested(&cmdline_settings.neovim_args) {
-        return Ok(None);
-    }
-
-    let mut command = create_blocking_nvim_command(cmdline_settings, false);
-    let binary = cmdline_settings.neovim_bin.clone().unwrap_or_else(|| "nvim".to_owned());
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run {binary} for passthrough output"))?;
-
-    Ok(Some(status))
+    Ok(None)
 }
 
 pub fn exit_status_code(status: ExitStatus) -> i32 {

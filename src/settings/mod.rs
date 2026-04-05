@@ -2,20 +2,13 @@ pub mod font;
 mod from_value;
 mod window_size;
 
-use anyhow::{Context, Result};
-use log::{trace, warn};
-use nvim_rs::Neovim;
 use parking_lot::RwLock;
-use rmpv::Value;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
-    convert::TryInto,
     fmt::Debug,
 };
-use winit::event_loop::EventLoopProxy;
 
-use crate::{bridge::NeovimWriter, window::EventPayload, window::RouteId};
 pub use from_value::ParseFromValue;
 pub use window_size::{
     DEFAULT_GRID_SIZE, MIN_GRID_SIZE, PersistentWindowSettings, clamped_grid_size,
@@ -43,30 +36,9 @@ impl FontConfigState {
     }
 }
 
-// Function types to handle settings updates
-type UpdateHandlerFunc = fn(&Settings, Value) -> SettingsChanged;
-type ReaderHandlerFunc = fn(&Settings) -> Option<Value>;
-
-// The Settings struct acts as a global container where each of Neovide's subsystems can store
-// their own settings. It will also coordinate updates between Neovide and nvim to make sure the
-// settings remain consistent on both sides.
-// Note: As right now we're only sending new setting values to Neovide during the
-// read_initial_values call, after that point we should not modify the contents of the Settings
-// struct except when prompted by an update event from nvim. Otherwise, the settings in Neovide and
-// nvim will get out of sync.
 #[derive(Default, Debug)]
 pub struct Settings {
     settings: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    updaters: RwLock<HashMap<SettingLocation, UpdateHandlerFunc>>,
-    readers: RwLock<HashMap<SettingLocation, ReaderHandlerFunc>>,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub enum SettingLocation {
-    // Setting from global variable with neovide prefix
-    NeovideGlobal(String),
-    // Setting from global neovim option
-    NeovimOption(String),
 }
 
 impl Settings {
@@ -76,17 +48,6 @@ impl Settings {
         settings
     }
 
-    pub fn set_setting_handlers(
-        &self,
-        setting_location: SettingLocation,
-        update_func: UpdateHandlerFunc,
-        reader_func: ReaderHandlerFunc,
-    ) {
-        self.updaters.write().insert(setting_location.clone(), update_func);
-
-        self.readers.write().insert(setting_location.clone(), reader_func);
-    }
-
     pub fn set<T: Clone + Send + Sync + 'static>(&self, t: &T) {
         let type_id: TypeId = TypeId::of::<T>();
         let t: T = (*t).clone();
@@ -94,7 +55,7 @@ impl Settings {
         write_lock.insert(type_id, Box::new(t));
     }
 
-    pub fn get<T: Clone + Send + Sync + 'static>(&'_ self) -> T {
+    pub fn get<T: Clone + Send + Sync + 'static>(&self) -> T {
         let read_lock = self.settings.read();
         let boxed = &read_lock
             .get(&TypeId::of::<T>())
@@ -103,121 +64,6 @@ impl Settings {
             .downcast_ref::<T>()
             .expect("Attempted to extract a settings object of the wrong type");
         (*value).clone()
-    }
-
-    pub fn setting_locations(&self) -> Vec<SettingLocation> {
-        self.updaters.read().keys().cloned().collect()
-    }
-
-    pub async fn read_initial_values(&self, nvim: &Neovim<NeovimWriter>) -> Result<()> {
-        let deprecated_settings = ["transparency".to_owned()];
-        let keys: Vec<SettingLocation> = self
-            .updaters
-            .read()
-            .keys()
-            .filter(|key| !matches!(key, SettingLocation::NeovideGlobal(name) if deprecated_settings.contains(name)))
-            .cloned()
-            .collect();
-
-        for location in keys {
-            match &location {
-                SettingLocation::NeovideGlobal(name) => {
-                    let variable_name = format!("neovide_{name}");
-                    match nvim.get_var(&variable_name).await {
-                        Ok(value) => {
-                            self.updaters.read().get(&location).unwrap()(self, value);
-                        }
-                        Err(error) => {
-                            trace!("Initial value load failed for {name}: {error}");
-                            let value = self.readers.read().get(&location).unwrap()(self);
-                            if let Some(value) = value {
-                                nvim.set_var(&variable_name, value).await.with_context(|| {
-                                    format!("Could not set initial value for {name}")
-                                })?;
-                            }
-                        }
-                    }
-                }
-                SettingLocation::NeovimOption(name) => match nvim.get_option(name).await {
-                    Ok(value) => {
-                        self.updaters.read().get(&location).unwrap()(self, value);
-                    }
-                    Err(error) => {
-                        trace!("Initial value load failed for {name}: {error}");
-                    }
-                },
-            }
-        }
-        Ok(())
-    }
-
-    pub fn handle_setting_changed_notification(
-        &self,
-        arguments: Vec<Value>,
-        event_loop_proxy: &EventLoopProxy<EventPayload>,
-        route_id: RouteId,
-    ) {
-        let mut arguments = arguments.into_iter();
-        let (Some(name), Some(value)) = (arguments.next(), arguments.next()) else {
-            warn!("Ignoring malformed setting_changed notification: expected [name, value]");
-            return;
-        };
-
-        let name: Result<String, _> = name.try_into();
-        let name = match name {
-            Ok(name) => name,
-            Err(error) => {
-                warn!("Ignoring setting_changed notification with invalid name: {error}");
-                return;
-            }
-        };
-
-        let location = SettingLocation::NeovideGlobal(name.clone());
-        let update_handler = match self.updaters.read().get(&location).copied() {
-            Some(handler) => handler,
-            None => {
-                warn!("Ignoring setting_changed notification for unknown setting: {name}");
-                return;
-            }
-        };
-
-        let event = update_handler(self, value);
-        let _ = event_loop_proxy.send_event(EventPayload::for_route(event.into(), route_id));
-    }
-
-    pub fn handle_option_changed_notification(
-        &self,
-        arguments: Vec<Value>,
-        event_loop_proxy: &EventLoopProxy<EventPayload>,
-        route_id: RouteId,
-    ) {
-        let mut arguments = arguments.into_iter();
-        let (Some(name), Some(value)) = (arguments.next(), arguments.next()) else {
-            warn!("Ignoring malformed option_changed notification: expected [name, value]");
-            return;
-        };
-
-        let name: Result<String, _> = name.try_into();
-        let name = match name {
-            Ok(name) => name,
-            Err(error) => {
-                warn!("Ignoring option_changed notification with invalid name: {error}");
-                return;
-            }
-        };
-
-        let location = SettingLocation::NeovimOption(name.clone());
-        let update_handler = match self.updaters.read().get(&location).copied() {
-            Some(handler) => handler,
-            None => {
-                warn!("Ignoring option_changed notification for unknown option: {name}");
-                return;
-            }
-        };
-
-        let event = update_handler(self, value);
-
-        let _ = event_loop_proxy.send_event(EventPayload::for_route(event.into(), route_id));
     }
 
     pub fn register<T: SettingGroup>(&self) {
@@ -231,79 +77,11 @@ pub enum SettingsChanged {
     Cursor(crate::renderer::cursor_renderer::CursorSettingsChanged),
     Renderer(crate::renderer::RendererSettingsChanged),
     ProgressBar(crate::renderer::progress_bar::ProgressBarSettingsChanged),
-    #[cfg(test)]
-    Test(tests::TestSettingsChanged),
 }
 
 #[cfg(test)]
 mod tests {
-    #[derive(Clone, SettingGroup)]
-    struct TestSettings {
-        foo: String,
-        bar: String,
-        baz: String,
-        #[option = "mousemoveevent"]
-        mousemoveevent_option: Option<bool>,
-    }
-
-    impl Default for TestSettings {
-        fn default() -> Self {
-            Self {
-                foo: "foo".to_string(),
-                bar: "bar".to_string(),
-                baz: "baz".to_string(),
-                mousemoveevent_option: None,
-            }
-        }
-    }
-
-    use async_trait::async_trait;
-    use nvim_rs::{Handler, Neovim};
-
     use super::*;
-    use crate::{
-        bridge::{
-            OpenMode, create_tokio_nvim_command,
-            session::{NeovimInstance, NeovimSession},
-        },
-        cmd_line::CmdLineSettings,
-        error_handling::ResultPanicExplanation,
-    };
-
-    #[derive(Clone)]
-    pub struct NeovimHandler();
-
-    #[async_trait]
-    impl Handler for NeovimHandler {
-        type Writer = NeovimWriter;
-
-        async fn handle_notify(
-            &self,
-            _event_name: String,
-            _arguments: Vec<Value>,
-            _neovim: Neovim<NeovimWriter>,
-        ) {
-        }
-    }
-
-    #[test]
-    fn test_set_setting_handlers() {
-        let settings = Settings::new();
-
-        let location = SettingLocation::NeovideGlobal("foo".to_owned());
-
-        fn noop_update(_settings: &Settings, _value: Value) -> SettingsChanged {
-            SettingsChanged::Test(TestSettingsChanged::Foo("hello".to_string()))
-        }
-        fn noop_read(_settings: &Settings) -> Option<Value> {
-            None
-        }
-
-        settings.set_setting_handlers(location.clone(), noop_update, noop_read);
-        let listeners = settings.updaters.read();
-        let listener = listeners.get(&location).unwrap();
-        assert!(core::ptr::fn_addr_eq(noop_update as UpdateHandlerFunc, *listener));
-    }
 
     #[test]
     fn test_set() {
@@ -358,35 +136,5 @@ mod tests {
 
         assert_eq!(v1, r1);
         assert_eq!(v2, r2);
-    }
-
-    #[tokio::test]
-    async fn test_read_initial_values() {
-        let settings = Settings::new();
-        settings.register::<TestSettings>();
-
-        // create_tokio_nvim_command reads from CmdLineSettings.neovim_args
-        settings.set::<CmdLineSettings>(&CmdLineSettings::default());
-
-        let cmdline_settings = settings.get::<CmdLineSettings>();
-        let command = create_tokio_nvim_command(&cmdline_settings, true, None, OpenMode::Startup);
-        let instance = NeovimInstance::Embedded(command);
-        let NeovimSession { neovim: nvim, .. } = NeovimSession::new(instance, NeovimHandler())
-            .await
-            .unwrap_or_explained_panic("Could not locate or start the neovim process");
-        nvim.set_var("neovide_bar", Value::from("bar_set".to_owned()))
-            .await
-            .expect("Could not set neovide_bar variable");
-        nvim.set_option("mousemoveevent", Value::from(true))
-            .await
-            .expect("Could not set mousemoveevent option");
-
-        settings.read_initial_values(&nvim).await.expect("Read initial values failed");
-
-        let test_settings = settings.get::<TestSettings>();
-        assert_eq!(test_settings.foo, "foo");
-        assert_eq!(test_settings.bar, "bar_set");
-        assert_eq!(test_settings.baz, "baz");
-        assert_eq!(test_settings.mousemoveevent_option, Some(true));
     }
 }

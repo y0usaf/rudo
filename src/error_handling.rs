@@ -6,7 +6,6 @@ use std::{
 
 use anyhow::{Error, Result};
 use clap::error::Error as ClapError;
-use itertools::Itertools;
 use log::error;
 use winit::event_loop::EventLoop;
 
@@ -14,7 +13,6 @@ use winit::event_loop::EventLoop;
 use crate::windows_attach_to_console;
 
 use crate::{
-    bridge::{ParallelCommand, require_active_handler, send_ui},
     clipboard::Clipboard,
     settings::Settings,
     window::{EventPayload, show_error_window},
@@ -26,14 +24,9 @@ fn show_error(explanation: &str) -> ! {
 }
 
 pub fn show_nvim_error(msg: &str) {
-    let handler = require_active_handler();
-    send_ui(
-        ParallelCommand::ShowError { lines: msg.split('\n').map(|s| s.to_string()).collect_vec() },
-        &handler,
-    );
+    error!("{msg}");
 }
 
-/// Formats, logs and displays the given message.
 #[macro_export]
 macro_rules! error_msg {
     ($($arg:tt)+) => {
@@ -60,13 +53,12 @@ impl<T, E: ToString> ResultPanicExplanation<T, E> for Result<T, E> {
 }
 
 fn format_and_log_error_message(err: Error) -> String {
-    let msg = format!("\
-Neovide just crashed :(
-This is the error that caused the crash. In case you don't know what to do with this, please feel free to report this on https://github.com/neovide/neovide/issues!
+    format!(
+        "Termvide just crashed :(
+This is the error that caused the crash. In case you don't know what to do with this, please feel free to report this on https://github.com/y0usaf/termvide/issues!
 
 {err:?}"
-    );
-    msg
+    )
 }
 
 pub fn handle_startup_errors(
@@ -75,14 +67,12 @@ pub fn handle_startup_errors(
     settings: Arc<Settings>,
     clipboard: Arc<Mutex<Clipboard>>,
 ) -> ExitCode {
-    // Command line output is always printed to the stdout/stderr
     if let Some(clap_error) = err.downcast_ref::<ClapError>() {
         #[cfg(target_os = "windows")]
         windows_attach_to_console();
         let _ = clap_error.print();
         ExitCode::from(clap_error.exit_code() as u8)
     } else if stdout().is_terminal() {
-        // The logger already writes to stderr
         log::error!("{}", &format_and_log_error_message(err));
         ExitCode::from(1)
     } else {

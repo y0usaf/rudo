@@ -729,10 +729,10 @@ impl ApplicationHandler<EventPayload> for Application {
 
                 self.prepare_open_files(event_loop, new_window, cwd, open_args);
             }
-            UserEvent::NeovimExited => {
+            UserEvent::ProcessExited => {
                 let route_id = self.route_id_for_target(target);
                 let Some(route_id) = route_id else {
-                    log::warn!("NeovimExited event missing window/route target");
+                    log::warn!("ProcessExited event missing window/route target");
                     return;
                 };
                 let window_id = self.window_wrapper.window_id_for_route(route_id);
@@ -740,7 +740,7 @@ impl ApplicationHandler<EventPayload> for Application {
                 if remaining_before <= 1 && window_id.is_some() {
                     save_window_size(&self.window_wrapper, &self.settings);
                 }
-                self.window_wrapper.handle_neovim_exit_route(route_id, &self.proxy);
+                self.window_wrapper.handle_process_exit_route(route_id, &self.proxy);
                 if let Some(window_id) = window_id {
                     self.render_states.remove(&window_id);
                 }
@@ -825,7 +825,7 @@ impl ApplicationHandler<EventPayload> for Application {
                 self.window_wrapper.handle_mac_shortcut(command);
                 self.mark_should_render_all();
             }
-            UserEvent::NeovimLaunchError { message } => {
+            UserEvent::ProcessLaunchError { message } => {
                 let window_config = error_window::create_error_window(event_loop, &self.settings);
                 let clipboard_handle = ClipboardHandle::new(self.clipboard.as_ref().unwrap());
                 let state = error_window::State::new(
@@ -836,20 +836,6 @@ impl ApplicationHandler<EventPayload> for Application {
                 );
                 let window_id = state.window_id();
                 self.error_windows.insert(window_id, (state, message));
-            }
-            UserEvent::NeovimRestart(details) => {
-                let route_id = self.route_id_for_target(target);
-                let Some(route_id) = route_id else {
-                    log::warn!("NeovimRestart event missing window/route target");
-                    return;
-                };
-                self.window_wrapper.queue_restart_route(route_id, details);
-                if let Some(window_id) = self.window_wrapper.window_id_for_route(route_id) {
-                    if let Some(state) = self.render_states.get_mut(&window_id) {
-                        state.pending_draw_commands.clear();
-                        state.should_render = ShouldRender::Immediately;
-                    }
-                }
             }
             payload => {
                 self.window_wrapper.handle_user_event(EventPayload { payload, target });
