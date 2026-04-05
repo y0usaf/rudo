@@ -70,24 +70,52 @@ impl TerminalScreen {
     }
 
     pub fn clear(&mut self) {
-        self.cells.fill(TerminalCell::default());
+        self.clear_with(&TerminalCell::default());
+    }
+
+    pub fn clear_with(&mut self, fill: &TerminalCell) {
+        self.cells.fill(fill.clone());
     }
 
     pub fn clear_line(&mut self, row: usize) {
+        self.clear_line_with(row, &TerminalCell::default());
+    }
+
+    pub fn clear_line_with(&mut self, row: usize, fill: &TerminalCell) {
         if let Some(line) = self.row_mut(row) {
-            line.fill(TerminalCell::default());
+            line.fill(fill.clone());
         }
     }
 
     pub fn erase_chars(&mut self, row: usize, start_col: usize, count: usize) {
+        self.erase_chars_with(row, start_col, count, &TerminalCell::default());
+    }
+
+    pub fn erase_chars_with(
+        &mut self,
+        row: usize,
+        start_col: usize,
+        count: usize,
+        fill: &TerminalCell,
+    ) {
         let cols = self.cols;
         let end = start_col.saturating_add(count).min(cols);
         if let Some(line) = self.row_mut(row) {
-            line[start_col.min(cols)..end].fill(TerminalCell::default());
+            line[start_col.min(cols)..end].fill(fill.clone());
         }
     }
 
     pub fn delete_chars(&mut self, row: usize, start_col: usize, count: usize) {
+        self.delete_chars_with(row, start_col, count, &TerminalCell::default());
+    }
+
+    pub fn delete_chars_with(
+        &mut self,
+        row: usize,
+        start_col: usize,
+        count: usize,
+        fill: &TerminalCell,
+    ) {
         if row >= self.rows || start_col >= self.cols {
             return;
         }
@@ -97,10 +125,20 @@ impl TerminalScreen {
         let tail = &mut line[start_col..];
         tail.rotate_left(count);
         let fill_start = tail.len() - count;
-        tail[fill_start..].fill(TerminalCell::default());
+        tail[fill_start..].fill(fill.clone());
     }
 
     pub fn insert_blank_chars(&mut self, row: usize, start_col: usize, count: usize) {
+        self.insert_blank_chars_with(row, start_col, count, &TerminalCell::default());
+    }
+
+    pub fn insert_blank_chars_with(
+        &mut self,
+        row: usize,
+        start_col: usize,
+        count: usize,
+        fill: &TerminalCell,
+    ) {
         if row >= self.rows || start_col >= self.cols {
             return;
         }
@@ -109,7 +147,7 @@ impl TerminalScreen {
         let line = self.row_mut(row).expect("validated row must exist");
         let tail = &mut line[start_col..];
         tail.rotate_right(count);
-        tail[..count].fill(TerminalCell::default());
+        tail[..count].fill(fill.clone());
     }
 
     pub fn insert_lines(&mut self, row: usize, count: usize) {
@@ -117,6 +155,16 @@ impl TerminalScreen {
     }
 
     pub fn insert_lines_in_region(&mut self, row: usize, bottom_exclusive: usize, count: usize) {
+        self.insert_lines_in_region_with(row, bottom_exclusive, count, &TerminalCell::default());
+    }
+
+    pub fn insert_lines_in_region_with(
+        &mut self,
+        row: usize,
+        bottom_exclusive: usize,
+        count: usize,
+        fill: &TerminalCell,
+    ) {
         if row >= self.rows || row >= bottom_exclusive || bottom_exclusive > self.rows {
             return;
         }
@@ -126,7 +174,7 @@ impl TerminalScreen {
         let region = self.region_range(row, bottom_exclusive);
         self.cells[region].rotate_right(count * cols);
         for clear_row in row..row + count {
-            self.clear_line(clear_row);
+            self.clear_line_with(clear_row, fill);
         }
     }
 
@@ -135,6 +183,16 @@ impl TerminalScreen {
     }
 
     pub fn delete_lines_in_region(&mut self, row: usize, bottom_exclusive: usize, count: usize) {
+        self.delete_lines_in_region_with(row, bottom_exclusive, count, &TerminalCell::default());
+    }
+
+    pub fn delete_lines_in_region_with(
+        &mut self,
+        row: usize,
+        bottom_exclusive: usize,
+        count: usize,
+        fill: &TerminalCell,
+    ) {
         if row >= self.rows || row >= bottom_exclusive || bottom_exclusive > self.rows {
             return;
         }
@@ -144,40 +202,56 @@ impl TerminalScreen {
         let region = self.region_range(row, bottom_exclusive);
         self.cells[region].rotate_left(count * cols);
         for clear_row in bottom_exclusive - count..bottom_exclusive {
-            self.clear_line(clear_row);
+            self.clear_line_with(clear_row, fill);
         }
     }
 
     pub fn clear_line_from(&mut self, row: usize, start_col: usize) {
+        self.clear_line_from_with(row, start_col, &TerminalCell::default());
+    }
+
+    pub fn clear_line_from_with(&mut self, row: usize, start_col: usize, fill: &TerminalCell) {
         let cols = self.cols;
         if let Some(line) = self.row_mut(row) {
-            line[start_col.min(cols)..].fill(TerminalCell::default());
+            line[start_col.min(cols)..].fill(fill.clone());
         }
     }
 
     pub fn clear_line_to(&mut self, row: usize, end_col: usize) {
+        self.clear_line_to_with(row, end_col, &TerminalCell::default());
+    }
+
+    pub fn clear_line_to_with(&mut self, row: usize, end_col: usize, fill: &TerminalCell) {
         let cols = self.cols;
         if cols == 0 {
             return;
         }
 
         if let Some(line) = self.row_mut(row) {
-            line[..=end_col.min(cols.saturating_sub(1))].fill(TerminalCell::default());
+            line[..=end_col.min(cols.saturating_sub(1))].fill(fill.clone());
         }
     }
 
     pub fn clear_from_cursor(&mut self, col: usize, row: usize) {
-        self.clear_line_from(row, col);
+        self.clear_from_cursor_with(col, row, &TerminalCell::default());
+    }
+
+    pub fn clear_from_cursor_with(&mut self, col: usize, row: usize, fill: &TerminalCell) {
+        self.clear_line_from_with(row, col, fill);
         for next_row in row.saturating_add(1)..self.rows {
-            self.clear_line(next_row);
+            self.clear_line_with(next_row, fill);
         }
     }
 
     pub fn clear_to_cursor(&mut self, col: usize, row: usize) {
+        self.clear_to_cursor_with(col, row, &TerminalCell::default());
+    }
+
+    pub fn clear_to_cursor_with(&mut self, col: usize, row: usize, fill: &TerminalCell) {
         for prior_row in 0..row {
-            self.clear_line(prior_row);
+            self.clear_line_with(prior_row, fill);
         }
-        self.clear_line_to(row, col);
+        self.clear_line_to_with(row, col, fill);
     }
 
     pub fn scroll_up(&mut self, lines: usize) -> Vec<Vec<TerminalCell>> {
@@ -190,25 +264,48 @@ impl TerminalScreen {
         bottom_exclusive: usize,
         lines: usize,
     ) -> Vec<Vec<TerminalCell>> {
+        self.scroll_up_in_region_with(top, bottom_exclusive, lines, &TerminalCell::default())
+    }
+
+    pub fn scroll_up_in_region_with(
+        &mut self,
+        top: usize,
+        bottom_exclusive: usize,
+        lines: usize,
+        fill: &TerminalCell,
+    ) -> Vec<Vec<TerminalCell>> {
         if top >= bottom_exclusive || bottom_exclusive > self.rows {
             return Vec::new();
         }
 
         let height = bottom_exclusive - top;
         let lines = lines.min(height);
-        let removed = (top..top + lines).map(|row| self.row_cells(row)).collect();
-
         let cols = self.cols;
-        let region = self.region_range(top, bottom_exclusive);
-        self.cells[region].rotate_left(lines * cols);
-        for clear_row in bottom_exclusive - lines..bottom_exclusive {
-            self.clear_line(clear_row);
-        }
+
+        // Drain removed rows directly to avoid clone-then-rotate.
+        let drain_start = top * cols;
+        let drain_end = (top + lines) * cols;
+        let removed_flat: Vec<TerminalCell> = self.cells.drain(drain_start..drain_end).collect();
+        let removed = removed_flat.chunks_exact(cols).map(|chunk| chunk.to_vec()).collect();
+
+        // Fill the gap at the bottom of the region with blank cells.
+        let insert_at = (bottom_exclusive - lines) * cols;
+        self.cells.splice(insert_at..insert_at, std::iter::repeat_n(fill.clone(), lines * cols));
 
         removed
     }
 
     pub fn scroll_down_in_region(&mut self, top: usize, bottom_exclusive: usize, lines: usize) {
+        self.scroll_down_in_region_with(top, bottom_exclusive, lines, &TerminalCell::default());
+    }
+
+    pub fn scroll_down_in_region_with(
+        &mut self,
+        top: usize,
+        bottom_exclusive: usize,
+        lines: usize,
+        fill: &TerminalCell,
+    ) {
         if top >= bottom_exclusive || bottom_exclusive > self.rows {
             return;
         }
@@ -219,7 +316,7 @@ impl TerminalScreen {
         let region = self.region_range(top, bottom_exclusive);
         self.cells[region].rotate_right(lines * cols);
         for clear_row in top..top + lines {
-            self.clear_line(clear_row);
+            self.clear_line_with(clear_row, fill);
         }
     }
 
@@ -228,7 +325,7 @@ impl TerminalScreen {
     }
 
     pub fn row_text(&self, row: usize) -> String {
-        self.row(row).into_iter().flatten().map(|cell| cell.text.as_str()).collect::<String>()
+        self.row(row).into_iter().flatten().map(|cell| cell.text()).collect::<String>()
     }
 
     fn index(&self, col: usize, row: usize) -> Option<usize> {
@@ -262,9 +359,9 @@ mod tests {
 
         let removed = screen.scroll_up(1);
 
-        assert_eq!(removed[0][0].text, "a");
-        assert_eq!(screen.get(0, 0).unwrap().text, "b");
-        assert_eq!(screen.get(0, 1).unwrap().text, " ");
+        assert_eq!(removed[0][0].text(), "a");
+        assert_eq!(screen.get(0, 0).unwrap().text(), "b");
+        assert_eq!(screen.get(0, 1).unwrap().text(), " ");
     }
 
     #[test]
