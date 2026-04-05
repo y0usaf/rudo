@@ -16,10 +16,6 @@ macro_rules! tracy_zone {
     ($name: expr, $color: expr) => {};
     ($name: expr) => {};
 }
-macro_rules! tracy_dynamic_zone {
-    ($name: expr, $color: expr) => {};
-    ($name: expr) => {};
-}
 macro_rules! tracy_gpu_zone {
     ($name: expr, $color: expr) => {};
     ($name: expr) => {};
@@ -38,10 +34,11 @@ macro_rules! tracy_fiber_enter {
     ($name: expr) => {};
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn tracy_fiber_leave() {}
 
-pub(crate) use tracy_dynamic_zone;
+#[allow(unused_imports)]
 pub(crate) use tracy_fiber_enter;
 pub(crate) use tracy_gpu_zone;
 pub(crate) use tracy_named_frame;

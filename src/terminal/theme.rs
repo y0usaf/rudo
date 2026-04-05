@@ -10,7 +10,7 @@ use crate::ui::Colors;
 
 const WALLUST_THEME_PATH: &str = ".cache/wallust/termvide-theme.toml";
 const TERMVIDE_THEME_PATH: &str = ".config/termvide/theme.toml";
-const NEOVIDE_THEME_PATH: &str = ".config/neovide/termvide-theme.toml";
+const LEGACY_THEME_PATH: &str = ".config/termvide/termvide-theme.toml";
 const TERMVIDE_THEME_ENV: &str = "TERMVIDE_THEME";
 
 #[derive(Clone, Debug)]
@@ -167,7 +167,7 @@ impl TerminalTheme {
         if let Some(home) = dirs::home_dir() {
             paths.push(home.join(WALLUST_THEME_PATH));
             paths.push(home.join(TERMVIDE_THEME_PATH));
-            paths.push(home.join(NEOVIDE_THEME_PATH));
+            paths.push(home.join(LEGACY_THEME_PATH));
         }
 
         paths

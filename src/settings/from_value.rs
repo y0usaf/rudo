@@ -3,6 +3,7 @@ use serde_json::Value;
 
 // Trait to allow for conversion from serde_json::Value to any other data type.
 // Note: Feel free to implement this trait for custom types in each subsystem.
+#[allow(dead_code)]
 pub trait ParseFromValue {
     fn parse_from_value(&mut self, value: Value);
 }

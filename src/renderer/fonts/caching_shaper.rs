@@ -1,7 +1,7 @@
 use std::{num::NonZeroUsize, rc::Rc};
 
 use itertools::Itertools;
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use lru::LruCache;
 use skia_safe::{
     TextBlob, TextBlobBuilder,
@@ -55,7 +55,8 @@ impl CachingShaper {
             linespace: 0.0,
             font_info: None,
         };
-        shaper.reset_font_loader();
+        let (_, font_width) = shaper.info();
+        log::info!("Initial font: size={font_size:.2}px, width={font_width:.2}px");
         shaper
     }
 
@@ -82,20 +83,6 @@ impl CachingShaper {
         debug!("scale_factor changed: {scale_factor:.2}");
         self.scale_factor = scale_factor;
         self.reset_font_loader();
-    }
-
-    pub fn update_font(&mut self, guifont_setting: &str) {
-        debug!("Updating font: {guifont_setting}");
-
-        let options = match FontOptions::parse(guifont_setting) {
-            Ok(opt) => opt,
-            Err(msg) => {
-                error_msg!("Failed to parse guifont: {}", msg);
-                return;
-            }
-        };
-
-        self.update_font_options(options);
     }
 
     pub fn update_font_options(&mut self, options: FontOptions) {
@@ -141,26 +128,6 @@ impl CachingShaper {
         self.reset_font_loader();
     }
 
-    pub fn update_linespace(&mut self, linespace: f32) {
-        debug!("Updating linespace: {linespace}");
-
-        let font_height = self.font_base_dimensions().height;
-        let impossible_linespace = font_height + linespace <= 0.0;
-
-        if !impossible_linespace {
-            debug!("Linespace updated to: {linespace}");
-            self.linespace = linespace;
-            self.reset_font_loader();
-        } else {
-            let reason = if impossible_linespace {
-                "Linespace too negative, would make font invisible"
-            } else {
-                "Font not found"
-            };
-            error!("Linespace can't be updated to {linespace} due to: {reason}");
-        }
-    }
-
     fn reset_font_loader(&mut self) {
         tracy_zone!("reset_font_loader");
         self.font_info = None;
@@ -171,10 +138,6 @@ impl CachingShaper {
         info!("Reset Font Loader: font_size: {font_size:.2}px, font_width: {font_width:.2}px");
 
         self.blob_cache.clear();
-    }
-
-    pub fn font_names(&self) -> Vec<String> {
-        self.font_loader.font_names()
     }
 
     fn info(&mut self) -> (Metrics, f32) {
@@ -246,7 +209,7 @@ impl CachingShaper {
         let mut cluster = CharCluster::new();
 
         // Enumerate the characters storing the glyph index in the user data so that we can position
-        // glyphs according to Neovim's grid rules
+        // glyphs according to the terminal grid rules
         let mut parser = Parser::new(
             Script::Latin,
             word.grapheme_clusters().flat_map(|(cell_index, cluster)| {
@@ -365,7 +328,7 @@ impl CachingShaper {
 
     pub fn cleanup_font_cache(&self) {
         // Only purge if we are truly about to exhaust the cache.
-        // See: https://github.com/neovide/neovide/issues/3299
+        // See: https://github.com/neovide/neovide/issues/3299 (upstream Neovide)
         // On high-DPI displays the old unconditional purge invalidated
         // glyphs every frame, which forced the GPU to keep
         // re-uploading textures and tanked performance.

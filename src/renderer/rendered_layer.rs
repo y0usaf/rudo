@@ -1,19 +1,14 @@
 use itertools::Itertools;
 use skia_safe::{
-    BlendMode, Canvas, ClipOp, Color, Paint, Path, PathOp, Point3, RRect, Rect,
+    BlendMode, Canvas, Color, Paint, Path, PathBuilder, PathOp, Rect,
     canvas::SaveLayerRec,
-    image_filters::blur,
-    utils::shadow_utils::{ShadowFlags, draw_shadow},
 };
 
 use glamour::Intersection;
 
-use crate::{
-    ui::WindowType,
-    units::{GridScale, PixelRect, to_skia_rect},
-};
+use crate::units::{GridScale, PixelRect, to_skia_rect};
 
-use super::{RenderedWindow, RendererSettings, WindowDrawDetails, is_rightmost_window_edge};
+use super::{RenderedWindow, WindowDrawDetails, is_rightmost_window_edge};
 
 struct LayerWindow<'w> {
     window: &'w mut RenderedWindow,
@@ -47,7 +42,6 @@ impl FloatingLayer<'_> {
     pub fn draw(
         &mut self,
         root_canvas: &Canvas,
-        settings: &RendererSettings,
         default_background: Color,
         grid_scale: GridScale,
         content_region: Option<PixelRect<f32>>,
@@ -65,33 +59,12 @@ impl FloatingLayer<'_> {
             })
             .collect::<Vec<_>>();
 
-        let (silhouette, bound_rect) = build_silhouette(&pixel_regions, settings, grid_scale);
+        let silhouette = build_silhouette(&pixel_regions, grid_scale);
         let (draw_clip, draw_bound_rect) =
-            self.build_draw_clip_and_bounds(silhouette.clone(), bound_rect, &regions, grid_scale);
-        let has_transparency = self.windows.iter().any(|window| window.has_transparency());
-
-        self._draw_shadow(root_canvas, &silhouette, settings);
+            self.build_draw_clip_and_bounds(silhouette.clone(), Rect::default(), &regions, grid_scale);
 
         root_canvas.save();
         root_canvas.clip_path(&draw_clip, None, Some(false));
-        let need_blur = has_transparency || settings.floating_blur;
-        if need_blur {
-            if let Some(blur) = blur(
-                (settings.floating_blur_amount_x, settings.floating_blur_amount_y),
-                None,
-                None,
-                None,
-            ) {
-                let paint = Paint::default()
-                    .set_anti_alias(false)
-                    .set_blend_mode(BlendMode::Src)
-                    .to_owned();
-                let save_layer_rec =
-                    SaveLayerRec::default().backdrop(&blur).bounds(&draw_bound_rect).paint(&paint);
-                root_canvas.save_layer(&save_layer_rec);
-                root_canvas.restore();
-            }
-        }
 
         let paint =
             Paint::default().set_anti_alias(false).set_blend_mode(BlendMode::SrcOver).to_owned();
@@ -111,7 +84,6 @@ impl FloatingLayer<'_> {
                 id: window.id,
                 region: regions[i],
                 grid_size: window.grid_size,
-                window_type: window.window_type,
             });
         });
 
@@ -126,46 +98,6 @@ impl FloatingLayer<'_> {
         ret
     }
 
-    fn _draw_shadow(&self, root_canvas: &Canvas, path: &Path, settings: &RendererSettings) {
-        if !settings.floating_shadow {
-            return;
-        }
-        // Assume that the message window is the only one in the layer
-        if self
-            .windows
-            .first()
-            .is_some_and(|w| matches!(w.window_type, WindowType::Message { scrolled: false }))
-        {
-            return;
-        }
-
-        root_canvas.save();
-        // We clip using the Difference op to make sure that the shadow isn't rendered inside
-        // the window itself.
-        root_canvas.clip_path(path, Some(ClipOp::Difference), None);
-        // The light angle is specified in degrees from the vertical, so we first convert them
-        // to radians and then use sin/cos to get the y and z components of the light
-        let light_angle_radians = settings.light_angle_degrees.to_radians();
-        draw_shadow(
-            root_canvas,
-            path,
-            // Specifies how far from the root canvas the shadow casting rect is. We just use
-            // the z component here to set it a constant distance away.
-            Point3::new(0., 0., settings.floating_z_height),
-            // Because we use the DIRECTIONAL_LIGHT shadow flag, this specifies the angle that
-            // the light is coming from.
-            Point3::new(0., -light_angle_radians.sin(), light_angle_radians.cos()),
-            // This is roughly equal to the apparent radius of the light .
-            5.,
-            Color::from_argb((0.03 * 255.) as u8, 0, 0, 0),
-            Color::from_argb((0.35 * 255.) as u8, 0, 0, 0),
-            // Directional Light flag is necessary to make the shadow render consistently
-            // across various sizes of floating windows. It effects how the light direction is
-            // processed.
-            Some(ShadowFlags::DIRECTIONAL_LIGHT),
-        );
-        root_canvas.restore();
-    }
 }
 
 fn get_window_group(windows: &mut Vec<LayerWindow>, index: usize) -> usize {
@@ -222,30 +154,22 @@ pub fn group_windows(
 
 fn build_silhouette(
     regions: &[PixelRect<f32>],
-    settings: &RendererSettings,
-    grid_scale: GridScale,
-) -> (Path, Rect) {
-    let silhouette = regions
+    _grid_scale: GridScale,
+) -> Path {
+    regions
         .iter()
-        .map(|r| rect_to_round_rect_path(to_skia_rect(r), settings, grid_scale))
+        .map(|r| {
+            let rect = to_skia_rect(r);
+            let mut builder = PathBuilder::new();
+            builder.add_rect(rect, None, None);
+            builder.detach()
+        })
         .reduce(|a, b| a.op(&b, PathOp::Union).unwrap())
-        .unwrap();
-
-    let bounding_rect = regions.iter().map(to_skia_rect).reduce(Rect::join2).unwrap();
-
-    (silhouette, bounding_rect)
+        .unwrap()
 }
 
 fn max_region_max_x(regions: &[PixelRect<f32>]) -> f32 {
     regions.iter().fold(f32::NEG_INFINITY, |max_x, region| max_x.max(region.max.x))
 }
 
-fn rect_to_round_rect_path(rect: Rect, settings: &RendererSettings, grid_scale: GridScale) -> Path {
-    let scaled_radius =
-        if settings.floating_corner_radius > 0.0 && settings.floating_corner_radius <= 1.0 {
-            settings.floating_corner_radius * grid_scale.height()
-        } else {
-            0.0
-        };
-    Path::rrect(RRect::new_rect_xy(rect, scaled_radius, scaled_radius), None)
-}
+

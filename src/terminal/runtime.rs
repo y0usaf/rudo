@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 
 use anyhow::Result;
 use tokio::{runtime::{Builder, Runtime}, sync::watch};
@@ -10,7 +10,7 @@ use crate::{
         platform_default_shell, terminal_environment,
     },
     running_tracker::RunningTracker,
-    terminal::session::spawn_pty_listener,
+    terminal::{session::spawn_pty_listener, theme::TerminalTheme},
     window::{EventPayload, RouteId},
 };
 
@@ -37,7 +37,14 @@ pub struct TerminalRuntime {
 
 impl TerminalRuntime {
     pub fn new() -> std::io::Result<Self> {
-        let runtime = Builder::new_multi_thread().enable_all().build()?;
+        let available = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let workers = available.min(4);
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()?;
         Ok(Self { runtime: Some(runtime) })
     }
 
@@ -66,6 +73,8 @@ impl TerminalRuntime {
         let (resize_tx, resize_rx) = watch::channel(size);
         let resize_tx = Arc::new(resize_tx);
 
+        let theme = TerminalTheme::load();
+
         let listener_process = process.clone();
         self.runtime().spawn(async move {
             if let Err(error) = spawn_pty_listener(
@@ -76,6 +85,7 @@ impl TerminalRuntime {
                 size.cols as usize,
                 size.rows as usize,
                 resize_rx,
+                theme,
             )
             .await
             {
@@ -100,6 +110,10 @@ impl TerminalRuntime {
         // before the child process starts its redraw in response to SIGWINCH.
         let _ = handle.resize_tx.send(size);
         self.runtime().spawn(async move {
+            // Yield once so the session listener has a chance to observe the
+            // watch-channel update and resize its terminal state *before* we
+            // deliver SIGWINCH to the child (which triggers its redraw).
+            tokio::task::yield_now().await;
             let mut process = handle.process;
             if let Err(error) = crate::pty::PtyProcess::resize(&mut process, size).await {
                 log::error!("terminal PTY resize failed: {error:#}");

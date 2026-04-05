@@ -1,13 +1,10 @@
 use anyhow::{Context, Result};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::{mpsc, watch}, task::JoinHandle};
 use winit::event_loop::EventLoopProxy;
 
 use crate::{
-    pty::{
-        NativePtySystem, PtyProcess, PtySize, PtySpawnConfig, PtySystem, platform_default_shell,
-        terminal_environment,
-    },
-    render::bridge::TerminalRenderBridge,
+    pty::{PtyProcess, PtySize},
+    session::bridge::TerminalRenderBridge,
     running_tracker::RunningTracker,
     terminal::{
         ClipboardRequest, ClipboardRequestKind, input::TerminalInputSettings,
@@ -33,8 +30,7 @@ pub struct TerminalFrame {
 }
 
 impl TerminalSessionCore {
-    pub fn new(cols: usize, rows: usize) -> Self {
-        let theme = TerminalTheme::load();
+    pub fn new(cols: usize, rows: usize, theme: TerminalTheme) -> Self {
         let state = TerminalState::with_theme(cols, rows, theme.clone());
         let sync_updates_active = state.synchronized_updates_active();
         Self {
@@ -52,7 +48,6 @@ impl TerminalSessionCore {
 
     pub fn apply_bytes(&mut self, bytes: &[u8]) -> TerminalFrame {
         self.parser.advance(&mut self.state, bytes);
-        let damage = self.state.take_damage();
         let clipboard_requests = self.state.take_pending_clipboard_requests();
         let sync_updates_active = self.state.synchronized_updates_active();
 
@@ -61,8 +56,10 @@ impl TerminalSessionCore {
             Vec::new()
         } else if self.sync_updates_active && self.pending_full_flush {
             self.pending_full_flush = false;
+            let _ = self.state.take_damage();
             self.render_bridge.full_draw_commands(&self.state)
         } else {
+            let damage = self.state.take_damage();
             self.render_bridge.draw_commands(&self.state, damage)
         };
 
@@ -129,59 +126,127 @@ pub fn spawn_pty_listener<P>(
     cols: usize,
     rows: usize,
     mut resize_rx: watch::Receiver<PtySize>,
+    theme: TerminalTheme,
 ) -> JoinHandle<Result<()>>
 where
-    P: PtyProcess + 'static,
+    P: PtyProcess + Clone + 'static,
 {
     tokio::spawn(async move {
-        let mut session = TerminalSessionCore::new(cols, rows);
+        let mut reader_process = process.clone();
+        let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+        let reader_thread = std::thread::spawn(move || {
+            loop {
+                let result = reader_process.read_blocking(DEFAULT_READ_CHUNK_SIZE);
+                let should_stop = match &result {
+                    Ok(bytes) => bytes.is_empty(),
+                    Err(_) => true,
+                };
+
+                if read_tx.send(result).is_err() {
+                    break;
+                }
+
+                if should_stop {
+                    break;
+                }
+            }
+        });
+
+        let mut session = TerminalSessionCore::new(cols, rows, theme);
         let mut last_title = session.state().title().map(str::to_owned);
         let mut last_input = session.state().input_settings();
         emit_terminal_input(&proxy, route_id, last_input);
         emit_draw_commands(&proxy, route_id, session.bootstrap_draw_commands());
 
-        loop {
-            let bytes = process.read(DEFAULT_READ_CHUNK_SIZE).await?;
-            if bytes.is_empty() {
-                break;
-            }
-
-            // Apply any pending resize to the terminal state *before* processing the
-            // bytes from the child.  The resize signal is sent before SIGWINCH is
-            // delivered to the child, so by the time the child's redraw bytes arrive
-            // the session will already know the new dimensions.
-            if let Ok(true) = resize_rx.has_changed() {
+        // Helper: drain all pending resize signals, applying only the latest.
+        // Returns `true` if at least one resize was applied.
+        let apply_pending_resizes = |session: &mut TerminalSessionCore,
+                                     resize_rx: &mut watch::Receiver<PtySize>,
+                                     proxy: &EventLoopProxy<EventPayload>,
+                                     route_id: RouteId| -> bool {
+            if resize_rx.has_changed().unwrap_or(false) {
                 let new_size = *resize_rx.borrow_and_update();
                 let resize_commands =
                     session.resize(new_size.cols as usize, new_size.rows as usize);
-                emit_draw_commands(&proxy, route_id, resize_commands);
+                emit_draw_commands(proxy, route_id, resize_commands);
+                true
+            } else {
+                false
             }
+        };
 
-            let frame = session.apply_bytes(&bytes);
-            for response in frame.responses {
-                process.write(&response).await?;
-            }
-            emit_clipboard_requests(&proxy, route_id, frame.clipboard_requests);
-            let commands = frame.commands;
-            let input = session.state().input_settings();
-            if input != last_input {
-                emit_terminal_input(&proxy, route_id, input);
-                last_input = input;
-            }
-            let title = session.state().title();
-            if title != last_title.as_deref() {
-                if let Some(title) = title {
-                    proxy
-                        .send_event(EventPayload::for_route(
-                            UserEvent::WindowCommand(WindowCommand::TitleChanged(title.to_owned())),
-                            route_id,
-                        ))
-                        .ok();
+        let mut reader_thread = Some(reader_thread);
+        let mut reader_exited = false;
+
+        let result: Result<()> = async {
+            loop {
+                tokio::select! {
+                    biased;
+
+                    _ = resize_rx.changed() => {
+                        apply_pending_resizes(
+                            &mut session, &mut resize_rx, &proxy, route_id,
+                        );
+                        continue;
+                    }
+
+                    read_result = read_rx.recv() => {
+                        let Some(read_result) = read_result else {
+                            reader_exited = true;
+                            break;
+                        };
+                        let bytes = read_result?;
+                        if bytes.is_empty() {
+                            break;
+                        }
+
+                        apply_pending_resizes(
+                            &mut session, &mut resize_rx, &proxy, route_id,
+                        );
+
+                        let frame = session.apply_bytes(&bytes);
+                        for response in frame.responses {
+                            process.write(&response).await?;
+                        }
+                        emit_clipboard_requests(&proxy, route_id, frame.clipboard_requests);
+                        let commands = frame.commands;
+                        let input = session.state().input_settings();
+                        if input != last_input {
+                            emit_terminal_input(&proxy, route_id, input);
+                            last_input = input;
+                        }
+                        let title = session.state().title();
+                        if title != last_title.as_deref() {
+                            if let Some(title) = title {
+                                proxy
+                                    .send_event(EventPayload::for_route(
+                                        UserEvent::WindowCommand(WindowCommand::TitleChanged(title.to_owned())),
+                                        route_id,
+                                    ))
+                                    .ok();
+                            }
+                            last_title = title.map(str::to_owned);
+                        }
+                        emit_draw_commands(&proxy, route_id, commands);
+                    }
                 }
-                last_title = title.map(str::to_owned);
             }
-            emit_draw_commands(&proxy, route_id, commands);
+            Ok(())
         }
+        .await;
+
+        if reader_exited {
+            match reader_thread.take().unwrap().join() {
+                Ok(()) => {}
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        } else {
+            // The blocking PTY read may never wake during shutdown, so avoid
+            // joining unless the channel closure proves the reader thread exited.
+            drop(reader_thread.take());
+        }
+
+        result?;
 
         let status = process.wait().await.context("failed waiting for PTY child exit")?;
         let reason = match status.signal.as_deref() {
@@ -197,40 +262,6 @@ where
     })
 }
 
-pub fn spawn_native_terminal_listener(
-    route_id: RouteId,
-    proxy: EventLoopProxy<EventPayload>,
-    running_tracker: RunningTracker,
-    size: PtySize,
-    shell: Option<String>,
-    cwd: Option<std::path::PathBuf>,
-) -> Result<JoinHandle<Result<()>>> {
-    let system = NativePtySystem;
-    let shell = platform_default_shell(shell.as_deref());
-    let process = system.spawn(PtySpawnConfig {
-        shell: Some(shell),
-        args: Vec::new(),
-        cwd,
-        env: terminal_environment(),
-        size,
-    })?;
-
-    // Create a watch channel.  The sender is dropped immediately since this
-    // helper does not expose a resize handle; the listener loop will simply
-    // never receive a resize event.
-    let (_resize_tx, resize_rx) = watch::channel(size);
-
-    Ok(spawn_pty_listener(
-        process,
-        route_id,
-        proxy,
-        running_tracker,
-        size.cols as usize,
-        size.rows as usize,
-        resize_rx,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -239,10 +270,11 @@ mod tests {
     use super::TerminalSessionCore;
     use crate::pty::{PtyExitStatus, PtyProcess, PtySize};
     use crate::terminal::ClipboardRequestKind;
+    use crate::terminal::theme::TerminalTheme;
 
     #[test]
     fn session_core_bootstraps_and_applies_output() {
-        let mut session = TerminalSessionCore::new(4, 2);
+        let mut session = TerminalSessionCore::new(4, 2, TerminalTheme::default());
 
         let bootstrap = session.bootstrap_draw_commands();
         let frame = session.apply_bytes(b"ab\r\ncd");
@@ -269,7 +301,7 @@ mod tests {
 
     #[test]
     fn session_core_buffers_during_synchronized_updates_and_flushes_full_frame_after() {
-        let mut session = TerminalSessionCore::new(4, 2);
+        let mut session = TerminalSessionCore::new(4, 2, TerminalTheme::default());
 
         let frame = session.apply_bytes(b"\x1bP=1s\x1b\\ab");
         assert!(frame.commands.is_empty());
@@ -293,7 +325,7 @@ mod tests {
 
     #[test]
     fn session_core_drains_clipboard_requests() {
-        let mut session = TerminalSessionCore::new(10, 5);
+        let mut session = TerminalSessionCore::new(10, 5, TerminalTheme::default());
         let frame = session.apply_bytes(b"\x1b]52;c;aGVsbG8=\x07");
 
         assert_eq!(frame.clipboard_requests.len(), 1);
@@ -302,15 +334,16 @@ mod tests {
 
     #[test]
     fn session_core_drains_clipboard_queries() {
-        let mut session = TerminalSessionCore::new(10, 5);
+        let mut session = TerminalSessionCore::new(10, 5, TerminalTheme::default());
         let frame = session.apply_bytes(b"\x1b]52;c;?\x07");
 
         assert_eq!(frame.clipboard_requests.len(), 1);
         assert_eq!(frame.clipboard_requests[0].kind, ClipboardRequestKind::Query);
     }
 
+    #[derive(Clone)]
     struct FakePtyProcess {
-        chunks: Vec<Vec<u8>>,
+        chunks: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         status: PtyExitStatus,
     }
 
@@ -320,8 +353,9 @@ mod tests {
             Ok(())
         }
 
-        async fn read(&mut self, _max_bytes: usize) -> Result<Vec<u8>> {
-            if self.chunks.is_empty() { Ok(Vec::new()) } else { Ok(self.chunks.remove(0)) }
+        fn read_blocking(&mut self, _max_bytes: usize) -> Result<Vec<u8>> {
+            let mut chunks = self.chunks.lock().unwrap();
+            if chunks.is_empty() { Ok(Vec::new()) } else { Ok(chunks.remove(0)) }
         }
 
         async fn write(&mut self, _bytes: &[u8]) -> Result<()> {
@@ -344,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn fake_process_can_be_read_to_completion() -> Result<()> {
         let mut process = FakePtyProcess {
-            chunks: vec![b"hello".to_vec(), Vec::new()],
+            chunks: std::sync::Arc::new(std::sync::Mutex::new(vec![b"hello".to_vec(), Vec::new()])),
             status: PtyExitStatus { success: true, code: 0, signal: None },
         };
 
@@ -356,7 +390,7 @@ mod tests {
 
     #[test]
     fn session_core_generates_terminal_query_responses() {
-        let mut session = TerminalSessionCore::new(10, 5);
+        let mut session = TerminalSessionCore::new(10, 5, TerminalTheme::default());
         let frame = session.apply_bytes(b"\x1b[6n\x1b[c\x1b[>c");
         let responses = frame.responses;
         assert!(responses.iter().any(|resp| resp == b"\x1b[1;1R"));

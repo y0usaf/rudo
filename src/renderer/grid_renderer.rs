@@ -2,7 +2,7 @@ use std::{ops::Range, sync::Arc};
 
 use log::trace;
 use skia_safe::{
-    BlendMode, Canvas, Color, Color4f, HSV, Paint, PathBuilder, colors, dash_path_effect,
+    BlendMode, Canvas, Color, Color4f, Paint, PathBuilder, colors, dash_path_effect,
 };
 
 use crate::{
@@ -69,27 +69,13 @@ impl GridRenderer {
         }
     }
 
-    pub fn font_names(&self) -> Vec<String> {
-        self.shaper.font_names()
-    }
-
     pub fn handle_scale_factor_update(&mut self, scale_factor: f64) {
         self.shaper.update_scale_factor(scale_factor as f32);
         self.update_font_dimensions();
     }
 
-    pub fn update_font(&mut self, guifont_setting: &str) {
-        self.shaper.update_font(guifont_setting);
-        self.update_font_dimensions();
-    }
-
     pub fn update_font_options(&mut self, options: FontOptions) {
         self.shaper.update_font_options(options);
-        self.update_font_dimensions();
-    }
-
-    pub fn update_linespace(&mut self, linespace_setting: f32) {
-        self.shaper.update_linespace(linespace_setting);
         self.update_font_dimensions();
     }
 
@@ -156,8 +142,7 @@ impl GridRenderer {
         opacity: f32,
     ) -> BackgroundInfo {
         tracy_zone!("draw_background");
-        let debug = self.settings.get::<RendererSettings>().debug_renderer;
-        if style.is_none() && !debug {
+        if style.is_none() {
             return BackgroundInfo {
                 custom_color: false,
                 transparent: self.default_style.blend > 0 || opacity < 1.0,
@@ -170,14 +155,7 @@ impl GridRenderer {
         let mut paint = Paint::default();
         paint.set_anti_alias(false);
         paint.set_blend_mode(BlendMode::Src);
-
-        if debug {
-            let random_hsv: HSV = (rand::random::<f32>() * 360.0, 0.3, 0.3).into();
-            let random_color = random_hsv.to_color(255);
-            paint.set_color(random_color);
-        } else {
-            paint.set_color(style_background);
-        }
+        paint.set_color(style_background);
 
         let is_default_background = style_background == self.get_default_background_color();
         let normal_opacity = self.settings.get::<WindowSettings>().normal_opacity;
@@ -252,13 +230,7 @@ impl GridRenderer {
             paint.set_anti_alias(false);
             paint.set_blend_mode(BlendMode::SrcOver);
 
-            if self.settings.get::<RendererSettings>().debug_renderer {
-                let random_hsv: HSV = (rand::random::<f32>() * 360.0, 1.0, 1.0).into();
-                let random_color = random_hsv.to_color(255);
-                paint.set_color(random_color);
-            } else {
-                paint.set_color(style.foreground(&self.default_style.colors).to_color());
-            }
+            paint.set_color(style.foreground(&self.default_style.colors).to_color());
             for word in fragment.words() {
                 let adjustment = PixelVec::new(
                     word.cell as f32 * self.grid_scale.width(),

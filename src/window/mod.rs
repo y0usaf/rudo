@@ -5,7 +5,7 @@ mod keyboard_manager;
 pub mod macos;
 mod mouse_manager;
 mod settings;
-mod window_wrapper;
+pub(crate) mod wrapper;
 
 #[cfg(target_os = "linux")]
 use std::env;
@@ -13,7 +13,6 @@ use std::env;
 use glamour::Size2;
 use winit::{
     dpi::{PhysicalSize, Size},
-    event::DeviceId,
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Cursor, Icon, Theme, Window},
 };
@@ -56,23 +55,15 @@ use crate::{
 pub use application::Application;
 pub use application::ShouldRender;
 pub use error_window::show_error_window;
-pub use mouse_manager::{MessageSelectionEvent, OverlayEvent};
+pub use mouse_manager::{MessageSelectionEvent, OverlayEvent, TerminalSelection, TerminalSelectionEvent};
 pub use settings::{ThemeSettings, WindowSettings, WindowSettingsChanged};
-pub use window_wrapper::WinitWindowWrapper;
+pub use wrapper::WinitWindowWrapper;
 
-static DEFAULT_ICON: &[u8] = include_bytes!("../../assets/neovide.ico");
+static DEFAULT_ICON: &[u8] = include_bytes!("../../assets/termvide.ico");
 
 const DEFAULT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize { width: 500, height: 500 };
 const MIN_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize { width: 300, height: 150 };
 const MAX_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize { width: 8192, height: 8192 };
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Pressure {
-    device_id: DeviceId,
-    pressure: f32,
-    stage: i64,
-}
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +84,7 @@ impl From<&str> for ForceClickKind {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowCommand {
     TitleChanged(String),
@@ -101,29 +93,9 @@ pub enum WindowCommand {
     ClipboardSet(ClipboardRequest),
     ClipboardQuery(ClipboardSelection),
     OpenHyperlink(String),
-    ListAvailableFonts,
     FocusWindow,
-    #[cfg(target_os = "macos")]
-    TouchpadPressure {
-        col: i64,
-        row: i64,
-        entity: String,
-        guifont: String,
-        kind: ForceClickKind,
-    },
-    #[cfg(target_os = "macos")]
-    HighlightMatchingPair {
-        grid: u64,
-        row: u64,
-        column: u64,
-        text: Option<String>,
-    },
     Minimize,
     ThemeChanged(Option<Theme>),
-    #[cfg(windows)]
-    RegisterRightClick,
-    #[cfg(windows)]
-    UnregisterRightClick,
 }
 
 #[cfg(target_os = "macos")]
@@ -136,26 +108,14 @@ pub enum MacShortcutCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UserEvent {
     DrawCommandBatch(Vec<DrawCommand>),
-    #[cfg(target_os = "macos")]
-    OpenFiles {
-        files: Vec<String>,
-        cwd: Option<String>,
-        caller_cwd: Option<String>,
-        tabs: bool,
-        new_window: bool,
-    },
     WindowCommand(WindowCommand),
     SettingsChanged(SettingsChanged),
     ConfigsChanged(Box<HotReloadConfigs>),
+    ProcessLaunchError { message: String },
     #[allow(dead_code)]
     RedrawRequested,
     ProcessExited,
-    ProcessLaunchError {
-        message: String,
-    },
-    ShowProgressBar {
-        percent: f32,
-    },
+
     #[cfg(target_os = "macos")]
     CreateWindow,
     #[cfg(target_os = "macos")]
@@ -324,7 +284,7 @@ pub fn create_window(
 
         if env::var("WAYLAND_DISPLAY").is_ok() {
             let app_id = &cmd_line_settings.wayland_app_id;
-            WindowAttributesExtWayland::with_name(window_attributes, app_id.clone(), "neovide")
+            WindowAttributesExtWayland::with_name(window_attributes, app_id.clone(), "termvide")
         } else {
             let class = &cmd_line_settings.x11_wm_class;
             let instance = &cmd_line_settings.x11_wm_class_instance;
@@ -351,7 +311,7 @@ pub enum WindowSize {
     Size(PhysicalSize<u32>),
     Maximized,
     Grid(GridSize<u32>),
-    NeovimGrid,
+    DefaultGrid,
 }
 
 pub fn determine_window_size(
@@ -367,7 +327,7 @@ pub fn determine_window_size(
                 dimensions.height.try_into().unwrap(),
             )))
         }
-        GeometryArgs { grid: Some(None), .. } => WindowSize::NeovimGrid,
+        GeometryArgs { grid: Some(None), .. } => WindowSize::DefaultGrid,
         GeometryArgs { size: Some(dimensions), .. } => WindowSize::Size(dimensions.into()),
         GeometryArgs { maximized: true, .. } => WindowSize::Maximized,
         _ => match window_settings {

@@ -4,7 +4,7 @@
 #![cfg_attr(test, allow(non_snake_case))]
 #![allow(unknown_lints)]
 #[macro_use]
-extern crate neovide_derive;
+extern crate termvide_derive;
 
 #[cfg(target_os = "windows")]
 #[cfg(test)]
@@ -14,7 +14,6 @@ extern crate approx;
 #[macro_use]
 extern crate clap;
 
-mod channel_utils;
 mod clipboard;
 mod cmd_line;
 mod dimensions;
@@ -23,8 +22,8 @@ mod frame;
 mod platform;
 mod profiling;
 mod pty;
-mod render;
 mod renderer;
+mod session;
 mod running_tracker;
 mod settings;
 mod terminal;
@@ -41,6 +40,7 @@ mod windows_utils;
 extern crate derive_new;
 
 use std::{
+    backtrace::Backtrace,
     env::{self, args},
     fs::{File, OpenOptions, create_dir_all},
     io::Write,
@@ -59,11 +59,10 @@ use winit::{error::EventLoopError, event_loop::EventLoopProxy};
 #[cfg(not(test))]
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 
-use backtrace::Backtrace;
 use cmd_line::CmdLineSettings;
 use error_handling::handle_startup_errors;
 use renderer::{
-    RendererSettings, cursor_renderer::CursorSettings, progress_bar::ProgressBarSettings,
+    RendererSettings, cursor_renderer::CursorSettings,
 };
 use version::BUILD_VERSION;
 use window::{
@@ -71,7 +70,6 @@ use window::{
     determine_window_size,
 };
 
-pub use channel_utils::*;
 #[cfg(target_os = "windows")]
 pub use windows_utils::*;
 
@@ -82,15 +80,16 @@ pub use profiling::startup_profiler;
 #[cfg(target_os = "macos")]
 use crate::frame::Frame;
 
-const DEFAULT_BACKTRACES_FILE: &str = "neovide_backtraces.log";
-const BACKTRACES_FILE_ENV_VAR: &str = "NEOVIDE_BACKTRACES";
-const REQUEST_MESSAGE: &str = "This is a bug and we would love for it to be reported to https://github.com/neovide/neovide/issues";
+const DEFAULT_BACKTRACES_FILE: &str = "termvide_backtraces.log";
+const BACKTRACES_FILE_ENV_VAR: &str = "TERMVIDE_BACKTRACES";
+const REQUEST_MESSAGE: &str =
+    "This is a bug and we would love for it to be reported to https://github.com/y0usaf/termvide/issues";
 #[cfg(not(target_os = "windows"))]
-const FORKED_FROM_TTY_ENV_VAR: &str = "NEOVIDE_FORKED_FROM_TTY";
+const FORKED_FROM_TTY_ENV_VAR: &str = "TERMVIDE_FORKED_FROM_TTY";
 
 fn main() -> ExitCode {
     set_hook(Box::new(|panic_info| {
-        let backtrace = Backtrace::new();
+        let backtrace = Backtrace::force_capture();
 
         let stderr_msg = generate_stderr_log_message(panic_info, &backtrace);
         eprintln!("{stderr_msg}");
@@ -133,7 +132,8 @@ fn main() -> ExitCode {
     let mut application = Application::new(
         window_size,
         grid_size,
-        config.font,
+        config.font.clone(),
+        config,
         event_loop.create_proxy(),
         settings.clone(),
         clipboard,
@@ -149,79 +149,13 @@ fn main() -> ExitCode {
 }
 
 fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result<Config> {
-    //  --------------
-    // | Architecture |
-    //  --------------
-    //
-    // BRIDGE:
-    //   The bridge is responsible for the connection to the neovim process itself. It is in charge
-    //   of starting and communicating to and from the process. The bridge is async and has a
-    //   couple of sub components:
-    //
-    //     NEOVIM HANDLER:
-    //       This component handles events from neovim sent specifically to the gui. This includes
-    //       redraw events responsible for updating the gui state, and custom neovide specific
-    //       events which are registered on startup and handle syncing of settings or features from
-    //       the neovim process.
-    //
-    //     UI COMMAND HANDLER:
-    //       This component handles communication from other components to the neovim process. The
-    //       commands are split into Serial and Parallel commands. Serial commands must be
-    //       processed in order while parallel commands can be processed in any order and in
-    //       parallel. `send_ui` is used to send those commands from the window code.
-    //
-    // EDITOR:
-    //   The editor is responsible for processing and transforming redraw events into something
-    //   more readily renderable. Ligature support and multi window management requires some
-    //   significant preprocessing of the redraw events in order to capture what exactly should get
-    //   drawn where. Further this step takes a bit of processing power to accomplish, so it is done
-    //   on it's own thread. Ideally heavily computationally expensive tasks should be done in the
-    //   editor.
-    //
-    // RENDERER:
-    //   The renderer is responsible for drawing the editor's output to the screen. It uses skia
-    //   for drawing and is responsible for maintaining the various draw surfaces which are stored
-    //   to prevent unnecessary redraws.
-    //
-    // WINDOW:
-    //   The window is responsible for rendering and gathering input events from the user. This
-    //   inncludes taking the draw commands from the editor and turning them into pixels on the
-    //   screen. The ui commands are then forwarded back to the BRIDGE to convert them into
-    //   commands for neovim to handle properly.
-    //
-    //  ------------------
-    // | Other Components |
-    //  ------------------
-    //
-    // Neovide also includes some other systems which are globally available via lazy static
-    // instantiations or passed between components.
-    //
-    // Settings:
-    //   The settings system is live updated from global variables in neovim with the prefix
-    //   "neovide". They allow us to configure and manage the functionality of neovide from neovim
-    //   init scripts and variables.
-    //
-    // RunningTracker:
-    //   The running tracker responds to quit requests, allowing other systems to trigger a process
-    //   exit.
-    //
-    //  ------------------
-    // | Communication flow |
-    //  ------------------
-    //
-    // The bridge reads from Neovim, and sends `RedrawEvent` to the editor. Some events are also
-    // sent directly to the window event loop using `WindowCommand`. Finally changed settings are
-    // parsed, which are sent as a window event through `SettingChanged`.
-    //
-    // The editor reads `RedrawEvent` and sends `DrawCommand` to the Window.
-    //
-    // The Window event loop sends UICommand to the bridge, which forwards them to Neovim. It also
-    // reads `DrawCommand`, `SettingChanged`, and `WindowCommand` from the other components.
+    // Termvide is a PTY-backed terminal emulator built on top of the forked rendering stack.
+    // Startup wires together configuration, settings registration, PTY session management,
+    // terminal-to-render draw command conversion, and the window/event loop.
 
     settings.register::<WindowSettings>();
     settings.register::<RendererSettings>();
     settings.register::<CursorSettings>();
-    settings.register::<ProgressBarSettings>();
 
     let config = Config::init();
     Config::watch_config_file(config.clone(), proxy.clone());
@@ -229,7 +163,7 @@ fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result
     set_hook(Box::new({
         let path = config.backtraces_path.clone();
         move |panic_info: &PanicHookInfo<'_>| {
-            let backtrace = Backtrace::new();
+            let backtrace = Backtrace::force_capture();
 
             let stderr_msg = generate_stderr_log_message(panic_info, &backtrace);
             eprintln!("{stderr_msg}");
@@ -247,7 +181,7 @@ fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result
     #[cfg(not(test))]
     init_logger(&settings);
 
-    trace!("Neovide version: {}", BUILD_VERSION);
+    trace!("Termvide version: {}", BUILD_VERSION);
 
     Ok(config)
 }
@@ -335,7 +269,7 @@ fn log_panic_to_file(panic_info: &PanicHookInfo, backtrace: &Backtrace, path: &O
         Some(v) => v,
         None => &match env::var(BACKTRACES_FILE_ENV_VAR) {
             Ok(v) => PathBuf::from(v),
-            Err(_) => settings::neovide_std_datapath().join(DEFAULT_BACKTRACES_FILE),
+            Err(_) => settings::termvide_std_datapath().join(DEFAULT_BACKTRACES_FILE),
         },
     };
 
@@ -395,6 +329,6 @@ fn generate_panic_message(panic_info: &PanicHookInfo) -> String {
     };
 
     format!(
-        "Neovide panicked with the message '{payload}'. (File: {file}; Line: {line}, Column: {column})"
+        "Termvide panicked with the message '{payload}'. (File: {file}; Line: {line}, Column: {column})"
     )
 }

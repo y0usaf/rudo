@@ -6,13 +6,13 @@ use windows_registry::{CURRENT_USER, Result};
 
 use crate::error_msg;
 
-const REGISTRY_PATH_DIRECTORY: &str = "Software\\Classes\\Directory\\Background\\shell\\Neovide";
+const REGISTRY_PATH_DIRECTORY: &str = "Software\\Classes\\Directory\\Background\\shell\\Termvide";
 const REGISTRY_PATH_DIRECTORY_COMMAND: &str =
-    "Software\\Classes\\Directory\\Background\\shell\\Neovide\\command";
-const REGISTRY_PATH_FOLDER: &str = "Software\\Classes\\*\\shell\\Neovide";
-const REGISTRY_PATH_FOLDER_COMMAND: &str = "Software\\Classes\\*\\shell\\Neovide\\command";
+    "Software\\Classes\\Directory\\Background\\shell\\Termvide\\command";
+const REGISTRY_PATH_FOLDER: &str = "Software\\Classes\\*\\shell\\Termvide";
+const REGISTRY_PATH_FOLDER_COMMAND: &str = "Software\\Classes\\*\\shell\\Termvide\\command";
 
-fn get_neovide_path() -> String {
+fn get_termvide_path() -> String {
     std::env::current_exe().unwrap_or_default().to_str().unwrap_or_default().to_string()
 }
 
@@ -25,31 +25,31 @@ fn unregister_rightclick() -> Result<()> {
 }
 
 fn register_rightclick_directory() -> Result<()> {
-    let neovide_path = get_neovide_path();
-    let neovide_description = "Open with Neovide";
-    let neovide_command = format!("{neovide_path} \"%V\"");
+    let termvide_path = get_termvide_path();
+    let termvide_description = "Open with Termvide";
+    let termvide_command = format!("{termvide_path} \"%V\"");
 
     let key = CURRENT_USER.create(REGISTRY_PATH_DIRECTORY)?;
-    key.set_string("", neovide_description)?;
-    key.set_string("Icon", &neovide_path)?;
+    key.set_string("", termvide_description)?;
+    key.set_string("Icon", &termvide_path)?;
 
     let key = CURRENT_USER.create(REGISTRY_PATH_DIRECTORY_COMMAND)?;
-    key.set_string("", &neovide_command)?;
+    key.set_string("", &termvide_command)?;
 
     Ok(())
 }
 
 fn register_rightclick_file() -> Result<()> {
-    let neovide_path = get_neovide_path();
-    let neovide_description = "Open with Neovide";
-    let neovide_command = format!("{neovide_path} \"%1\"");
+    let termvide_path = get_termvide_path();
+    let termvide_description = "Open with Termvide";
+    let termvide_command = format!("{termvide_path} \"%1\"");
 
     let key = CURRENT_USER.create(REGISTRY_PATH_FOLDER)?;
-    key.set_string("", neovide_description)?;
-    key.set_string("Icon", &neovide_path)?;
+    key.set_string("", termvide_description)?;
+    key.set_string("Icon", &termvide_path)?;
 
     let key = CURRENT_USER.create(REGISTRY_PATH_FOLDER_COMMAND)?;
-    key.set_string("", &neovide_command)?;
+    key.set_string("", &termvide_command)?;
 
     Ok(())
 }

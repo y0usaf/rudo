@@ -13,9 +13,9 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::window::{EventPayload, MacShortcutCommand, UserEvent};
 
-const PINNED_ENV_VAR: &str = "NEOVIDE_SYSTEM_PINNED_HOTKEY";
-const SWITCHER_ENV_VAR: &str = "NEOVIDE_SYSTEM_SWITCHER_HOTKEY";
-const LEGACY_ENV_VAR: &str = "NEOVIDE_MACOS_ACTIVATION_HOTKEY";
+const PINNED_ENV_VAR: &str = "TERMVIDE_SYSTEM_PINNED_HOTKEY";
+const SWITCHER_ENV_VAR: &str = "TERMVIDE_SYSTEM_SWITCHER_HOTKEY";
+const LEGACY_ENV_VAR: &str = "TERMVIDE_MACOS_ACTIVATION_HOTKEY";
 
 const PINNED_DEFAULT: &str = "cmd+ctrl+z";
 const SWITCHER_DEFAULT: &str = "cmd+ctrl+n";

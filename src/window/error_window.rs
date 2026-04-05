@@ -167,10 +167,6 @@ impl State {
         }
     }
 
-    pub fn window_id(&self) -> winit::window::WindowId {
-        self.skia_renderer.window().id()
-    }
-
     pub fn handle_window_event(&mut self, event: WindowEvent, message: &str) {
         match event {
             WindowEvent::CloseRequested => {
@@ -494,7 +490,7 @@ pub fn create_error_window(event_loop: &ActiveEventLoop, settings: &Settings) ->
     let icon = load_icon(cmd_line_settings.icon.as_ref());
 
     let window_attributes = Window::default_attributes()
-        .with_title("Neovide")
+        .with_title("Termvide")
         .with_window_icon(Some(icon))
         .with_transparent(false)
         .with_visible(true)

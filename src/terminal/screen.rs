@@ -281,16 +281,16 @@ impl TerminalScreen {
         let height = bottom_exclusive - top;
         let lines = lines.min(height);
         let cols = self.cols;
+        let region = self.region_range(top, bottom_exclusive);
 
-        // Drain removed rows directly to avoid clone-then-rotate.
-        let drain_start = top * cols;
-        let drain_end = (top + lines) * cols;
-        let removed_flat: Vec<TerminalCell> = self.cells.drain(drain_start..drain_end).collect();
-        let removed = removed_flat.chunks_exact(cols).map(|chunk| chunk.to_vec()).collect();
+        let removed = (top..top + lines)
+            .filter_map(|row| self.row(row).map(|cells| cells.to_vec()))
+            .collect();
 
-        // Fill the gap at the bottom of the region with blank cells.
-        let insert_at = (bottom_exclusive - lines) * cols;
-        self.cells.splice(insert_at..insert_at, std::iter::repeat_n(fill.clone(), lines * cols));
+        self.cells[region].rotate_left(lines * cols);
+        for clear_row in bottom_exclusive - lines..bottom_exclusive {
+            self.clear_line_with(clear_row, fill);
+        }
 
         removed
     }

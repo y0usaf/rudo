@@ -30,9 +30,7 @@ use objc2_foundation::{
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::bridge::{
-    NeovimHandler, SerialCommand, require_active_handler, send_or_queue_file_drop, send_ui,
-};
+
 use crate::renderer::fonts::font_options::FontOptions;
 use crate::settings::Settings;
 use crate::utils::expand_tilde;
@@ -62,13 +60,13 @@ static SHOW_NATIVE_TAB_BAR: AtomicBool = AtomicBool::new(false);
 static ENABLE_NATIVE_TAB_BAR: AtomicBool = AtomicBool::new(false);
 static EVENT_LOOP_PROXY: OnceLock<EventLoopProxy<EventPayload>> = OnceLock::new();
 
-const NEOVIDE_TABBING_IDENTIFIER: &str = "NeovideWindowTabGroup";
-const NEOVIDE_WEBSITE_URL: &str = "https://neovide.dev/";
-const NEOVIDE_SPONSOR_URL: &str = "https://github.com/sponsors/neovide";
-const NEOVIDE_CREATE_ISSUE_URL: &str =
-    "https://github.com/neovide/neovide/issues/new?template=bug_report.md";
-static DEFAULT_NEOVIDE_ICON_BYTES: &[u8] =
-    include_bytes!("../../../extra/osx/Neovide.app/Contents/Resources/Neovide.icns");
+const TERMVIDE_TABBING_IDENTIFIER: &str = "TermvideWindowTabGroup";
+const TERMVIDE_WEBSITE_URL: &str = "https://github.com/y0usaf/termvide";
+const TERMVIDE_SPONSOR_URL: &str = "https://github.com/sponsors/y0usaf";
+const TERMVIDE_CREATE_ISSUE_URL: &str =
+    "https://github.com/y0usaf/termvide/issues/new";
+// TODO: Add proper Termvide .icns icon file
+static DEFAULT_TERMVIDE_ICON_BYTES: &[u8] = &[];
 
 fn native_tabs_enabled() -> bool {
     ENABLE_NATIVE_TAB_BAR.load(Ordering::Relaxed)
@@ -290,14 +288,14 @@ fn load_icon_from_custom_path(icon_path: &str) -> Option<Retained<NSImage>> {
 fn load_icon_from_default_bytes() -> Option<Retained<NSImage>> {
     unsafe {
         let data = NSData::dataWithBytes_length(
-            DEFAULT_NEOVIDE_ICON_BYTES.as_ptr() as *mut c_void,
-            DEFAULT_NEOVIDE_ICON_BYTES.len(),
+            DEFAULT_TERMVIDE_ICON_BYTES.as_ptr() as *mut c_void,
+            DEFAULT_TERMVIDE_ICON_BYTES.len(),
         );
         NSImage::initWithData(NSImage::alloc(), data.as_ref())
     }
 }
 
-fn load_neovide_icon(custom_icon_path: Option<&String>) -> Option<Retained<NSImage>> {
+fn load_termvide_icon(custom_icon_path: Option<&String>) -> Option<Retained<NSImage>> {
     custom_icon_path
         .and_then(|path| {
             let expanded = expand_tilde(path);
@@ -330,7 +328,6 @@ pub struct MacosWindowFeature {
     match_paren_indicator_view: Option<Retained<MatchParenIndicatorView>>,
     #[allow(dead_code)]
     activation_hotkey: Option<GlobalHotkeys>,
-    neovim_handler: NeovimHandler,
     simple_fullscreen: bool,
     has_transparent_titlebar: bool,
 }
@@ -340,7 +337,6 @@ impl MacosWindowFeature {
         window: &Window,
         settings: Arc<Settings>,
         proxy: EventLoopProxy<EventPayload>,
-        neovim_handler: NeovimHandler,
     ) -> Self {
         let mtm =
             MainThreadMarker::new().expect("MacosWindowFeature must be created in main thread.");
@@ -418,7 +414,6 @@ impl MacosWindowFeature {
             definition_is_active: false,
             match_paren_indicator_view: None,
             activation_hotkey,
-            neovim_handler,
             simple_fullscreen,
             has_transparent_titlebar,
         };
@@ -431,7 +426,7 @@ impl MacosWindowFeature {
         macos_window_feature
     }
     fn configure_native_tabbing(ns_window: &NSWindow) {
-        ns_window.setTabbingIdentifier(ns_string!(NEOVIDE_TABBING_IDENTIFIER));
+        ns_window.setTabbingIdentifier(ns_string!(TERMVIDE_TABBING_IDENTIFIER));
         Self::apply_tab_bar_preference(ns_window);
     }
 
@@ -689,7 +684,7 @@ impl MacosWindowFeature {
             return;
         }
 
-        send_ui(SerialCommand::ForceClickCommand, &self.neovim_handler);
+        // Force click command bridge removed — no-op.
     }
 
     fn install_titlebar_click_handler(
@@ -944,7 +939,7 @@ impl MacosWindowFeature {
         }
     }
 
-    /// Get the extra titlebar height in pixels, so Neovide can do the correct top padding.
+    /// Get the extra titlebar height in pixels, so Termvide can do the correct top padding.
     fn tab_bar_padding_in_pixels(&self) -> u32 {
         if !should_show_native_tab_bar() {
             return 0;
@@ -1113,8 +1108,8 @@ impl MacosWindowFeature {
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
 
-            // Make sure the icon is loaded when launched from terminal
-            let icon = load_neovide_icon(self.settings.get::<CmdLineSettings>().icon.as_ref());
+            // Make sure the app icon is loaded when launched from a terminal
+            let icon = load_termvide_icon(self.settings.get::<CmdLineSettings>().icon.as_ref());
             let icon_ref: Option<&NSImage> = icon.as_ref().map(|img| img.as_ref());
             unsafe { app.setApplicationIconImage(icon_ref) }
         });
@@ -1130,8 +1125,7 @@ define_class!(
     impl QuitHandler {
         #[unsafe(method(quit:))]
         fn quit(&self, _event: &NSEvent) {
-            let handler = require_active_handler();
-            send_ui(SerialCommand::Keyboard("<D-q>".into()), &handler);
+            // Command bridge removed — quit is handled via terminal PTY / window close.
         }
     }
 );
@@ -1151,17 +1145,17 @@ define_class!(
     impl HelpMenuHandler {
         #[unsafe(method(createIssueReport:))]
         fn create_issue_report(&self, _sender: &AnyObject) {
-            open_external_url(NEOVIDE_CREATE_ISSUE_URL);
+            open_external_url(TERMVIDE_CREATE_ISSUE_URL);
         }
 
-        #[unsafe(method(openNeovideWebsite:))]
-        fn open_neovide_website(&self, _sender: &AnyObject) {
-            open_external_url(NEOVIDE_WEBSITE_URL);
+        #[unsafe(method(openTermvideWebsite:))]
+        fn open_termvide_website(&self, _sender: &AnyObject) {
+            open_external_url(TERMVIDE_WEBSITE_URL);
         }
 
         #[unsafe(method(openSponsorPage:))]
         fn open_sponsor_page(&self, _sender: &AnyObject) {
-            open_external_url(NEOVIDE_SPONSOR_URL);
+            open_external_url(TERMVIDE_SPONSOR_URL);
         }
     }
 );
@@ -1179,7 +1173,7 @@ define_class!(
     struct NewWindowHandler;
 
     impl NewWindowHandler {
-        #[unsafe(method(neovideCreateWindow:))]
+        #[unsafe(method(termvideCreateWindow:))]
         fn create_window(&self, _sender: Option<&AnyObject>) {
             request_new_window();
         }
@@ -1203,7 +1197,7 @@ define_class!(
     struct TabOverviewHandler;
 
     impl TabOverviewHandler {
-        #[unsafe(method(neovideShowAllTabs:))]
+        #[unsafe(method(termvideShowAllTabs:))]
         fn show_all_tabs(&self, _sender: Option<&AnyObject>) {
             trigger_tab_overview();
         }
@@ -1227,7 +1221,7 @@ define_class!(
     struct TabOverviewNotificationHandler;
 
     impl TabOverviewNotificationHandler {
-        #[unsafe(method(neovideWindowDidBecomeKey:))]
+        #[unsafe(method(termvideWindowDidBecomeKey:))]
         fn window_did_become_key(&self, notification: &NSNotification) {
             if !TAB_OVERVIEW_ACTIVE.with(|active| active.get()) {
                 return;
@@ -1245,7 +1239,7 @@ define_class!(
 
             let identifier = window_ref.tabbingIdentifier();
             let identifier_ref: &NSString = identifier.as_ref();
-            if identifier_ref != ns_string!(NEOVIDE_TABBING_IDENTIFIER) {
+            if identifier_ref != ns_string!(TERMVIDE_TABBING_IDENTIFIER) {
                 log::trace!(
                     "WindowDidBecomeKey ignored (tab id = {})",
                     identifier_ref
@@ -1291,7 +1285,7 @@ define_class!(
             }
         }
 
-        #[unsafe(method(neovidePerformDetach:))]
+        #[unsafe(method(termvidePerformDetach:))]
         fn perform_detach(&self, timer: &NSTimer) {
             let Some(user_info) = timer.userInfo() else {
                 return;
@@ -1330,7 +1324,7 @@ impl TabOverviewNotificationHandler {
         unsafe {
             center.addObserver_selector_name_object(
                 &handler,
-                sel!(neovideWindowDidBecomeKey:),
+                sel!(termvideWindowDidBecomeKey:),
                 Some(NSWindowDidBecomeKeyNotification),
                 None,
             );
@@ -1349,7 +1343,7 @@ impl TabOverviewNotificationHandler {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.0,
                 self,
-                sel!(neovidePerformDetach:),
+                sel!(termvidePerformDetach:),
                 Some(window.as_ref()),
                 false,
             );
@@ -1378,7 +1372,7 @@ define_class!(
             unsafe { self.schedule_deferred_prune(menu) };
         }
 
-        #[unsafe(method(neovidePruneWindowMenu:))]
+        #[unsafe(method(termvidePruneWindowMenu:))]
         fn prune_window_menu(&self, timer: &NSTimer) {
             let Some(user_info) = timer.userInfo() else {
                 return;
@@ -1404,7 +1398,7 @@ impl WindowMenuDelegate {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.0,
                 self,
-                sel!(neovidePruneWindowMenu:),
+                sel!(termvidePruneWindowMenu:),
                 Some(menu),
                 false,
             );
@@ -1422,17 +1416,17 @@ define_class!(
     struct WindowMenuNotificationHandler;
 
     impl WindowMenuNotificationHandler {
-        #[unsafe(method(neovideWindowDidBecomeMain:))]
+        #[unsafe(method(termvideWindowDidBecomeMain:))]
         fn window_did_become_main(&self, notification: &NSNotification) {
             self.schedule_refresh_from_notification(notification);
         }
 
-        #[unsafe(method(neovideWindowDidBecomeKey:))]
+        #[unsafe(method(termvideWindowDidBecomeKey:))]
         fn window_did_become_key(&self, notification: &NSNotification) {
             self.schedule_refresh_from_notification(notification);
         }
 
-        #[unsafe(method(neovideRefreshWindowMenu:))]
+        #[unsafe(method(termvideRefreshWindowMenu:))]
         fn refresh_window_menu(&self, _timer: &NSTimer) {
             if should_show_native_tab_bar() {
                 return;
@@ -1456,13 +1450,13 @@ impl WindowMenuNotificationHandler {
         unsafe {
             center.addObserver_selector_name_object(
                 &handler,
-                sel!(neovideWindowDidBecomeMain:),
+                sel!(termvideWindowDidBecomeMain:),
                 Some(NSWindowDidBecomeMainNotification),
                 None,
             );
             center.addObserver_selector_name_object(
                 &handler,
-                sel!(neovideWindowDidBecomeKey:),
+                sel!(termvideWindowDidBecomeKey:),
                 Some(NSWindowDidBecomeKeyNotification),
                 None,
             );
@@ -1492,7 +1486,7 @@ impl WindowMenuNotificationHandler {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.0,
                 self,
-                sel!(neovideRefreshWindowMenu:),
+                sel!(termvideRefreshWindowMenu:),
                 None,
                 false,
             );
@@ -1626,7 +1620,7 @@ impl Menu {
             let create_new_window = NSMenuItem::new(mtm);
             create_new_window.setTitle(ns_string!("New Window"));
             create_new_window.setKeyEquivalent(ns_string!("n"));
-            create_new_window.setAction(Some(sel!(neovideCreateWindow:)));
+            create_new_window.setAction(Some(sel!(termvideCreateWindow:)));
             create_new_window.setTarget(Some(&self.new_window_handler));
             menu.addItem(&create_new_window);
 
@@ -1637,7 +1631,7 @@ impl Menu {
                 show_all_tabs_item.setKeyEquivalentModifierMask(
                     NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
                 );
-                show_all_tabs_item.setAction(Some(sel!(neovideShowAllTabs:)));
+                show_all_tabs_item.setAction(Some(sel!(termvideShowAllTabs:)));
                 show_all_tabs_item.setTarget(Some(&self.tab_overview_handler));
                 menu.addItem(&show_all_tabs_item);
             }
@@ -1664,7 +1658,7 @@ impl Menu {
 
             let website_item = NSMenuItem::new(mtm);
             website_item.setTitle(ns_string!("Documentation"));
-            website_item.setAction(Some(sel!(openNeovideWebsite:)));
+            website_item.setAction(Some(sel!(openTermvideWebsite:)));
             website_item.setTarget(Some(&self.help_menu_handler));
             menu.addItem(&website_item);
 
@@ -1703,11 +1697,11 @@ impl Menu {
 
             let is_show_all_tabs_title = title_ref == ns_string!("Show All Tabs");
 
-            let is_neovide_show_all_tabs_action =
-                action.is_some_and(|sel| sel == sel!(neovideShowAllTabs:));
+            let is_termvide_show_all_tabs_action =
+                action.is_some_and(|sel| sel == sel!(termvideShowAllTabs:));
 
             let should_remove_system_show_all_tabs =
-                is_show_all_tabs_title && !is_neovide_show_all_tabs_action;
+                is_show_all_tabs_title && !is_termvide_show_all_tabs_action;
 
             if should_remove_tab_item || should_remove_system_show_all_tabs {
                 indices_to_remove.push(idx);
@@ -1745,10 +1739,8 @@ pub fn is_tab_overview_active() -> bool {
 }
 
 pub fn register_file_handler() {
-    fn dispatch_file_drops(filenames: &NSArray<NSString>) {
-        for filename in filenames.iter() {
-            send_or_queue_file_drop(filename.to_string(), None);
-        }
+    fn dispatch_file_drops(_filenames: &NSArray<NSString>) {
+        // File drop command bridge removed — no-op.
     }
 
     unsafe extern "C-unwind" fn handle_create_window(
@@ -1770,7 +1762,7 @@ pub fn register_file_handler() {
         let menu = NSMenu::new(mtm);
         let create_new_window = NSMenuItem::new(mtm);
         create_new_window.setTitle(ns_string!("New Window"));
-        create_new_window.setAction(Some(sel!(neovideCreateWindow:)));
+        create_new_window.setAction(Some(sel!(termvideCreateWindow:)));
         create_new_window.setTarget(Some(this));
         menu.addItem(&create_new_window);
         Retained::autorelease_return(menu)
@@ -1798,7 +1790,7 @@ pub fn register_file_handler() {
         let class: &AnyClass = AnyObject::class(delegate.as_ref());
 
         // register subclass of whatever was in delegate
-        let class_name = CString::new("NeovideApplicationDelegate").unwrap();
+        let class_name = CString::new("TermvideApplicationDelegate").unwrap();
         let mut my_class = ClassBuilder::new(class_name.as_c_str(), class).unwrap();
         my_class.add_method(
             sel!(application:openFiles:),
@@ -1811,7 +1803,7 @@ pub fn register_file_handler() {
         );
 
         my_class.add_method(
-            sel!(neovideCreateWindow:),
+            sel!(termvideCreateWindow:),
             handle_create_window as unsafe extern "C-unwind" fn(_, _, _) -> _,
         );
 

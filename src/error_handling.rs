@@ -4,9 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Error, Result};
+use anyhow::Error;
 use clap::error::Error as ClapError;
-use log::error;
 use winit::event_loop::EventLoop;
 
 #[cfg(target_os = "windows")]
@@ -18,37 +17,10 @@ use crate::{
     window::{EventPayload, show_error_window},
 };
 
-fn show_error(explanation: &str) -> ! {
-    error!("{explanation}");
-    panic!("{}", explanation.to_string());
-}
-
-pub fn show_nvim_error(msg: &str) {
-    error!("{msg}");
-}
-
 #[macro_export]
 macro_rules! error_msg {
     ($($arg:tt)+) => {
-        let msg = format!($($arg)+);
-        log::error!("{}", msg);
-        $crate::error_handling::show_nvim_error(&msg);
-    }
-}
-
-pub trait ResultPanicExplanation<T, E: ToString> {
-    fn unwrap_or_explained_panic(self, explanation: &str) -> T;
-}
-
-impl<T, E: ToString> ResultPanicExplanation<T, E> for Result<T, E> {
-    fn unwrap_or_explained_panic(self, explanation: &str) -> T {
-        match self {
-            Err(error) => {
-                let explanation = format!("{}: {}", explanation, error.to_string());
-                show_error(&explanation);
-            }
-            Ok(content) => content,
-        }
+        log::error!($($arg)+);
     }
 }
 

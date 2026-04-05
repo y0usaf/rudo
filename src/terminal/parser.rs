@@ -214,7 +214,7 @@ impl Perform for TerminalPerformer<'_> {
             }
             'p' if intermediates == b"!" => {
                 // DECSTR – Soft Terminal Reset (CSI ! p)
-                // neovim sends this during startup to normalise terminal state.
+                // Common during terminal startup to normalise terminal state.
                 self.state.soft_reset();
             }
             'u' if private => self.state.report_kitty_keyboard_flags(),
@@ -583,7 +583,7 @@ fn param_nonzero_or(params: &[i64], index: usize, default: i64) -> i64 {
 mod tests {
     use super::TerminalParser;
     use crate::{
-        render::bridge::TerminalRenderBridge,
+        session::bridge::TerminalRenderBridge,
         renderer::{DrawCommand, WindowDrawCommand},
         terminal::{ClipboardRequestKind, ClipboardSelection, state::TerminalState},
         ui::CursorShape,

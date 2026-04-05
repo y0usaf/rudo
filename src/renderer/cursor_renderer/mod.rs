@@ -1,5 +1,4 @@
 mod blink;
-mod cursor_vfx;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -57,15 +56,6 @@ pub struct CursorSettings {
     unfocused_outline_width: f32,
     smooth_blink: bool,
     cell_color_fallback: bool,
-
-    vfx_mode: cursor_vfx::VfxModeList,
-    vfx_opacity: f32,
-    vfx_particle_lifetime: f32,
-    vfx_particle_highlight_lifetime: f32,
-    vfx_particle_density: f32,
-    vfx_particle_speed: f32,
-    vfx_particle_phase: f32,
-    vfx_particle_curl: f32,
 }
 
 impl Default for CursorSettings {
@@ -80,14 +70,6 @@ impl Default for CursorSettings {
             unfocused_outline_width: 1.0 / 8.0,
             smooth_blink: false,
             cell_color_fallback: false,
-            vfx_mode: cursor_vfx::VfxModeList::default(),
-            vfx_opacity: 200.0,
-            vfx_particle_lifetime: 0.5,
-            vfx_particle_highlight_lifetime: 0.2,
-            vfx_particle_density: 0.7,
-            vfx_particle_speed: 10.0,
-            vfx_particle_phase: 1.5,
-            vfx_particle_curl: 1.0,
         }
     }
 }
@@ -222,8 +204,6 @@ pub struct CursorRenderer {
     previous_cursor_position: Option<(u64, GridPos<u64>)>,
     previous_cursor_shape: Option<CursorShape>,
     previous_editor_mode: EditorMode,
-    cursor_vfxs: Vec<Box<dyn cursor_vfx::CursorVfx>>,
-    previous_vfx_mode: cursor_vfx::VfxModeList,
     window_has_focus: bool,
     jumped: bool,
 
@@ -240,8 +220,6 @@ impl CursorRenderer {
             previous_cursor_position: None,
             previous_cursor_shape: None,
             previous_editor_mode: EditorMode::Normal,
-            cursor_vfxs: vec![],
-            previous_vfx_mode: cursor_vfx::VfxModeList::default(),
             window_has_focus: true,
             jumped: false,
 
@@ -323,9 +301,6 @@ impl CursorRenderer {
         if new_cursor_pos != self.previous_cursor_position {
             self.previous_cursor_position = new_cursor_pos;
             self.jumped = true;
-            for vfx in self.cursor_vfxs.iter_mut() {
-                vfx.cursor_jumped(self.destination);
-            }
         }
     }
 
@@ -402,10 +377,6 @@ impl CursorRenderer {
         }
 
         canvas.restore();
-
-        for vfx in self.cursor_vfxs.iter() {
-            vfx.render(&settings, canvas, grid_renderer, &self.cursor);
-        }
     }
 
     pub fn animate(
@@ -419,11 +390,6 @@ impl CursorRenderer {
             return false;
         }
         let settings = self.settings.get::<CursorSettings>();
-
-        if settings.vfx_mode != self.previous_vfx_mode {
-            self.cursor_vfxs = cursor_vfx::new_cursor_vfxs(&settings.vfx_mode);
-            self.previous_vfx_mode = settings.vfx_mode.clone();
-        }
 
         let mut cursor_width = grid_renderer.grid_scale.width();
         if self.cursor.double_width && self.cursor.shape == CursorShape::Block {
@@ -445,10 +411,6 @@ impl CursorRenderer {
                 &self.cursor.shape.clone(),
                 self.cursor.cell_percentage.unwrap_or(DEFAULT_CELL_PERCENTAGE),
             );
-
-            for vfx in self.cursor_vfxs.iter_mut() {
-                vfx.restart(center_destination);
-            }
         }
 
         let mut animating = false;
@@ -498,28 +460,6 @@ impl CursorRenderer {
 
                 animating |= corner_animating;
             }
-
-            let mut vfx_animating = false;
-            let vfx_base_color = self
-                .cursor
-                .background(&grid_renderer.default_style.colors, settings.cell_color_fallback)
-                .to_color();
-
-            for vfx in self.cursor_vfxs.iter_mut() {
-                let ret = vfx.update(
-                    &settings,
-                    vfx_base_color,
-                    center_destination,
-                    cursor_dimensions,
-                    immediate_movement,
-                    dt,
-                );
-                if !vfx_animating {
-                    vfx_animating = ret;
-                }
-            }
-
-            animating |= vfx_animating;
         }
         self.jumped = false;
 

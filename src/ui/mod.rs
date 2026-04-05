@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use skia_safe::Color4f;
 
@@ -72,26 +72,6 @@ pub enum CursorShape {
     Vertical,
 }
 
-impl CursorShape {
-    pub fn from_type_name(name: &str) -> Option<CursorShape> {
-        match name {
-            "block" => Some(CursorShape::Block),
-            "horizontal" => Some(CursorShape::Horizontal),
-            "vertical" => Some(CursorShape::Vertical),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct CursorMode {
-    pub shape: Option<CursorShape>,
-    pub style_id: Option<u64>,
-    pub cell_percentage: Option<f32>,
-    pub blinkwait: Option<u64>,
-    pub blinkon: Option<u64>,
-    pub blinkoff: Option<u64>,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cursor {
@@ -212,25 +192,9 @@ impl Cursor {
             .unwrap_or(255)
     }
 
-    pub fn change_mode(&mut self, cursor_mode: &CursorMode, styles: &HashMap<u64, Arc<Style>>) {
-        let CursorMode { shape, style_id, cell_percentage, blinkwait, blinkon, blinkoff } =
-            cursor_mode;
-
-        if let Some(shape) = shape {
-            self.shape = shape.clone();
-        }
-
-        if let Some(style_id) = style_id {
-            self.style = styles.get(style_id).cloned();
-        }
-
-        self.cell_percentage = *cell_percentage;
-        self.blinkwait = *blinkwait;
-        self.blinkon = *blinkon;
-        self.blinkoff = *blinkoff;
-    }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WindowType {
     Editor,
@@ -374,6 +338,7 @@ pub struct AnchorInfo {
     pub sort_order: SortOrder,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowAnchor {
     NorthWest,
@@ -383,6 +348,7 @@ pub enum WindowAnchor {
     Absolute,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditorMode {
     Normal,
@@ -393,109 +359,4 @@ pub enum EditorMode {
     Unknown(String),
 }
 
-pub fn line_from_cells(row: &[GridCell]) -> Line {
-    let mut current_start = 0;
-    let mut line_fragments = Vec::new();
-    let mut text = String::new();
 
-    while current_start < row.len() {
-        let (next_start, line_fragment) =
-            build_line_fragment_from_cells(row, row.len(), current_start, &mut text);
-        current_start = next_start;
-        line_fragments.push(line_fragment);
-    }
-
-    let cells = Some(row.iter().map(|(character, _)| character.clone()).collect());
-    Line { text, fragments: line_fragments, cells, hyperlinks: None }
-}
-
-fn build_line_fragment_from_cells(
-    row: &[GridCell],
-    width: usize,
-    start: usize,
-    text: &mut String,
-) -> (usize, LineFragmentData) {
-    let (_, style) = &row[start];
-
-    let mut consumed_width = 0u32;
-    let mut last_box_char = None;
-    let mut text_range = text.len() as u32..text.len() as u32;
-    let mut words = Vec::new();
-    let mut current_word = WordData::default();
-
-    for (cluster, possible_end_style) in row.iter().take(width).skip(start) {
-        if style != possible_end_style {
-            break;
-        }
-
-        if crate::renderer::box_drawing::is_box_char(cluster) {
-            if text_range.is_empty() {
-                last_box_char = Some(cluster)
-            }
-            if (!text_range.is_empty() && last_box_char.is_none()) || last_box_char != Some(cluster)
-            {
-                break;
-            }
-        } else if last_box_char.is_some() {
-            break;
-        }
-
-        consumed_width += 1;
-
-        let cluster = if cluster.len() > 255 { " " } else { cluster };
-        if cluster.is_empty() {
-            if !current_word.cluster_sizes.is_empty() {
-                current_word.cluster_sizes.push(0);
-            }
-            continue;
-        }
-
-        let is_whitespace = cluster.chars().next().is_some_and(|char| char.is_whitespace());
-        if is_whitespace {
-            if !current_word.cluster_sizes.is_empty() {
-                words.push(current_word);
-                current_word = WordData::default();
-            }
-        } else if current_word.cluster_sizes.is_empty() {
-            current_word.cell = consumed_width - 1;
-            current_word.cluster_sizes.push(cluster.len() as u8);
-            current_word.text_offset = text.len() as u32 - text_range.start;
-        } else {
-            current_word.cluster_sizes.push(cluster.len() as u8);
-        }
-
-        text.push_str(cluster);
-        text_range.end += cluster.len() as u32;
-    }
-
-    if !current_word.cluster_sizes.is_empty() {
-        words.push(current_word);
-    }
-
-    let line_fragment = LineFragmentData {
-        text_range,
-        cells: start as u32..start as u32 + consumed_width,
-        style: style.clone(),
-        words,
-    };
-
-    (start + consumed_width as usize, line_fragment)
-}
-
-impl WindowAnchor {
-    pub fn modified_top_left(
-        &self,
-        grid_left: f64,
-        grid_top: f64,
-        width: u64,
-        height: u64,
-    ) -> (f64, f64) {
-        match self {
-            WindowAnchor::NorthWest => (grid_left, grid_top),
-            WindowAnchor::NorthEast => (grid_left - width as f64, grid_top),
-            WindowAnchor::SouthWest => (grid_left, grid_top - height as f64),
-            WindowAnchor::SouthEast => (grid_left - width as f64, grid_top - height as f64),
-            WindowAnchor::Absolute => (grid_left, grid_top),
-        }
-    }
-}

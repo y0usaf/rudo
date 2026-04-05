@@ -1,10 +1,15 @@
 use std::{env, ffi::OsString, fs};
 
 pub fn platform_default_shell_impl() -> OsString {
-    env::var_os("TERMVIDE_SHELL")
+    normalized_env_shell("TERMVIDE_SHELL")
+        .or_else(|| normalized_env_shell("SHELL"))
         .or_else(shell_from_passwd)
-        .or_else(|| env::var_os("SHELL"))
         .unwrap_or_else(|| OsString::from("/bin/sh"))
+}
+
+fn normalized_env_shell(key: &str) -> Option<OsString> {
+    let value = env::var_os(key)?;
+    (!value.to_string_lossy().trim().is_empty()).then_some(value)
 }
 
 fn shell_from_passwd() -> Option<OsString> {
@@ -31,7 +36,7 @@ fn parse_shell_from_passwd(passwd: &str, uid: u32) -> Option<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_shell_from_passwd;
+    use super::{normalized_env_shell, parse_shell_from_passwd};
     use std::ffi::OsString;
 
     #[test]
@@ -47,5 +52,28 @@ mod tests {
     fn returns_none_when_uid_missing() {
         let passwd = "root:x:0:0:root:/root:/bin/sh\n";
         assert_eq!(parse_shell_from_passwd(passwd, 1000), None);
+    }
+
+    #[test]
+    fn ignores_empty_env_shell_values() {
+        unsafe {
+            std::env::set_var("TERMVIDE_SHELL", "   ");
+        }
+        assert_eq!(normalized_env_shell("TERMVIDE_SHELL"), None);
+        unsafe {
+            std::env::remove_var("TERMVIDE_SHELL");
+        }
+    }
+
+    #[test]
+    fn preserves_non_empty_env_shell_values() {
+        let expected = OsString::from(" /bin/zsh ");
+        unsafe {
+            std::env::set_var("TERMVIDE_SHELL", &expected);
+        }
+        assert_eq!(normalized_env_shell("TERMVIDE_SHELL"), Some(expected));
+        unsafe {
+            std::env::remove_var("TERMVIDE_SHELL");
+        }
     }
 }

@@ -1,5 +1,5 @@
 # Box Drawing Character Test File
-# This file contains various combinations of box drawing characters to test rendering in Neovide
+# This file contains various combinations of box drawing characters to test rendering in Termvide
 
 ## Basic Box Drawing Characters
 

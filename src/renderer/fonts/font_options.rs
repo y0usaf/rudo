@@ -12,16 +12,26 @@ use skia_safe::{
 use crate::{error_msg, settings::ParseFromValue, ui};
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
+#[allow(dead_code)]
 const FONT_OPTS_SEPARATOR: char = ':';
+#[allow(dead_code)]
 const FONT_LIST_SEPARATOR: char = ',';
+#[allow(dead_code)]
 const FONT_HINTING_PREFIX: &str = "#h-";
+#[allow(dead_code)]
 const FONT_EDGING_PREFIX: &str = "#e-";
+#[allow(dead_code)]
 const FONT_HEIGHT_PREFIX: char = 'h';
+#[allow(dead_code)]
 const FONT_WIDTH_PREFIX: char = 'w';
+#[allow(dead_code)]
 const FONT_BOLD_OPT: &str = "b";
+#[allow(dead_code)]
 const FONT_ITALIC_OPT: &str = "i";
 
+#[allow(dead_code)]
 const INVALID_SIZE_ERR: &str = "Invalid size";
+#[allow(dead_code)]
 const INVALID_WIDTH_ERR: &str = "Invalid width";
 
 /// Description of the normal font.
@@ -129,6 +139,7 @@ impl FontFeature {
 }
 
 impl FontOptions {
+    #[allow(dead_code)]
     pub fn parse(guifont_setting: &str) -> Result<FontOptions, &str> {
         let mut font_options = FontOptions::default();
 
@@ -270,10 +281,12 @@ impl PartialEq for FontOptions {
     }
 }
 
+#[allow(dead_code)]
 fn parse_pixels(part: &str) -> Result<f32, ParseFloatError> {
     Ok(points_to_pixels(part[1..].parse::<f32>()?))
 }
 
+#[allow(dead_code)]
 fn parse_font_name(font_name: impl AsRef<str>) -> String {
     let parsed_font_name = font_name
         .as_ref()
@@ -386,7 +399,7 @@ impl From<PixelGeometry> for skia_safe::PixelGeometry {
 }
 
 pub fn points_to_pixels(value: f32) -> f32 {
-    // Fonts in neovim are using points, not pixels.
+    // Fonts in terminal/GUI configs use points, not pixels.
     //
     // Skia docs is incorrectly stating it uses points, but uses pixels:
     // https://api.skia.org/classSkFont.html#a7e28a156a517d01bc608c14c761346bf

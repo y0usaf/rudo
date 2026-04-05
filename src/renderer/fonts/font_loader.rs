@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     fmt::{Display, Formatter},
     num::NonZeroUsize,
     rc::Rc,
@@ -18,6 +19,14 @@ use crate::{
 
 static DEFAULT_FONT: &[u8] = include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
 static LAST_RESORT_FONT: &[u8] = include_bytes!("../../../assets/fonts/LastResort-Regular.ttf");
+
+thread_local! {
+    static SHARED_FONT_MGR: OnceCell<FontMgr> = const { OnceCell::new() };
+}
+
+fn shared_font_mgr() -> FontMgr {
+    SHARED_FONT_MGR.with(|cell| cell.get_or_init(FontMgr::new).clone())
+}
 
 pub struct FontPair {
     pub key: FontKey,
@@ -78,7 +87,7 @@ impl Display for FontKey {
 impl FontLoader {
     pub fn new(font_size: f32) -> FontLoader {
         FontLoader {
-            font_mgr: FontMgr::new(),
+            font_mgr: shared_font_mgr(),
             cache: LruCache::new(NonZeroUsize::new(20).unwrap()),
             font_size,
             last_resort: None,
@@ -163,9 +172,6 @@ impl FontLoader {
         self.cache.get(&font_pair.key);
     }
 
-    pub fn font_names(&self) -> Vec<String> {
-        self.font_mgr.family_names().collect()
-    }
 }
 
 fn font_hinting(hinting: &FontHinting) -> SkiaHinting {

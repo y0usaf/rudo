@@ -8,7 +8,8 @@ use crate::{
     settings::Settings, units::GridSize, window::WindowSettings, window::WinitWindowWrapper,
 };
 
-const SETTINGS_FILE: &str = "neovide-settings.json";
+const SETTINGS_FILE: &str = "termvide-settings.json";
+const LEGACY_SETTINGS_FILE: &str = "termvide-settings.json";
 
 pub const DEFAULT_GRID_SIZE: GridSize<u32> = GridSize { width: 100, height: 50 };
 pub const MIN_GRID_SIZE: GridSize<u32> = GridSize { width: 20, height: 6 };
@@ -36,24 +37,41 @@ struct PersistentSettings {
 }
 
 fn settings_path() -> PathBuf {
-    let mut settings_path = neovide_std_datapath();
+    let mut settings_path = termvide_std_datapath();
     settings_path.push(SETTINGS_FILE);
+    settings_path
+}
+
+fn legacy_settings_path() -> PathBuf {
+    let mut settings_path = legacy_std_datapath();
+    settings_path.push(LEGACY_SETTINGS_FILE);
     settings_path
 }
 
 fn load_settings() -> Result<PersistentSettings, String> {
     let settings_path = settings_path();
-    let json = std::fs::read_to_string(settings_path).map_err(|e| e.to_string())?;
+    let json = std::fs::read_to_string(&settings_path)
+        .or_else(|_| std::fs::read_to_string(legacy_settings_path()))
+        .map_err(|e| e.to_string())?;
     serde_json::from_str(&json).map_err(|e| e.to_string())
 }
 
-pub fn neovide_std_datapath() -> PathBuf {
+pub fn termvide_std_datapath() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| {
             warn!("Could not determine local data directory, falling back to current directory");
             PathBuf::from(".")
         })
-        .join("neovide")
+        .join("termvide")
+}
+
+fn legacy_std_datapath() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| {
+            warn!("Could not determine local data directory, falling back to current directory");
+            PathBuf::from(".")
+        })
+        .join("termvide")
 }
 
 pub fn load_last_window_settings() -> Result<PersistentWindowSettings, String> {
@@ -105,7 +123,7 @@ pub fn save_window_size(window_wrapper: &WinitWindowWrapper, settings: &Settings
 
     let settings_path = settings_path();
 
-    if let Err(write_error) = std::fs::create_dir_all(neovide_std_datapath()) {
+    if let Err(write_error) = std::fs::create_dir_all(termvide_std_datapath()) {
         error!("Could not create settings directory: {write_error}");
         return;
     }

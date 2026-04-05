@@ -5,19 +5,16 @@ use skia_safe::{
 };
 
 use crate::{
-    cmd_line::CmdLineSettings,
     profiling::{tracy_plot, tracy_zone},
-    renderer::{GridRenderer, RendererSettings, animation_utils::*},
-    settings::Settings,
+    renderer::{GridRenderer, animation_utils::*},
     ui::WindowAnchor,
-    ui::{AnchorInfo, Hyperlink, Line, LineFragment, SortOrder, WindowType},
+    ui::{AnchorInfo, Hyperlink, Line, LineFragment, WindowType},
     units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelVec, to_skia_rect},
     utils::RingBuffer,
 };
 
 #[cfg(target_os = "macos")]
 pub const BASE_GRID_ID: u64 = 1;
-pub const NO_MULTIGRID_GRID_ID: u64 = 0;
 
 const MAX_TRAILING_FILL_CELLS: f32 = 1.0;
 
@@ -39,30 +36,8 @@ pub enum WindowDrawCommand {
         row: usize,
         line: Line,
     },
-    Scroll {
-        top: u64,
-        bottom: u64,
-        left: u64,
-        right: u64,
-        rows: i64,
-        cols: i64,
-    },
     Clear,
     Show,
-    Hide,
-    Close,
-    Viewport {
-        scroll_delta: f64,
-    },
-    ViewportMargins {
-        top: u64,
-        bottom: u64,
-        #[allow(unused)]
-        left: u64,
-        #[allow(unused)]
-        right: u64,
-    },
-    SortOrder(SortOrder),
 }
 
 struct RenderedLine {
@@ -107,13 +82,6 @@ pub struct WindowDrawDetails {
     pub id: u64,
     pub region: PixelRect<f32>,
     pub grid_size: GridSize<u32>,
-    pub window_type: WindowType,
-}
-
-impl WindowDrawDetails {
-    pub fn event_grid_id(&self, settings: &Settings) -> u64 {
-        if settings.get::<CmdLineSettings>().no_multi_grid { NO_MULTIGRID_GRID_ID } else { self.id }
-    }
 }
 
 impl RenderedWindow {
@@ -173,7 +141,6 @@ impl RenderedWindow {
 
     pub fn animate(
         &mut self,
-        settings: &RendererSettings,
         grid_rect: &GridRect<f32>,
         dt: f32,
     ) -> bool {
@@ -183,7 +150,7 @@ impl RenderedWindow {
             self.position_t = 2.0;
         } else {
             animating = true;
-            self.position_t = (self.position_t + dt / settings.position_animation_length).min(1.0);
+            self.position_t = (self.position_t + dt / 0.15).min(1.0);
         }
 
         let prev_position = self.grid_current_position;
@@ -195,7 +162,7 @@ impl RenderedWindow {
         );
         animating |= self.grid_current_position != prev_position;
 
-        let scrolling = self.scroll_animation.update(dt, settings.scroll_animation_length);
+        let scrolling = self.scroll_animation.update(dt, 0.3);
 
         animating |= scrolling;
 
@@ -235,7 +202,7 @@ impl RenderedWindow {
             }
         }
 
-        log::trace!("region: {pixel_region:?}, inner: {inner_region:?}, pics: {pics}");
+        let _pics = pics;
         canvas.restore();
 
         self.draw_trailing_background_surface(canvas, pixel_region, grid_scale);
@@ -286,19 +253,6 @@ impl RenderedWindow {
         canvas.restore();
     }
 
-    pub fn has_transparency(&self) -> bool {
-        let scroll_offset_lines = self.scroll_animation.position.floor() as isize;
-        if self.scrollback_lines.is_empty() {
-            return false;
-        }
-        self.scrollback_lines
-            .iter_range(
-                scroll_offset_lines..scroll_offset_lines + self.grid_size.height as isize + 1,
-            )
-            .flatten()
-            .any(|line| line.borrow().has_transparency)
-    }
-
     pub fn draw(
         &mut self,
         root_canvas: &Canvas,
@@ -321,7 +275,6 @@ impl RenderedWindow {
                 id: self.id,
                 region: pixel_region_box,
                 grid_size: self.grid_size,
-                window_type: self.window_type,
             };
         }
 
@@ -338,7 +291,6 @@ impl RenderedWindow {
             id: self.id,
             region: draw_region_box,
             grid_size: self.grid_size,
-            window_type: self.window_type,
         }
     }
 
@@ -524,9 +476,12 @@ impl RenderedWindow {
         let end = end_col.min(max_col);
         let (start, end) = if start <= end { (start, end) } else { (end, start) };
 
-        let mut text = String::new();
-        for col in start..=end {
-            text.push_str(&cells[col as usize]);
+        let start = start as usize;
+        let end = end as usize;
+        let capacity: usize = cells[start..=end].iter().map(|cell| cell.len()).sum();
+        let mut text = String::with_capacity(capacity);
+        for cell in &cells[start..=end] {
+            text.push_str(cell);
         }
 
         let trimmed_len = text.trim_end_matches(' ').len();
@@ -610,16 +565,19 @@ impl RenderedWindow {
                     self.grid_destination = grid_position;
                 }
 
-                let height = new_grid_size.height as usize;
-                self.actual_lines.resize(height, None);
-                self.grid_size = new_grid_size;
+                if new_grid_size != self.grid_size {
+                    let old_height = self.actual_lines.len();
+                    let height = new_grid_size.height as usize;
+                    self.actual_lines.resize(height, None);
+                    self.grid_size = new_grid_size;
 
-                self.scrollback_lines.resize(2 * height, None);
-                self.scrollback_lines.clone_from_iter(&self.actual_lines);
-                self.scroll_delta = 0;
+                    self.scrollback_lines.resize(2 * height, None);
+                    self.scrollback_lines.clone_from_iter(&self.actual_lines);
+                    self.scroll_delta = 0;
 
-                if height != self.actual_lines.len() {
-                    self.scroll_animation.reset();
+                    if height != old_height {
+                        self.scroll_animation.reset();
+                    }
                 }
 
                 self.anchor_info = anchor_info;
@@ -656,17 +614,6 @@ impl RenderedWindow {
 
                 self.actual_lines[row] = Some(Rc::new(RefCell::new(line)));
             }
-            WindowDrawCommand::Scroll { top, bottom, left, right, rows, cols } => {
-                tracy_zone!("scroll_cmd", 0);
-                if top == 0
-                    && bottom == u64::from(self.grid_size.height)
-                    && left == 0
-                    && right == u64::from(self.grid_size.width)
-                    && cols == 0
-                {
-                    self.actual_lines.rotate(rows as isize);
-                }
-            }
             WindowDrawCommand::Clear => {
                 tracy_zone!("clear_cmd", 0);
                 self.scroll_delta = 0;
@@ -682,27 +629,10 @@ impl RenderedWindow {
                     self.scroll_animation.reset();
                 }
             }
-            WindowDrawCommand::Hide => {
-                tracy_zone!("hide_cmd", 0);
-                self.hidden = true;
-            }
-            WindowDrawCommand::Viewport { scroll_delta } => {
-                log::trace!("Handling Viewport {}", self.id);
-                self.scroll_delta = scroll_delta.round() as isize;
-            }
-            WindowDrawCommand::ViewportMargins { top, bottom, .. } => {
-                self.viewport_margins = ViewportMargins { top, bottom }
-            }
-            WindowDrawCommand::SortOrder(sort_order) => {
-                if let Some(anchor_info) = self.anchor_info.as_mut() {
-                    anchor_info.sort_order = sort_order;
-                }
-            }
-            _ => {}
         };
     }
 
-    pub fn flush(&mut self, renderer_settings: &RendererSettings) {
+    pub fn flush(&mut self) {
         if !self.valid {
             return;
         }
@@ -728,12 +658,8 @@ impl RenderedWindow {
 
             let max_delta =
                 self.scrollback_lines.len().saturating_sub(self.grid_size.height as usize);
-            log::trace!(
-                "Scroll offset {scroll_offset}, delta {scroll_delta}, max_delta {max_delta}"
-            );
             if scroll_delta.unsigned_abs() > max_delta {
-                let far_lines = renderer_settings
-                    .scroll_animation_far_lines
+                let far_lines = 1_u32
                     .min(self.actual_lines.len() as u32) as isize;
 
                 scroll_offset = -(far_lines * scroll_delta.signum()) as f32;
@@ -750,7 +676,6 @@ impl RenderedWindow {
                 scroll_offset = scroll_offset.clamp(-(max_delta as f32), max_delta as f32);
             }
             self.scroll_animation.position = scroll_offset;
-            log::trace!("Current scroll {scroll_offset}");
         }
         self.scroll_delta = 0;
     }
@@ -960,7 +885,7 @@ mod tests {
                 ]),
             ),
         });
-        window.flush(&crate::renderer::RendererSettings::default());
+        window.flush();
 
         let link = window.hyperlink_at_cell(0, 0).unwrap();
         assert_eq!(link.uri, "https://example.com");

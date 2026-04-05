@@ -1,4 +1,4 @@
-pub const BUILD_VERSION: &str = env!("NEOVIDE_BUILD_VERSION");
+pub const BUILD_VERSION: &str = env!("TERMVIDE_BUILD_VERSION");
 
 #[cfg(target_os = "macos")]
 pub fn release_channel() -> &'static str {

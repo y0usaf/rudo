@@ -30,15 +30,23 @@ impl DirtyRows {
         Self { words: [0; Self::WORDS] }
     }
 
+    pub const fn can_represent_row(row: usize) -> bool {
+        row < Self::MAX_ROWS
+    }
+
+    pub const fn can_represent_range(range: &std::ops::Range<usize>) -> bool {
+        range.start <= range.end && range.end <= Self::MAX_ROWS
+    }
+
     pub fn set(&mut self, row: usize) {
-        if row < Self::MAX_ROWS {
-            self.words[row / 64] |= 1u64 << (row % 64);
-        }
+        debug_assert!(Self::can_represent_row(row));
+        self.words[row / 64] |= 1u64 << (row % 64);
     }
 
     pub fn set_range(&mut self, range: std::ops::Range<usize>) {
+        debug_assert!(Self::can_represent_range(&range));
         let start = range.start;
-        let end = range.end.min(Self::MAX_ROWS);
+        let end = range.end;
         if start >= end {
             return;
         }
@@ -173,7 +181,7 @@ const KITTY_KEYBOARD_STACK_LIMIT: usize = 16;
 
 pub struct TerminalState {
     primary_screen: TerminalScreen,
-    alternate_screen: TerminalScreen,
+    alternate_screen: Option<TerminalScreen>,
     cursor: TerminalCursor,
     saved_cursor: Option<TerminalCursor>,
     saved_cursor_position: Option<TerminalCursor>,
@@ -214,14 +222,14 @@ impl TerminalState {
         let base_theme = Box::new(theme.clone());
         Self {
             primary_screen: TerminalScreen::new(cols, rows),
-            alternate_screen: TerminalScreen::new(cols, rows),
+            alternate_screen: None,
             cursor: TerminalCursor::default(),
             saved_cursor: None,
             saved_cursor_position: None,
             pen: TerminalPen::default(),
             title: None,
             using_alternate_screen: false,
-            scrollback: VecDeque::with_capacity(DEFAULT_SCROLLBACK_LIMIT),
+            scrollback: VecDeque::with_capacity(256),
             scrollback_limit: DEFAULT_SCROLLBACK_LIMIT,
             damage: TerminalDamage::Full,
             input: TerminalInputSettings::default(),
@@ -256,12 +264,16 @@ impl TerminalState {
     }
 
     pub fn screen(&self) -> &TerminalScreen {
-        if self.using_alternate_screen { &self.alternate_screen } else { &self.primary_screen }
+        if self.using_alternate_screen {
+            self.alternate_screen.as_ref().expect("alternate screen must exist when active")
+        } else {
+            &self.primary_screen
+        }
     }
 
     pub fn screen_mut(&mut self) -> &mut TerminalScreen {
         if self.using_alternate_screen {
-            &mut self.alternate_screen
+            self.alternate_screen.as_mut().expect("alternate screen must exist when active")
         } else {
             &mut self.primary_screen
         }
@@ -399,7 +411,9 @@ impl TerminalState {
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.primary_screen.resize(cols, rows);
-        self.alternate_screen.resize(cols, rows);
+        if let Some(ref mut alt) = self.alternate_screen {
+            alt.resize(cols, rows);
+        }
         self.cursor.column = self.cursor.column.min(cols.saturating_sub(1));
         self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
         self.scroll_region_top = 0;
@@ -431,6 +445,7 @@ impl TerminalState {
         let hyperlink = self.current_hyperlink.clone();
         let col = self.cursor.column;
         let row = self.cursor.row;
+        let cols = self.cols();
         let cell_width = if width > 1 { CellWidth::Double } else { CellWidth::Single };
 
         if self.insert_mode {
@@ -443,12 +458,12 @@ impl TerminalState {
             row,
             TerminalCell::from_char(ch, style.clone(), hyperlink.clone(), cell_width),
         );
-        if width > 1 && col + 1 < self.cols() {
+        if width > 1 && col + 1 < cols {
             self.screen_mut().set(col + 1, row, TerminalCell::continuation(style, hyperlink));
         }
 
-        if col + width >= self.cols() {
-            self.cursor.column = self.cols().saturating_sub(1);
+        if col + width >= cols {
+            self.cursor.column = cols.saturating_sub(1);
             self.wrap_pending = self.auto_wrap && width == 1;
         } else {
             self.cursor.column += width;
@@ -476,15 +491,15 @@ impl TerminalState {
     }
 
     fn restore_cursor_state(&mut self) {
-        if let Some(saved) = self.saved_cursor.clone() {
-            self.cursor = saved;
+        if let Some(saved) = self.saved_cursor.as_ref() {
+            self.cursor = saved.clone();
             self.wrap_pending = false;
         }
     }
 
     pub fn restore_cursor_position(&mut self) {
-        if let Some(saved) = self.saved_cursor_position.clone() {
-            self.cursor = saved;
+        if let Some(saved) = self.saved_cursor_position.as_ref() {
+            self.cursor = saved.clone();
             self.wrap_pending = false;
         }
     }
@@ -529,8 +544,9 @@ impl TerminalState {
                 for row in removed {
                     self.scrollback.push_back(row);
                 }
-                while self.scrollback.len() > self.scrollback_limit {
-                    self.scrollback.pop_front();
+                let overflow = self.scrollback.len().saturating_sub(self.scrollback_limit);
+                if overflow > 0 {
+                    self.scrollback.drain(..overflow);
                 }
             }
             self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
@@ -738,8 +754,9 @@ impl TerminalState {
             for row in removed {
                 self.scrollback.push_back(row);
             }
-            while self.scrollback.len() > self.scrollback_limit {
-                self.scrollback.pop_front();
+            let overflow = self.scrollback.len().saturating_sub(self.scrollback_limit);
+            if overflow > 0 {
+                self.scrollback.drain(..overflow);
             }
         }
         self.mark_rows_dirty(scroll_region_top..scroll_region_bottom);
@@ -786,8 +803,13 @@ impl TerminalState {
             if save_restore_cursor {
                 self.save_cursor_state();
             }
+            let cols = self.primary_screen.cols();
+            let rows = self.primary_screen.rows();
+            match self.alternate_screen {
+                Some(ref mut alt) => alt.clear(),
+                None => self.alternate_screen = Some(TerminalScreen::new(cols, rows)),
+            }
             self.using_alternate_screen = true;
-            self.alternate_screen.clear();
             self.cursor.row = self.cursor.row.min(self.rows().saturating_sub(1));
             self.cursor.column = self.cursor.column.min(self.cols().saturating_sub(1));
             self.wrap_pending = false;
@@ -1129,15 +1151,21 @@ impl TerminalState {
             return;
         }
 
+        let rows = rows.start..rows_end;
+        if self.rows() > DirtyRows::MAX_ROWS || !DirtyRows::can_represent_range(&rows) {
+            self.damage = TerminalDamage::Full;
+            return;
+        }
+
         match &mut self.damage {
             TerminalDamage::Full => {}
             TerminalDamage::None => {
                 let mut dirty = DirtyRows::new();
-                dirty.set_range(rows.start..rows_end);
+                dirty.set_range(rows);
                 self.damage = TerminalDamage::Rows(dirty);
             }
             TerminalDamage::Rows(dirty) => {
-                dirty.set_range(rows.start..rows_end);
+                dirty.set_range(rows);
             }
         }
     }
@@ -1221,7 +1249,7 @@ fn rgb(r: u8, g: u8, b: u8) -> Color4f {
 
 #[cfg(test)]
 mod tests {
-    use super::{CharsetSlot, DecCharset, TerminalState};
+    use super::{CharsetSlot, DecCharset, DirtyRows, TerminalDamage, TerminalState};
     use crate::terminal::input::KittyKeyboardFlags;
     use crate::terminal::{
         ClipboardRequestKind, ClipboardSelection, Hyperlink, style::TerminalColor,
@@ -1443,5 +1471,27 @@ mod tests {
 
         state.pop_kitty_keyboard_flags(2);
         assert_eq!(state.input_settings().kitty_keyboard_flags.bits(), 0);
+    }
+
+    #[test]
+    fn dirty_row_tracking_degrades_to_full_for_tall_terminals() {
+        let mut state = TerminalState::new(2, DirtyRows::MAX_ROWS + 1);
+        let _ = state.take_damage();
+
+        state.set_cursor_position(DirtyRows::MAX_ROWS, 0);
+        state.print_char('x');
+
+        assert_eq!(state.take_damage(), TerminalDamage::Full);
+    }
+
+    #[test]
+    fn dirty_row_tracking_degrades_to_full_for_ranges_past_capacity() {
+        let mut state = TerminalState::new(2, DirtyRows::MAX_ROWS);
+        let _ = state.take_damage();
+
+        state.set_cursor_position(DirtyRows::MAX_ROWS - 1, 0);
+        state.clear_from_cursor();
+
+        assert_eq!(state.take_damage(), TerminalDamage::Full);
     }
 }

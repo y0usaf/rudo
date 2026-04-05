@@ -5,8 +5,6 @@ use crate::{
     terminal::input::{KittyKeyboardFlags, TerminalInputSettings},
 };
 
-#[allow(unused_imports)]
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::{
     event::{ElementState, Ime, KeyEvent, Modifiers, WindowEvent},
     keyboard::{Key, KeyCode, KeyLocation, NamedKey, PhysicalKey},
@@ -16,12 +14,6 @@ use {
     crate::{window::WindowSettings, window::settings::OptionAsMeta},
     winit::keyboard::ModifiersKeyState,
 };
-
-use crate::profiling::tracy_named_frame;
-
-fn is_ascii_alphabetic_char(text: &str) -> bool {
-    text.len() == 1 && text.chars().next().unwrap().is_ascii_alphabetic()
-}
 
 pub struct KeyboardManager {
     modifiers: Modifiers,
@@ -43,31 +35,6 @@ impl KeyboardManager {
 
     pub fn current_modifiers(&self) -> Modifiers {
         self.modifiers
-    }
-
-    pub fn handle_event<T>(&mut self, event: &WindowEvent, _target: &T) {
-        match event {
-            WindowEvent::KeyboardInput { event: key_event, is_synthetic: false, .. }
-                if self.ime_preedit.0.is_empty() =>
-            {
-                log::trace!("{key_event:#?}");
-                if key_event.state == ElementState::Pressed {
-                    if let Some(text) = self.format_key(key_event) {
-                        log::trace!("Key pressed {} {:?}", text, self.modifiers.state());
-                        tracy_named_frame!("keyboard input");
-                    }
-                }
-            }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                log::trace!("Ime commit {text}");
-                let _ = self.format_key_text(text, false);
-            }
-            WindowEvent::Ime(Ime::Preedit(text, cursor_offset)) => {
-                self.ime_preedit = (text.to_string(), *cursor_offset);
-            }
-            WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(*modifiers),
-            _ => {}
-        }
     }
 
     pub fn handle_terminal_event(
@@ -121,94 +88,6 @@ impl KeyboardManager {
         }
     }
 
-    fn handle_numpad_numkey<'a>(
-        is_numlock_enabled: bool,
-        numlock_str: &'a str,
-        non_numlock_str: &'a str,
-    ) -> Option<&'a str> {
-        if is_numlock_enabled {
-            return Some(numlock_str);
-        }
-        Some(non_numlock_str)
-    }
-
-    fn handle_numpad_key(key_event: &KeyEvent) -> Option<&str> {
-        let PhysicalKey::Code(physical_key_code) = key_event.physical_key else {
-            return None;
-        };
-        let is_numlock_key = key_event.text.is_some();
-        match physical_key_code {
-            KeyCode::NumpadDivide => Some("kDivide"),
-            KeyCode::NumpadStar => Some("kMultiply"),
-            KeyCode::NumpadSubtract => Some("kMinus"),
-            KeyCode::NumpadAdd => Some("kPlus"),
-            KeyCode::NumpadEnter => Some("kEnter"),
-            KeyCode::NumpadEqual => Some("kEqual"),
-            KeyCode::NumpadComma => match key_event.logical_key.as_ref() {
-                Key::Character(",") => Some("kComma"),
-                Key::Character(".") => Some("kPoint"),
-                _ => None,
-            },
-            KeyCode::NumpadDecimal => {
-                if is_numlock_key {
-                    match key_event.logical_key.as_ref() {
-                        Key::Character(",") => Some("kComma"),
-                        Key::Character(".") => Some("kPoint"),
-                        _ => None,
-                    }
-                } else {
-                    Some("kDel")
-                }
-            }
-            KeyCode::Numpad9 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k9", "kPageUp")
-            }
-            KeyCode::Numpad8 => KeyboardManager::handle_numpad_numkey(is_numlock_key, "k8", "kUp"),
-            KeyCode::Numpad7 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k7", "kHome")
-            }
-            KeyCode::Numpad6 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k6", "kRight")
-            }
-            KeyCode::Numpad5 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k5", "kOrigin")
-            }
-            KeyCode::Numpad4 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k4", "kLeft")
-            }
-            KeyCode::Numpad3 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k3", "kPageDown")
-            }
-            KeyCode::Numpad2 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k2", "kDown")
-            }
-            KeyCode::Numpad1 => KeyboardManager::handle_numpad_numkey(is_numlock_key, "k1", "kEnd"),
-            KeyCode::Numpad0 => {
-                KeyboardManager::handle_numpad_numkey(is_numlock_key, "k0", "Insert")
-            }
-            _ => None,
-        }
-    }
-
-    fn format_key(&self, key_event: &KeyEvent) -> Option<String> {
-        if let Some(text) = get_special_key(key_event) {
-            Some(self.format_key_text(text, true))
-        } else {
-            self.format_normal_key(key_event)
-        }
-    }
-
-    fn format_normal_key(&self, key_event: &KeyEvent) -> Option<String> {
-        key_event
-            .text
-            .as_ref()
-            .or(match &key_event.logical_key {
-                Key::Character(text) => Some(text),
-                _ => None,
-            })
-            .map(|text| self.format_key_text(text.as_str(), false))
-    }
-
     fn encode_terminal_key_event(
         &self,
         key_event: &KeyEvent,
@@ -248,41 +127,6 @@ impl KeyboardManager {
         }
 
         Some(bytes)
-    }
-
-    fn format_key_text(&self, text: &str, is_special: bool) -> String {
-        let text = if self.modifiers.state().shift_key() && is_ascii_alphabetic_char(text) {
-            text.to_uppercase()
-        } else {
-            text.to_string()
-        };
-
-        let modifiers = self.format_modifier_string(&text, is_special);
-        let (text, is_special) =
-            if text == "<" { ("lt".to_string(), true) } else { (text, is_special) };
-        if modifiers.is_empty() {
-            if is_special { format!("<{text}>") } else { text }
-        } else {
-            format!("<{modifiers}{text}>")
-        }
-    }
-
-    pub fn format_modifier_string(&self, text: &str, is_special: bool) -> String {
-        let state = self.modifiers.state();
-        let include_shift = is_special || (state.control_key() && is_ascii_alphabetic_char(text));
-
-        #[cfg(target_os = "macos")]
-        let have_meta = self.meta_is_pressed || is_special && state.alt_key();
-
-        #[cfg(not(target_os = "macos"))]
-        let have_meta = self.meta_is_pressed;
-
-        let mut ret = String::new();
-        (state.shift_key() && include_shift).then(|| ret += "S-");
-        state.control_key().then(|| ret += "C-");
-        (have_meta).then(|| ret += "M-");
-        state.super_key().then(|| ret += "D-");
-        ret
     }
 }
 
@@ -670,80 +514,12 @@ fn encode_special_terminal_key(
     }
 }
 
-fn get_special_key(key_event: &KeyEvent) -> Option<&str> {
-    if key_event.location == KeyLocation::Numpad {
-        return KeyboardManager::handle_numpad_key(key_event);
-    }
-    let Key::Named(key) = &key_event.logical_key else {
-        return None;
-    };
-    match key {
-        NamedKey::ArrowDown => Some("Down"),
-        NamedKey::ArrowLeft => Some("Left"),
-        NamedKey::ArrowRight => Some("Right"),
-        NamedKey::ArrowUp => Some("Up"),
-        NamedKey::Backspace => Some("BS"),
-        NamedKey::Delete => Some("Del"),
-        NamedKey::End => Some("End"),
-        NamedKey::Enter => Some("Enter"),
-        NamedKey::Escape => Some("Esc"),
-        NamedKey::F1 => Some("F1"),
-        NamedKey::F2 => Some("F2"),
-        NamedKey::F3 => Some("F3"),
-        NamedKey::F4 => Some("F4"),
-        NamedKey::F5 => Some("F5"),
-        NamedKey::F6 => Some("F6"),
-        NamedKey::F7 => Some("F7"),
-        NamedKey::F8 => Some("F8"),
-        NamedKey::F9 => Some("F9"),
-        NamedKey::F10 => Some("F10"),
-        NamedKey::F11 => Some("F11"),
-        NamedKey::F12 => Some("F12"),
-        NamedKey::F13 => Some("F13"),
-        NamedKey::F14 => Some("F14"),
-        NamedKey::F15 => Some("F15"),
-        NamedKey::F16 => Some("F16"),
-        NamedKey::F17 => Some("F17"),
-        NamedKey::F18 => Some("F18"),
-        NamedKey::F19 => Some("F19"),
-        NamedKey::F20 => Some("F20"),
-        NamedKey::F21 => Some("F21"),
-        NamedKey::F22 => Some("F22"),
-        NamedKey::F23 => Some("F23"),
-        NamedKey::F24 => Some("F24"),
-        NamedKey::F25 => Some("F25"),
-        NamedKey::F26 => Some("F26"),
-        NamedKey::F27 => Some("F27"),
-        NamedKey::F28 => Some("F28"),
-        NamedKey::F29 => Some("F29"),
-        NamedKey::F30 => Some("F30"),
-        NamedKey::F31 => Some("F31"),
-        NamedKey::F32 => Some("F32"),
-        NamedKey::F33 => Some("F33"),
-        NamedKey::F34 => Some("F34"),
-        NamedKey::F35 => Some("F35"),
-        NamedKey::Home => Some("Home"),
-        NamedKey::Insert => Some("Insert"),
-        NamedKey::PageDown => Some("PageDown"),
-        NamedKey::PageUp => Some("PageUp"),
-        NamedKey::Space => {
-            if key_event.text == Some(" ".into()) || key_event.text.is_none() {
-                Some("Space")
-            } else {
-                None
-            }
-        }
-        NamedKey::Tab => Some("Tab"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         application_keypad_symbol, encode_application_keypad_symbol, encode_control_text,
         encode_cursor_key, encode_end_key, encode_home_key, encode_kitty_csi_u,
-        encode_special_terminal_key, encode_xterm_csi_modifier, encode_xterm_function_modifier,
+        encode_xterm_csi_modifier, encode_xterm_function_modifier,
         encode_xterm_ss3, encode_xterm_tilde_modifier, kitty_modifier_param,
         xterm_modifier_param,
     };

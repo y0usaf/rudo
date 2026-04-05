@@ -8,13 +8,10 @@ pub use crate::platform::macos::settings::*;
 
 #[derive(Clone, SettingGroup, PartialEq)]
 pub struct WindowSettings {
-    pub confirm_quit: bool,
     pub cursor_hack: bool,
     pub fullscreen: bool,
-    pub has_mouse_grid_detection: bool,
     pub hide_mouse_when_typing: bool,
     pub input_ime: bool,
-    pub iso_layout: bool,
     pub normal_opacity: f32,
     #[alias = "transparency"]
     pub opacity: f32,
@@ -32,7 +29,6 @@ pub struct WindowSettings {
     pub touch_deadzone: f32,
     pub touch_drag_timeout: f32,
     pub window_blurred: bool,
-    pub message_area_drag_selection: bool,
     #[cfg(target_os = "windows")]
     pub corner_preference: CornerPreference,
     #[cfg(target_os = "macos")]
@@ -48,24 +44,16 @@ pub struct WindowSettings {
     #[cfg(target_os = "windows")]
     pub title_text_color: String,
 
-    #[option = "mousemoveevent"]
-    pub mouse_move_event: bool,
-    #[option = "lines"]
-    pub observed_lines: Option<u64>,
-    #[option = "columns"]
-    pub observed_columns: Option<u64>,
+
 }
 
 impl Default for WindowSettings {
     fn default() -> Self {
         Self {
-            confirm_quit: true,
             cursor_hack: true,
             fullscreen: false,
-            has_mouse_grid_detection: false,
             hide_mouse_when_typing: false,
             input_ime: true,
-            iso_layout: false,
             normal_opacity: 1.0,
             opacity: 1.0,
             padding_bottom: 0,
@@ -82,7 +70,6 @@ impl Default for WindowSettings {
             touch_deadzone: 6.0,
             touch_drag_timeout: 0.17,
             window_blurred: false,
-            message_area_drag_selection: true,
             #[cfg(target_os = "windows")]
             corner_preference: CornerPreference::Default,
             #[cfg(target_os = "macos")]
@@ -98,10 +85,7 @@ impl Default for WindowSettings {
             #[cfg(target_os = "windows")]
             title_text_color: "".to_string(),
 
-            // Neovim options
-            mouse_move_event: false,
-            observed_columns: None,
-            observed_lines: None,
+
         }
     }
 }

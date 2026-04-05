@@ -3,13 +3,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "macos")]
-use {
-    crate::bridge::{OpenArgs, send_or_queue_file_drop, set_active_route_handler},
-    crate::utils::resolve_relative_path,
-    std::path::Path,
-};
-
 use glamour::Size2;
 use rustc_hash::FxHashMap;
 use winit::{
@@ -21,15 +14,15 @@ use winit::{
 };
 
 use super::{
-    CmdLineSettings, EventPayload, EventTarget, RouteId, WindowSettings, WindowSize,
-    WinitWindowWrapper, error_window, save_window_size,
+    EventPayload, EventTarget, RouteId, WindowSettings, WindowSize, WinitWindowWrapper,
+    error_window, save_window_size,
 };
 use crate::{
     clipboard::{Clipboard, ClipboardHandle},
     profiling::{tracy_plot, tracy_zone},
     renderer::DrawCommand,
     running_tracker::RunningTracker,
-    settings::{AppHotReloadConfigs, HotReloadConfigs, Settings, font::FontSettings},
+    settings::{AppHotReloadConfigs, Config, HotReloadConfigs, Settings, font::FontSettings},
     units::Grid,
     window::UserEvent,
 };
@@ -121,8 +114,6 @@ impl RenderState {
 
 pub struct Application {
     idle: bool,
-    #[allow(dead_code)]
-    initial_grid_size: Option<Size2<Grid<u32>>>,
     render_states: FxHashMap<WindowId, RenderState>,
     error_windows: FxHashMap<WindowId, (error_window::State, String)>,
 
@@ -139,20 +130,21 @@ impl Application {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         _initial_window_size: WindowSize,
-        initial_grid_size: Option<Size2<Grid<u32>>>,
+        _initial_grid_size: Option<Size2<Grid<u32>>>,
         initial_font_settings: Option<FontSettings>,
+        config: Config,
         proxy: EventLoopProxy<EventPayload>,
         settings: Arc<Settings>,
         clipboard: Arc<Mutex<Clipboard>>,
         clipboard_handle: ClipboardHandle,
     ) -> Self {
-        let cmd_line_settings = settings.get::<CmdLineSettings>();
-        let idle = cmd_line_settings.idle;
+        let idle = true;
 
         let runtime_tracker = RunningTracker::new();
 
         let window_wrapper = WinitWindowWrapper::new(
             initial_font_settings,
+            config,
             settings.clone(),
             runtime_tracker.clone(),
             clipboard_handle,
@@ -160,7 +152,6 @@ impl Application {
 
         Self {
             idle,
-            initial_grid_size,
             render_states: FxHashMap::default(),
             error_windows: FxHashMap::default(),
 
@@ -243,62 +234,12 @@ impl Application {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn activate_focused_route(&self) {
-        let Some(window_id) = self.window_wrapper.get_focused_route() else {
-            return;
-        };
-
-        if let Some(route_id) = self.window_wrapper.route_id_for_window(window_id) {
-            set_active_route_handler(route_id);
-        }
-
-        self.window_wrapper.activate_and_focus_window(window_id);
-    }
-
-    #[cfg(target_os = "macos")]
-    fn prepare_open_files(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        new_window: bool,
-        cwd: Option<&Path>,
-        args: OpenArgs,
-    ) {
-        if !new_window {
-            self.activate_focused_route();
-            self.send_file_drops(args);
-            return;
-        }
-
-        if self.settings.get::<CmdLineSettings>().server.is_some() {
-            self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, None);
-            self.mark_should_render_all();
-            self.send_file_drops(args);
-            return;
-        }
-
-        let open_args = (!args.files_to_open.is_empty()).then_some(args);
-        self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, open_args);
-        self.mark_should_render_all();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn send_file_drops(&self, args: OpenArgs) {
-        for path in args.files_to_open {
-            send_or_queue_file_drop(path, Some(args.tabs));
-        }
-    }
-
     fn handle_app_config_changed(&mut self, config: AppHotReloadConfigs) {
         match config {
             AppHotReloadConfigs::Idle(idle) => {
-                let mut cmd_line_settings = self.settings.get::<CmdLineSettings>();
-                if cmd_line_settings.idle == idle && self.idle == idle {
+                if self.idle == idle {
                     return;
                 }
-
-                cmd_line_settings.idle = idle;
-                self.settings.set(&cmd_line_settings);
                 self.idle = idle;
                 self.mark_should_render_all();
             }
@@ -306,6 +247,8 @@ impl Application {
     }
 
     fn handle_config_changed(&mut self, _target: EventTarget, config: HotReloadConfigs) {
+        self.window_wrapper.update_config(&config);
+
         match config {
             HotReloadConfigs::App(config) => {
                 self.handle_app_config_changed(config);
@@ -409,17 +352,8 @@ impl Application {
 
     fn teardown(&mut self) {
         // Drop the clipboard while the event loop is still alive so Wayland handles are released
-        // safely. see https://github.com/neovide/neovide/issues/3311
+        // safely.
         self.clipboard.take();
-
-        // Wait a little bit more and force Nevovim to exit after that.
-        // This should not be required, but Neovim through libuv spawns childprocesses that inherits all the handles
-        // This means that the stdio and stderr handles are not properly closed, so the nvim-rs
-        // read will hang forever, waiting for more data to read.
-        // See https://github.com/neovide/neovide/issues/2182 (which includes links to libuv issues)
-        if let Some(runtime) = self.window_wrapper.runtime.take() {
-            runtime.shutdown(std::time::Duration::from_millis(500));
-        }
     }
 
     fn handle_animation_steps(&mut self, window_id: WindowId, dt: Duration) {
@@ -594,7 +528,7 @@ impl Application {
             } else {
                 // Cache purging should only happen once we become idle; doing it while throttling
                 // for vsync caused Skia to evict glyphs mid-animation and re-upload them every
-                // frame. See https://github.com/neovide/neovide/pull/3324
+                // frame. See https://github.com/neovide/neovide/pull/3324 (upstream Neovide)
                 let should_cleanup_cache = self
                     .render_states
                     .get(&window_id)
@@ -715,19 +649,10 @@ impl ApplicationHandler<EventPayload> for Application {
         let EventPayload { payload, target } = event;
         match payload {
             UserEvent::ConfigsChanged(config) => self.handle_config_changed(target, *config),
-            #[cfg(target_os = "macos")]
-            UserEvent::OpenFiles { files, cwd, caller_cwd, tabs, new_window } => {
-                let cwd = cwd.as_deref().map(Path::new);
-                let caller_cwd = caller_cwd.as_deref().map(Path::new);
-                let open_args = OpenArgs {
-                    files_to_open: files
-                        .into_iter()
-                        .map(|path| resolve_relative_path(&path, caller_cwd))
-                        .collect(),
-                    tabs,
-                };
-
-                self.prepare_open_files(event_loop, new_window, cwd, open_args);
+            UserEvent::ProcessLaunchError { message } => {
+                log::error!("{message}");
+                self.runtime_tracker.quit_with_code(1, &message);
+                event_loop.exit();
             }
             UserEvent::ProcessExited => {
                 let route_id = self.route_id_for_target(target);
@@ -824,18 +749,6 @@ impl ApplicationHandler<EventPayload> for Application {
             UserEvent::MacShortcut(command) => {
                 self.window_wrapper.handle_mac_shortcut(command);
                 self.mark_should_render_all();
-            }
-            UserEvent::ProcessLaunchError { message } => {
-                let window_config = error_window::create_error_window(event_loop, &self.settings);
-                let clipboard_handle = ClipboardHandle::new(self.clipboard.as_ref().unwrap());
-                let state = error_window::State::new(
-                    &message,
-                    window_config,
-                    self.settings.clone(),
-                    clipboard_handle,
-                );
-                let window_id = state.window_id();
-                self.error_windows.insert(window_id, (state, message));
             }
             payload => {
                 self.window_wrapper.handle_user_event(EventPayload { payload, target });

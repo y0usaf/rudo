@@ -12,7 +12,7 @@ use std::{
 pub use from_value::ParseFromValue;
 pub use window_size::{
     DEFAULT_GRID_SIZE, MIN_GRID_SIZE, PersistentWindowSettings, clamped_grid_size,
-    load_last_window_settings, neovide_std_datapath, save_window_size,
+    load_last_window_settings, save_window_size, termvide_std_datapath,
 };
 
 pub mod config;
@@ -76,7 +76,6 @@ pub enum SettingsChanged {
     Window(crate::window::WindowSettingsChanged),
     Cursor(crate::renderer::cursor_renderer::CursorSettingsChanged),
     Renderer(crate::renderer::RendererSettingsChanged),
-    ProgressBar(crate::renderer::progress_bar::ProgressBarSettingsChanged),
 }
 
 #[cfg(test)]

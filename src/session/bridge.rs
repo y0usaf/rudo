@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     renderer::{DrawCommand, WindowDrawCommand},
     terminal::{
+        Hyperlink as TerminalHyperlink,
         cell::CellWidth,
         screen::TerminalScreen,
         state::{TerminalDamage, TerminalState},
@@ -159,6 +160,26 @@ impl StyleCache {
     }
 }
 
+struct HyperlinkCache {
+    map: HashMap<*const TerminalHyperlink, Arc<Hyperlink>>,
+}
+
+impl HyperlinkCache {
+    fn new() -> Self {
+        Self { map: HashMap::with_capacity(4) }
+    }
+
+    fn resolve_opt(&mut self, hyperlink: Option<&Arc<TerminalHyperlink>>) -> Option<Arc<Hyperlink>> {
+        hyperlink.map(|link| {
+            let ptr = Arc::as_ptr(link);
+            self.map
+                .entry(ptr)
+                .or_insert_with(|| Arc::new(Hyperlink { id: link.id.clone(), uri: link.uri.clone() }))
+                .clone()
+        })
+    }
+}
+
 fn line_for_row(
     screen: &TerminalScreen,
     row: usize,
@@ -169,16 +190,17 @@ fn line_for_row(
     let width = cells.len();
 
     let mut text = String::with_capacity(width);
-    let mut fragments = Vec::new();
+    let mut fragments = Vec::with_capacity(width.min(8));
     let mut cell_strings: Vec<String> = Vec::with_capacity(width);
     let mut hyperlinks: Vec<Option<Arc<Hyperlink>>> = Vec::with_capacity(width);
+    let mut hyperlink_cache = HyperlinkCache::new();
     let mut start = 0;
 
     while start < width {
         let resolved_style = style_cache.resolve_opt(cells[start].style.as_ref(), theme);
         let text_start = text.len() as u32;
         let frag_start = start as u32;
-        let mut words = Vec::new();
+        let mut words = Vec::with_capacity((width - start).min(8));
         let mut current_word = WordData::default();
         let mut consumed = 0u32;
         let mut last_box_char: Option<&str> = None;
@@ -212,9 +234,7 @@ fn line_for_row(
                     current_word.cluster_sizes.push(0);
                 }
                 cell_strings.push(String::new());
-                hyperlinks.push(cell.hyperlink.as_ref().map(|link| {
-                    Arc::new(Hyperlink { id: link.id.clone(), uri: link.uri.clone() })
-                }));
+                hyperlinks.push(hyperlink_cache.resolve_opt(cell.hyperlink.as_ref()));
                 continue;
             }
 
@@ -234,11 +254,7 @@ fn line_for_row(
 
             text.push_str(cluster);
             cell_strings.push(cluster.to_string());
-            hyperlinks.push(
-                cell.hyperlink
-                    .as_ref()
-                    .map(|link| Arc::new(Hyperlink { id: link.id.clone(), uri: link.uri.clone() })),
-            );
+            hyperlinks.push(hyperlink_cache.resolve_opt(cell.hyperlink.as_ref()));
         }
 
         if !current_word.cluster_sizes.is_empty() {

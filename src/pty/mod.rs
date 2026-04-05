@@ -75,7 +75,10 @@ pub struct PtyExitStatus {
 #[async_trait]
 pub trait PtyProcess: Send {
     async fn resize(&mut self, size: PtySize) -> Result<()>;
-    async fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>>;
+    fn read_blocking(&mut self, max_bytes: usize) -> Result<Vec<u8>>;
+    async fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>> {
+        self.read_blocking(max_bytes)
+    }
     async fn write(&mut self, bytes: &[u8]) -> Result<()>;
     async fn shutdown(&mut self) -> Result<()>;
     async fn wait(&mut self) -> Result<PtyExitStatus>;
@@ -100,12 +103,17 @@ pub const TERMVIDE_TERM_ENV_VAR: &str = "TERMVIDE_TERM";
 const DEFAULT_TERM: &str = "xterm-256color";
 const TERMVIDE_TERM: &str = "termvide";
 
-fn configured_term() -> OsString {
+pub(crate) fn compute_configured_term() -> OsString {
     match env::var_os(TERMVIDE_TERM_ENV_VAR) {
         Some(value) if !value.is_empty() => value,
         _ if bundled_terminfo_is_available() => OsString::from(TERMVIDE_TERM),
         _ => OsString::from(DEFAULT_TERM),
     }
+}
+
+fn configured_term() -> OsString {
+    static CACHE: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
+    CACHE.get_or_init(compute_configured_term).clone()
 }
 
 fn bundled_terminfo_is_available() -> bool {
@@ -216,14 +224,11 @@ impl PtyProcess for NativePtyProcess {
         task::block_in_place(|| self.master.lock().resize(size.into())).context("PTY resize failed")
     }
 
-    async fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>> {
-        task::block_in_place(|| {
-            let mut buffer = vec![0; max_bytes.max(1)];
-            let bytes_read = self.reader.lock().read(&mut buffer)?;
-            buffer.truncate(bytes_read);
-            Ok::<_, std::io::Error>(buffer)
-        })
-        .context("PTY read failed")
+    fn read_blocking(&mut self, max_bytes: usize) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; max_bytes.max(1)];
+        let bytes_read = self.reader.lock().read(&mut buffer).context("PTY read failed")?;
+        buffer.truncate(bytes_read);
+        Ok(buffer)
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<()> {
@@ -311,10 +316,7 @@ mod tests {
     #[test]
     fn terminal_environment_sets_expected_term() {
         with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
-            let env = terminal_environment();
-            assert!(env.iter().any(|(key, value)| {
-                key == &OsString::from("TERM") && value == &OsString::from(DEFAULT_TERM)
-            }));
+            assert_eq!(compute_configured_term(), OsString::from(DEFAULT_TERM));
         });
     }
 
@@ -327,11 +329,7 @@ mod tests {
             std::fs::write(&entry_path, b"compiled-terminfo").unwrap();
 
             std::env::set_var("TERMINFO", &temp_dir);
-            let env = terminal_environment();
-
-            assert!(env.iter().any(|(key, value)| {
-                key == &OsString::from("TERM") && value == &OsString::from(TERMVIDE_TERM)
-            }));
+            assert_eq!(compute_configured_term(), OsString::from(TERMVIDE_TERM));
         });
     }
 
@@ -339,11 +337,7 @@ mod tests {
     fn terminal_environment_allows_term_override() {
         with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
             std::env::set_var(TERMVIDE_TERM_ENV_VAR, "termvide");
-            let env = terminal_environment();
-
-            assert!(env.iter().any(|(key, value)| {
-                key == &OsString::from("TERM") && value == &OsString::from("termvide")
-            }));
+            assert_eq!(compute_configured_term(), OsString::from("termvide"));
         });
     }
 
@@ -351,11 +345,7 @@ mod tests {
     fn terminal_environment_override_wins_even_without_bundled_terminfo() {
         with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
             std::env::set_var(TERMVIDE_TERM_ENV_VAR, "screen-256color");
-            let env = terminal_environment();
-
-            assert!(env.iter().any(|(key, value)| {
-                key == &OsString::from("TERM") && value == &OsString::from("screen-256color")
-            }));
+            assert_eq!(compute_configured_term(), OsString::from("screen-256color"));
         });
     }
 
@@ -363,11 +353,7 @@ mod tests {
     fn terminal_environment_ignores_empty_term_override() {
         with_env_vars_cleared(&[TERMVIDE_TERM_ENV_VAR, "TERMINFO", "TERMINFO_DIRS"], || {
             std::env::set_var(TERMVIDE_TERM_ENV_VAR, "");
-            let env = terminal_environment();
-
-            assert!(env.iter().any(|(key, value)| {
-                key == &OsString::from("TERM") && value == &OsString::from(DEFAULT_TERM)
-            }));
+            assert_eq!(compute_configured_term(), OsString::from(DEFAULT_TERM));
         });
     }
 
