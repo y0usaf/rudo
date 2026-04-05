@@ -1,0 +1,3 @@
+# Intentionally left empty.
+# Linker acceleration is already configured in flake.nix for the Nix dev/build environment.
+# Avoid forcing a linker globally here, since plain `cargo build` may not have `clang`/`mold` on PATH.

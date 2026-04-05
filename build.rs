@@ -3,12 +3,12 @@ use std::process::Command;
 fn main() {
     set_rerun();
 
-    println!("cargo:rustc-env=NEOVIDE_BUILD_VERSION={}", build_version());
+    println!("cargo:rustc-env=TERMVIDE_BUILD_VERSION={}", build_version());
 
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();
-        res.set_icon("assets/neovide.ico");
+        res.set_icon("assets/termvide.ico");
         res.compile().expect("Could not attach exe icon");
     }
 }
@@ -16,7 +16,7 @@ fn main() {
 fn set_rerun() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=assets/neovide.ico");
+    println!("cargo:rerun-if-changed=assets/termvide.ico");
 
     for path in ["HEAD", "refs", "index", "packed-refs"] {
         if let Some(path) = git_path(path) {
@@ -24,13 +24,6 @@ fn set_rerun() {
         }
     }
 
-    if let Some(files) = git_output(&["ls-files", "-z"]) {
-        for file in files.split('\0').filter(|file| !file.is_empty()) {
-            println!("cargo:rerun-if-changed={file}");
-        }
-    } else {
-        println!("cargo:warning=Could not list tracked files for version rerun tracking");
-    }
 }
 
 fn build_version() -> String {

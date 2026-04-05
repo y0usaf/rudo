@@ -26,10 +26,9 @@ If applicable, add screenshots to help explain your problem.
 
 **Desktop (please complete the following information):**
  - OS: [e.g. macOS 11.4]
- - Neovide Version [e.g. 0.6.0]
- - Neovim Version [e.g. 0.5.0]
+ - Termvide Version [e.g. 0.16.0]
 
-**Please run `neovide --log` and paste the contents of the `.log` file created in the current directory here:**
+**Please run `termvide --log` and paste the contents of the `.log` file created in the current directory here:**
 
 **Additional context**
 Add any other context about the problem here.
