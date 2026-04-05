@@ -1,7 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use tokio::runtime::{Builder, Runtime};
+use tokio::{runtime::{Builder, Runtime}, sync::watch};
 use winit::event_loop::EventLoopProxy;
 
 use crate::{
@@ -14,14 +14,20 @@ use crate::{
     window::{EventPayload, RouteId},
 };
 
+/// Handle to a running terminal process.  Cloning is cheap – both fields are
+/// backed by reference-counted handles.
 #[derive(Clone)]
 pub struct TerminalHandle {
     process: NativePtyProcess,
+    /// Sender half of a watch channel used to signal PTY dimension changes to
+    /// the session listener loop.  The sender is wrapped in an `Arc` so that
+    /// multiple clones of `TerminalHandle` all share the same channel.
+    resize_tx: Arc<watch::Sender<PtySize>>,
 }
 
 impl TerminalHandle {
-    pub fn new(process: NativePtyProcess) -> Self {
-        Self { process }
+    pub fn new(process: NativePtyProcess, resize_tx: Arc<watch::Sender<PtySize>>) -> Self {
+        Self { process, resize_tx }
     }
 }
 
@@ -54,6 +60,12 @@ impl TerminalRuntime {
             size,
         })?;
 
+        // Create a watch channel so that window resize events can be forwarded to
+        // the session listener loop without requiring it to share a mutex with the
+        // render thread.
+        let (resize_tx, resize_rx) = watch::channel(size);
+        let resize_tx = Arc::new(resize_tx);
+
         let listener_process = process.clone();
         self.runtime().spawn(async move {
             if let Err(error) = spawn_pty_listener(
@@ -63,6 +75,7 @@ impl TerminalRuntime {
                 running_tracker,
                 size.cols as usize,
                 size.rows as usize,
+                resize_rx,
             )
             .await
             {
@@ -70,7 +83,7 @@ impl TerminalRuntime {
             }
         });
 
-        Ok(TerminalHandle::new(process))
+        Ok(TerminalHandle::new(process, resize_tx))
     }
 
     pub fn write(&self, handle: TerminalHandle, bytes: Vec<u8>) {
@@ -83,6 +96,9 @@ impl TerminalRuntime {
     }
 
     pub fn resize(&self, handle: TerminalHandle, size: PtySize) {
+        // Notify the session listener loop first so the terminal state is updated
+        // before the child process starts its redraw in response to SIGWINCH.
+        let _ = handle.resize_tx.send(size);
         self.runtime().spawn(async move {
             let mut process = handle.process;
             if let Err(error) = crate::pty::PtyProcess::resize(&mut process, size).await {
