@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-podman run --rm --volume .:/mnt --workdir /mnt --tty --interactive --env "LDAI_*" ubuntu-builder-neovide "$@"
