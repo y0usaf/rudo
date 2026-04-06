@@ -116,6 +116,15 @@ fn main() -> ExitCode {
         Err(err) => return handle_startup_errors(err, event_loop, settings.clone(), clipboard),
     };
 
+    // Apply transparency/opacity from config.toml into WindowSettings.
+    if config.transparency.unwrap_or(false) {
+        let mut window_settings = settings.get::<WindowSettings>();
+        let opacity = config.opacity.unwrap_or(1.0);
+        window_settings.opacity = opacity;
+        window_settings.normal_opacity = opacity;
+        settings.set(&window_settings);
+    }
+
     // Set BgColor by default when using a transparent frame, so the titlebar text gets correct
     // color.
     #[cfg(target_os = "macos")]

@@ -93,6 +93,8 @@ pub struct Config {
     pub wayland_app_id: Option<String>,
     pub x11_wm_class: Option<String>,
     pub x11_wm_class_instance: Option<String>,
+    pub transparency: Option<bool>,
+    pub opacity: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
