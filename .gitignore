@@ -1,14 +1,3 @@
 /target
-/target-ubuntu
-/.vs
-**/*.rs.bk
-*.log
-.DS_Store
-website/book
-*.AppImage
-.envrc
-flake.nix
-flake.lock
-.direnv/
-.devenv/
-ref
+/result
+/ref

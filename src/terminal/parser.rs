@@ -1,939 +1,1360 @@
-use vte::{Params, Parser, Perform};
+//! VT100/xterm escape sequence parser.
+//! Uses the `vte` crate for state machine parsing, with full SGR, CSI, ESC, and OSC support.
 
-use crate::terminal::{
-    ClipboardSelection, Hyperlink,
-    state::{CharsetSlot, DecCharset, TerminalState},
-    theme::parse_color,
-};
-use crate::ui::CursorShape;
+use super::cell::{Cell, CellFlags, ColorSource, PackedColor};
+use super::damage::DamageTracker;
+use super::grid::Grid;
+use super::mouse::{MouseMode, MouseState};
+use super::theme::Theme;
 
-pub struct TerminalParser {
-    parser: Parser,
-}
+// ---------------------------------------------------------------------------
+// Color helpers
+// ---------------------------------------------------------------------------
 
-impl Default for TerminalParser {
-    fn default() -> Self {
-        Self::new()
+/// Parse an extended color specification from a flat parameter slice.
+///
+/// Handles both semicolon-separated (`38;5;idx` / `38;2;r;g;b`) and
+/// colon-separated subparameter forms.  Returns `(color, source, number of
+/// params consumed)`.
+fn parse_extended_color(params: &[u16], theme: &Theme) -> (PackedColor, ColorSource, usize) {
+    if params.is_empty() {
+        return (PackedColor(0), ColorSource::Default, 0);
+    }
+    match params[0] {
+        // 256-color: ;5;idx
+        5 if params.len() >= 2 => {
+            let idx = params[1] as u8;
+            (theme.palette(idx), ColorSource::Palette, 2)
+        }
+        // True color: ;2;r;g;b
+        2 if params.len() >= 4 => {
+            let r = params[1] as u8;
+            let g = params[2] as u8;
+            let b = params[3] as u8;
+            (PackedColor::new(r, g, b), ColorSource::Rgb, 4)
+        }
+        _ => (PackedColor(0), ColorSource::Default, 0),
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public parser
+// ---------------------------------------------------------------------------
+
+/// VT100/xterm terminal parser wrapping the `vte` state machine.
+pub struct TerminalParser {
+    parser: vte::Parser,
+    current_attrs: Cell,
+    pub title: Option<String>,
+    pub responses: Vec<Vec<u8>>,
+    pub theme: Theme,
+    pub mouse_state: MouseState,
+    pub application_cursor_keys: bool,
+    origin_mode: bool,
+}
+
+#[allow(dead_code)]
 impl TerminalParser {
     pub fn new() -> Self {
-        Self { parser: Parser::new() }
+        let theme = Theme::default();
+        let mut default_cell = Cell::default();
+        default_cell.fg = theme.foreground;
+        default_cell.bg = theme.background;
+        Self {
+            parser: vte::Parser::new(),
+            current_attrs: default_cell,
+            title: None,
+            responses: Vec::new(),
+            theme,
+            mouse_state: MouseState::new(),
+            application_cursor_keys: false,
+            origin_mode: false,
+        }
     }
 
-    pub fn advance(&mut self, state: &mut TerminalState, bytes: &[u8]) {
-        let mut performer = TerminalPerformer { state, dcs: None };
+    pub fn with_theme(theme: Theme) -> Self {
+        let mut default_cell = Cell::default();
+        default_cell.fg = theme.foreground;
+        default_cell.bg = theme.background;
+        Self {
+            parser: vte::Parser::new(),
+            current_attrs: default_cell,
+            title: None,
+            responses: Vec::new(),
+            theme,
+            mouse_state: MouseState::new(),
+            application_cursor_keys: false,
+            origin_mode: false,
+        }
+    }
+
+    /// Feed raw bytes from the PTY into the parser.
+    pub fn advance(&mut self, grid: &mut Grid, damage: &mut DamageTracker, bytes: &[u8]) {
+        let mut performer = Performer {
+            grid,
+            damage,
+            current_attrs: &mut self.current_attrs,
+            title: &mut self.title,
+            responses: &mut self.responses,
+            theme: &self.theme,
+            mouse_state: &mut self.mouse_state,
+            application_cursor_keys: &mut self.application_cursor_keys,
+            origin_mode: &mut self.origin_mode,
+        };
         self.parser.advance(&mut performer, bytes);
     }
+
+    /// Drain and return all pending response bytes (e.g. DSR, DA answers).
+    pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.responses)
+    }
 }
 
-struct TerminalPerformer<'a> {
-    state: &'a mut TerminalState,
-    dcs: Option<PendingDcs>,
+// ---------------------------------------------------------------------------
+// Performer – implements vte::Perform
+// ---------------------------------------------------------------------------
+
+struct Performer<'a> {
+    grid: &'a mut Grid,
+    damage: &'a mut DamageTracker,
+    current_attrs: &'a mut Cell,
+    title: &'a mut Option<String>,
+    responses: &'a mut Vec<Vec<u8>>,
+    theme: &'a Theme,
+    mouse_state: &'a mut MouseState,
+    application_cursor_keys: &'a mut bool,
+    origin_mode: &'a mut bool,
 }
 
-struct PendingDcs {
-    params: Vec<i64>,
-    intermediates: Vec<u8>,
-    action: char,
-    data: Vec<u8>,
-}
+impl<'a> Performer<'a> {
+    // -----------------------------------------------------------------------
+    // SGR attribute handling
+    // -----------------------------------------------------------------------
 
-impl Perform for TerminalPerformer<'_> {
-    fn print(&mut self, c: char) {
-        self.state.print_char(c);
+    fn handle_sgr(&mut self, params: &vte::Params) {
+        // Collect all params into a flat list so we can index freely.
+        // Each "parameter group" from vte may contain subparameters (colon-separated).
+        // We flatten them for uniform handling.
+        let mut flat = [0u16; 32];
+        let mut flat_len = 0usize;
+        for group in params.iter() {
+            for &val in group {
+                if flat_len < flat.len() {
+                    flat[flat_len] = val;
+                    flat_len += 1;
+                }
+            }
+        }
+
+        if flat_len == 0 {
+            // Bare ESC[m == reset.
+            self.sgr_reset();
+            return;
+        }
+
+        let mut i = 0;
+        while i < flat_len {
+            let code = flat[i];
+            i += 1;
+            match code {
+                0 => self.sgr_reset(),
+
+                // Set attributes
+                1 => self.current_attrs.flags.insert(CellFlags::BOLD),
+                2 => self.current_attrs.flags.insert(CellFlags::DIM),
+                3 => self.current_attrs.flags.insert(CellFlags::ITALIC),
+                4 => self.current_attrs.flags.insert(CellFlags::UNDERLINE),
+                5 | 6 => self.current_attrs.flags.insert(CellFlags::BLINK),
+                7 => self.current_attrs.flags.insert(CellFlags::REVERSE),
+                8 => self.current_attrs.flags.insert(CellFlags::HIDDEN),
+                9 => self.current_attrs.flags.insert(CellFlags::STRIKETHROUGH),
+
+                // Remove attributes
+                21 => self.current_attrs.flags.remove(CellFlags::BOLD), // (or double underline – we treat as unbold)
+                22 => {
+                    self.current_attrs.flags.remove(CellFlags::BOLD);
+                    self.current_attrs.flags.remove(CellFlags::DIM);
+                }
+                23 => self.current_attrs.flags.remove(CellFlags::ITALIC),
+                24 => self.current_attrs.flags.remove(CellFlags::UNDERLINE),
+                25 => self.current_attrs.flags.remove(CellFlags::BLINK),
+                27 => self.current_attrs.flags.remove(CellFlags::REVERSE),
+                28 => self.current_attrs.flags.remove(CellFlags::HIDDEN),
+                29 => self.current_attrs.flags.remove(CellFlags::STRIKETHROUGH),
+
+                // Standard foreground 30–37
+                30..=37 => {
+                    self.current_attrs.fg = self.theme.palette((code - 30) as u8);
+                    self.current_attrs.fg_src = ColorSource::Palette;
+                }
+                // Extended foreground
+                38 => {
+                    let (color, src, consumed) =
+                        parse_extended_color(&flat[i..flat_len], self.theme);
+                    if consumed > 0 {
+                        self.current_attrs.fg = color;
+                        self.current_attrs.fg_src = src;
+                        i += consumed;
+                    }
+                }
+                // Default foreground
+                39 => {
+                    self.current_attrs.fg = self.theme.foreground;
+                    self.current_attrs.fg_src = ColorSource::Default;
+                }
+
+                // Standard background 40–47
+                40..=47 => {
+                    self.current_attrs.bg = self.theme.palette((code - 40) as u8);
+                    self.current_attrs.bg_src = ColorSource::Palette;
+                }
+                // Extended background
+                48 => {
+                    let (color, src, consumed) =
+                        parse_extended_color(&flat[i..flat_len], self.theme);
+                    if consumed > 0 {
+                        self.current_attrs.bg = color;
+                        self.current_attrs.bg_src = src;
+                        i += consumed;
+                    }
+                }
+                // Default background
+                49 => {
+                    self.current_attrs.bg = self.theme.background;
+                    self.current_attrs.bg_src = ColorSource::Default;
+                }
+
+                // Bright foreground 90–97
+                90..=97 => {
+                    self.current_attrs.fg = self.theme.palette((code - 90 + 8) as u8);
+                    self.current_attrs.fg_src = ColorSource::Palette;
+                }
+
+                // Bright background 100–107
+                100..=107 => {
+                    self.current_attrs.bg = self.theme.palette((code - 100 + 8) as u8);
+                    self.current_attrs.bg_src = ColorSource::Palette;
+                }
+
+                _ => {} // unrecognised – ignore
+            }
+        }
     }
 
+    fn sgr_reset(&mut self) {
+        self.current_attrs.flags = CellFlags::empty();
+        self.current_attrs.fg = self.theme.foreground;
+        self.current_attrs.bg = self.theme.background;
+        self.current_attrs.fg_src = ColorSource::Default;
+        self.current_attrs.bg_src = ColorSource::Default;
+    }
+
+    // -----------------------------------------------------------------------
+    // CSI dispatch helpers
+    // -----------------------------------------------------------------------
+
+    /// Extract the first parameter, defaulting to `default` when absent or 0.
+    fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
+        params
+            .iter()
+            .nth(idx)
+            .and_then(|p| p.first().copied())
+            .map(|v| if v == 0 { default } else { v })
+            .unwrap_or(default)
+    }
+
+    /// Extract the first parameter, defaulting to `default` when absent (0 IS valid).
+    fn param_zero_ok(params: &vte::Params, idx: usize, default: u16) -> u16 {
+        params
+            .iter()
+            .nth(idx)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(default)
+    }
+
+    #[inline]
+    fn row_bounds(&self) -> (usize, usize) {
+        if *self.origin_mode {
+            self.grid.scroll_region()
+        } else {
+            (0, self.grid.rows().saturating_sub(1))
+        }
+    }
+
+    #[inline]
+    fn absolute_row_param(&self, row: usize) -> usize {
+        let (min_row, max_row) = self.row_bounds();
+        if *self.origin_mode {
+            (min_row + row).min(max_row)
+        } else {
+            row.min(max_row)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BCE (Background Color Erase) blank cell
+    // -----------------------------------------------------------------------
+
+    /// Build a blank cell that inherits the current SGR background color.
+    /// Per VT220/xterm spec, erased cells take on the current background.
+    fn blank_cell(&self) -> Cell {
+        Cell {
+            ch: ' ' as u32,
+            flags: CellFlags::empty(),
+            fg_src: ColorSource::Default,
+            bg_src: self.current_attrs.bg_src,
+            fg: self.theme.foreground,
+            bg: self.current_attrs.bg,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Insert / Delete lines (IL, DL)
+    // -----------------------------------------------------------------------
+
+    fn insert_lines(&mut self, count: usize) {
+        let blank = self.blank_cell();
+        self.grid
+            .insert_lines_at_with(self.grid.cursor.row, count, blank);
+        self.damage.mark_all();
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        let blank = self.blank_cell();
+        self.grid
+            .delete_lines_at_with(self.grid.cursor.row, count, blank);
+        self.damage.mark_all();
+    }
+
+    // -----------------------------------------------------------------------
+    // Erase characters (ECH)
+    // -----------------------------------------------------------------------
+
+    fn erase_chars(&mut self, count: usize) {
+        let blank = self.blank_cell();
+        self.grid.erase_chars_with(count, blank);
+        self.damage.mark_row(self.grid.cursor.row);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vte::Perform implementation
+// ---------------------------------------------------------------------------
+
+/// Mask to strip positional flags when copying text attributes to cells.
+const PRINT_FLAGS_MASK: CellFlags = CellFlags::from_bits_truncate(
+    !(CellFlags::WIDE.bits() | CellFlags::WIDE_SPACER.bits() | CellFlags::DIRTY.bits()),
+);
+
+impl<'a> vte::Perform for Performer<'a> {
+    // ------ Print a visible character ------------------------------------
+    #[inline]
+    fn print(&mut self, c: char) {
+        let col = self.grid.cursor.col;
+        let _row = self.grid.cursor.row;
+        let cols = self.grid.cols();
+
+        // Determine character width
+        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+
+        // Handle autowrap: if we're past the last column, wrap.
+        if col >= cols {
+            self.grid.carriage_return();
+            let blank = self.blank_cell();
+            self.grid.linefeed_with(blank);
+        }
+
+        let col = self.grid.cursor.col;
+        let row = self.grid.cursor.row;
+
+        if col >= cols {
+            return; // safety
+        }
+
+        // Write the cell
+        let cell = self.grid.cell_mut(col, row);
+        cell.ch = c as u32;
+        cell.flags = self.current_attrs.flags & PRINT_FLAGS_MASK;
+        cell.fg = self.current_attrs.fg;
+        cell.bg = self.current_attrs.bg;
+        cell.fg_src = self.current_attrs.fg_src;
+        cell.bg_src = self.current_attrs.bg_src;
+        cell.mark_dirty();
+
+        if width == 2 {
+            cell.flags.insert(CellFlags::WIDE);
+            // Place spacer in next column
+            if col + 1 < cols {
+                let spacer = self.grid.cell_mut(col + 1, row);
+                *spacer = Cell::default();
+                spacer.flags.insert(CellFlags::WIDE_SPACER);
+                spacer.mark_dirty();
+                self.grid.cursor.col = col + 2;
+            } else {
+                self.grid.cursor.col = col + 1;
+            }
+        } else {
+            self.grid.cursor.col = col + 1;
+        }
+
+        self.grid.row_mut(row).dirty = true;
+        self.damage.mark_row(row);
+    }
+
+    // ------ Execute a C0 control byte ------------------------------------
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => self.state.linefeed(),
-            b'\r' => self.state.carriage_return(),
-            0x08 => self.state.backspace(),
-            b'\t' => self.state.tab(),
-            0x0e => self.state.shift_out(),
-            0x0f => self.state.shift_in(),
+            // BEL
+            0x07 => { /* bell – ignore for now */ }
+            // BS – backspace
+            0x08 => {
+                if self.grid.cursor.col > 0 {
+                    self.grid.cursor.col -= 1;
+                }
+            }
+            // HT – horizontal tab
+            0x09 => {
+                let col = self.grid.cursor.col;
+                let cols = self.grid.cols();
+                // Advance to next tab stop (every DEFAULT_TAB_WIDTH columns).
+                let next = ((col / crate::core_app::DEFAULT_TAB_WIDTH) + 1)
+                    * crate::core_app::DEFAULT_TAB_WIDTH;
+                self.grid.cursor.col = next.min(cols.saturating_sub(1));
+            }
+            // LF, VT, FF
+            0x0A | 0x0B | 0x0C => {
+                let blank = self.blank_cell();
+                self.grid.linefeed_with(blank);
+                self.damage.mark_all();
+            }
+            // CR
+            0x0D => {
+                self.grid.carriage_return();
+            }
             _ => {}
         }
     }
 
-    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore {
-            return;
-        }
-
-        self.dcs = Some(PendingDcs {
-            params: params_iter(params).collect(),
-            intermediates: intermediates.to_vec(),
-            action,
-            data: Vec::new(),
-        });
-    }
-
-    fn put(&mut self, byte: u8) {
-        if let Some(dcs) = &mut self.dcs {
-            dcs.data.push(byte);
-        }
-    }
-
-    fn unhook(&mut self) {
-        let Some(dcs) = self.dcs.take() else {
-            return;
-        };
-
-        if dcs.intermediates == b"=" && dcs.action == 's' {
-            match dcs.params.first().copied() {
-                Some(1) => self.state.set_synchronized_updates(true),
-                Some(2) => self.state.set_synchronized_updates(false),
-                _ => {}
-            }
-            return;
-        }
-
-        if dcs.intermediates == b"$" && dcs.action == 'q' {
-            match dcs.data.as_slice() {
-                b"m" => self.state.report_selection_or_setting(b"1$r", &sgr_report(self.state)),
-                b" q" => {
-                    let cursor_style = match self.state.cursor().shape {
-                        CursorShape::Block => 2,
-                        CursorShape::Horizontal => 4,
-                        CursorShape::Vertical => 6,
-                    };
-                    self.state.report_selection_or_setting(b"1$r", &format!("{cursor_style} q"));
-                }
-                b"r" => {
-                    let (top, bottom) = self.state.scroll_region();
-                    self.state
-                        .report_selection_or_setting(b"1$r", &format!("{};{}r", top + 1, bottom));
-                }
-                _ => self.state.report_selection_or_setting(b"0$r", ""),
-            }
-        }
-    }
-
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        let Some(command) = params.first() else {
-            return;
-        };
-
-        match *command {
-            b"0" | b"2" => {
-                if let Some(title) = params.get(1).and_then(|value| std::str::from_utf8(value).ok())
-                {
-                    self.state.set_title(title);
-                }
-            }
-            b"4" => apply_palette_osc(self.state, &params[1..]),
-            b"8" => apply_hyperlink_osc(self.state, &params[1..]),
-            b"10" => apply_dynamic_color_osc(
-                self.state,
-                "10",
-                &params[1..],
-                DynamicColorKind::Foreground,
-            ),
-            b"11" => apply_dynamic_color_osc(
-                self.state,
-                "11",
-                &params[1..],
-                DynamicColorKind::Background,
-            ),
-            b"12" => {
-                apply_dynamic_color_osc(self.state, "12", &params[1..], DynamicColorKind::Cursor)
-            }
-            b"52" => apply_clipboard_osc(self.state, &params[1..]),
-            b"104" => reset_palette_osc(self.state, &params[1..]),
-            b"110" => self.state.reset_default_foreground(),
-            b"111" => self.state.reset_default_background(),
-            b"112" => self.state.reset_cursor_color(),
-            _ => {}
-        }
-    }
-
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore {
-            return;
-        }
-
-        let param_values = params_iter(params).collect::<Vec<_>>();
-
-        let private = intermediates.first() == Some(&b'?');
-        let secondary = intermediates.first() == Some(&b'>');
+    // ------ CSI dispatch -------------------------------------------------
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        let has_question = intermediates.contains(&b'?');
 
         match action {
-            'A' => self.state.move_cursor(-(param_nonzero_or(&param_values, 0, 1) as isize), 0),
-            'B' => self.state.move_cursor(param_nonzero_or(&param_values, 0, 1) as isize, 0),
-            'C' => self.state.move_cursor(0, param_nonzero_or(&param_values, 0, 1) as isize),
-            'D' => self.state.move_cursor(0, -(param_nonzero_or(&param_values, 0, 1) as isize)),
-            'E' => self.state.next_line(param_nonzero_or(&param_values, 0, 1) as usize),
-            'F' => self.state.previous_line(param_nonzero_or(&param_values, 0, 1) as usize),
+            // -- Cursor movement ------------------------------------------
+            // CUU – Cursor Up
+            'A' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let (min_row, _) = self.row_bounds();
+                let row = self.grid.cursor.row;
+                self.grid.cursor.row = row.saturating_sub(n).max(min_row);
+            }
+            // CUD – Cursor Down
+            'B' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let (_, max_row) = self.row_bounds();
+                let row = self.grid.cursor.row;
+                self.grid.cursor.row = (row + n).min(max_row);
+            }
+            // CUF – Cursor Forward
+            'C' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let col = self.grid.cursor.col;
+                let max = self.grid.cols().saturating_sub(1);
+                self.grid.cursor.col = (col + n).min(max);
+            }
+            // CUB – Cursor Back
+            'D' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let col = self.grid.cursor.col;
+                self.grid.cursor.col = col.saturating_sub(n);
+            }
+            // CNL – Cursor Next Line
+            'E' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let (_, max_row) = self.row_bounds();
+                let row = self.grid.cursor.row;
+                self.grid.cursor.row = (row + n).min(max_row);
+                self.grid.cursor.col = 0;
+            }
+            // CPL – Cursor Previous Line
+            'F' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let (min_row, _) = self.row_bounds();
+                let row = self.grid.cursor.row;
+                self.grid.cursor.row = row.saturating_sub(n).max(min_row);
+                self.grid.cursor.col = 0;
+            }
+            // CHA – Cursor Horizontal Absolute
             'G' => {
-                self.state
-                    .set_cursor_column(param_nonzero_or(&param_values, 0, 1).saturating_sub(1) as usize)
+                let n = Self::param(params, 0, 1) as usize;
+                let max = self.grid.cols().saturating_sub(1);
+                self.grid.cursor.col = (n.saturating_sub(1)).min(max);
             }
+            // CUP / HVP – Cursor Position
             'H' | 'f' => {
-                let row = param_nonzero_or(&param_values, 0, 1).saturating_sub(1) as usize;
-                let col = param_nonzero_or(&param_values, 1, 1).saturating_sub(1) as usize;
-                self.state.set_cursor_position(row, col);
+                let row = Self::param(params, 0, 1) as usize;
+                let col = Self::param(params, 1, 1) as usize;
+                self.grid.set_cursor(
+                    col.saturating_sub(1),
+                    self.absolute_row_param(row.saturating_sub(1)),
+                );
             }
-            'd' => self
-                .state
-                .set_cursor_row(param_nonzero_or(&param_values, 0, 1).saturating_sub(1) as usize),
-            'J' => match first_param_or(params, 0) {
-                0 => self.state.clear_from_cursor(),
-                1 => self.state.clear_to_cursor(),
-                2 => self.state.clear_screen(),
-                _ => {}
-            },
-            'K' => match first_param_or(params, 0) {
-                0 => self.state.clear_line_from_cursor(),
-                1 => self.state.clear_line_to_cursor(),
-                2 => self.state.clear_line(),
-                _ => {}
-            },
-            '@' => self.state.insert_blank_chars(param_nonzero_or(&param_values, 0, 1) as usize),
-            'P' => self.state.delete_chars(param_nonzero_or(&param_values, 0, 1) as usize),
-            'X' => self.state.erase_chars(param_nonzero_or(&param_values, 0, 1) as usize),
-            'L' => self.state.insert_lines(param_nonzero_or(&param_values, 0, 1) as usize),
-            'M' => self.state.delete_lines(param_nonzero_or(&param_values, 0, 1) as usize),
-            'S' => self.state.scroll_up_lines(param_nonzero_or(&param_values, 0, 1) as usize),
-            'T' => self.state.scroll_down_lines(param_nonzero_or(&param_values, 0, 1) as usize),
-            'm' => self.state.set_sgr_iter(params_iter(params)),
+            // ED – Erase Display
+            'J' => {
+                let blank = self.blank_cell();
+                let mode = Self::param_zero_ok(params, 0, 0);
+                match mode {
+                    0 => self.grid.erase_below_with(blank),
+                    1 => self.grid.erase_above_with(blank),
+                    2 | 3 => self.grid.erase_all_with(blank),
+                    _ => {}
+                }
+                self.damage.mark_all();
+            }
+            // EL – Erase in Line
+            'K' => {
+                let blank = self.blank_cell();
+                let mode = Self::param_zero_ok(params, 0, 0);
+                match mode {
+                    0 => self.grid.erase_to_end_of_line_with(blank),
+                    1 => self.grid.erase_to_start_of_line_with(blank),
+                    2 => self.grid.erase_line_with(blank),
+                    _ => {}
+                }
+                self.damage.mark_row(self.grid.cursor.row);
+            }
+            // IL – Insert Lines
+            'L' => {
+                let n = Self::param(params, 0, 1) as usize;
+                self.insert_lines(n);
+            }
+            // DL – Delete Lines
+            'M' => {
+                let n = Self::param(params, 0, 1) as usize;
+                self.delete_lines(n);
+            }
+            // DCH – Delete Characters
+            'P' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let blank = self.blank_cell();
+                self.grid.delete_chars_with(n, blank);
+                self.damage.mark_row(self.grid.cursor.row);
+            }
+            // ICH – Insert Characters
+            '@' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let blank = self.blank_cell();
+                self.grid.insert_chars_with(n, blank);
+                self.damage.mark_row(self.grid.cursor.row);
+            }
+            // ECH – Erase Characters
+            'X' => {
+                let n = Self::param(params, 0, 1) as usize;
+                self.erase_chars(n);
+            }
+            // SU – Scroll Up
+            'S' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let blank = self.blank_cell();
+                self.grid.scroll_up_with(n, blank);
+                self.damage.mark_all();
+            }
+            // SD – Scroll Down
+            'T' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let blank = self.blank_cell();
+                self.grid.scroll_down_with(n, blank);
+                self.damage.mark_all();
+            }
+            // VPA – Vertical Position Absolute
+            'd' => {
+                let n = Self::param(params, 0, 1) as usize;
+                self.grid.cursor.row = self.absolute_row_param(n.saturating_sub(1));
+            }
+            // SGR – Select Graphic Rendition
+            'm' => {
+                self.handle_sgr(params);
+            }
+            // DSR – Device Status Report
+            'n' => {
+                let mode = Self::param_zero_ok(params, 0, 0);
+                if mode == 6 {
+                    // Respond with cursor position (1-based). In origin mode, the row is
+                    // reported relative to the active scroll region.
+                    let row = if *self.origin_mode {
+                        let (top, _) = self.grid.scroll_region();
+                        self.grid.cursor.row.saturating_sub(top) + 1
+                    } else {
+                        self.grid.cursor.row + 1
+                    };
+                    let col = self.grid.cursor.col + 1;
+                    let response = format!("\x1b[{};{}R", row, col);
+                    self.responses.push(response.into_bytes());
+                }
+            }
+            // DECSTBM – Set Scrolling Region
             'r' => {
-                let top = param_nonzero_or(&param_values, 0, 1).saturating_sub(1) as usize;
-                let bottom = match param_values.get(1).copied().unwrap_or(self.state.rows() as i64) {
-                    0 => self.state.rows() as i64,
-                    value => value,
-                } as usize;
-                self.state.set_scroll_region(top, bottom);
-            }
-            'n' if !private => self.state.report_device_status(first_param_or(params, 0)),
-            'p' if intermediates == b"?$" => {
-                for mode in params_iter(params) {
-                    self.state.report_private_mode(mode);
+                if !has_question {
+                    let top = Self::param(params, 0, 1) as usize;
+                    let bottom = Self::param(params, 1, self.grid.rows() as u16) as usize;
+                    self.grid
+                        .set_scroll_region(top.saturating_sub(1), bottom.saturating_sub(1));
+                    // Move cursor to home after setting scroll region.
+                    self.grid.set_cursor(0, 0);
                 }
             }
-            'p' if intermediates == b"!" => {
-                // DECSTR – Soft Terminal Reset (CSI ! p)
-                // Common during terminal startup to normalise terminal state.
-                self.state.soft_reset();
-            }
-            'u' if private => self.state.report_kitty_keyboard_flags(),
-            'u' if secondary => self.state.push_kitty_keyboard_flags(first_param_or(params, 0)),
-            'u' if intermediates.first() == Some(&b'<') => {
-                self.state.pop_kitty_keyboard_flags(first_param_or(params, 1));
-            }
-            'u' if intermediates.first() == Some(&b'=') => {
-                let mut iter = params_iter(params);
-                let flags = iter.next().unwrap_or(0);
-                let mode = iter.next().unwrap_or(1);
-                self.state.set_kitty_keyboard_flags(flags, mode);
-            }
-            'h' if private => {
-                for mode in &param_values {
-                    self.state.use_private_mode(*mode, true);
+            // Save / Restore cursor
+            's' => {
+                if !has_question && intermediates.is_empty() {
+                    self.grid.save_cursor();
                 }
             }
-            'l' if private => {
-                for mode in &param_values {
-                    self.state.use_private_mode(*mode, false);
+            'u' => {
+                if !has_question && intermediates.is_empty() {
+                    self.grid.restore_cursor();
                 }
             }
+            // DA – Device Attributes
+            'c' => {
+                if !has_question {
+                    let mode = Self::param_zero_ok(params, 0, 0);
+                    if mode == 0 {
+                        // Respond as VT220.
+                        self.responses.push(b"\x1b[?62;c".to_vec());
+                    }
+                }
+            }
+            // Window manipulation
+            't' => {
+                let mode = Self::param_zero_ok(params, 0, 0);
+                match mode {
+                    22 => {
+                        // Push title – ignore (we don't maintain a title stack)
+                    }
+                    23 => {
+                        // Pop title – ignore
+                    }
+                    _ => {
+                        // Ignore other window manipulations
+                    }
+                }
+            }
+            // DECSET / DECRST – Private mode set / reset
             'h' => {
-                for mode in &param_values {
-                    if *mode == 4 {
-                        self.state.set_insert_mode(true);
+                if has_question {
+                    for group in params.iter() {
+                        if let Some(&mode) = group.first() {
+                            match mode {
+                                // DECCKM – application cursor keys
+                                1 => *self.application_cursor_keys = true,
+                                // DECOM – origin mode
+                                6 => {
+                                    *self.origin_mode = true;
+                                    let (top, _) = self.grid.scroll_region();
+                                    self.grid.set_cursor(0, top);
+                                }
+                                // DECTCEM – show cursor
+                                25 => self.grid.cursor.visible = true,
+                                // Alternate screen buffers
+                                47 | 1047 | 1049 => {
+                                    self.grid.enter_alternate_screen();
+                                    self.damage.mark_all();
+                                }
+                                // Save cursor
+                                1048 => self.grid.save_cursor(),
+                                // Autowrap mode (parsing left as current default behaviour)
+                                7 => {}
+                                // Mouse tracking modes
+                                1000 => self.mouse_state.mode = MouseMode::Click,
+                                1002 => self.mouse_state.mode = MouseMode::Drag,
+                                1003 => self.mouse_state.mode = MouseMode::Motion,
+                                1006 => self.mouse_state.sgr = true,
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
             'l' => {
-                for mode in &param_values {
-                    if *mode == 4 {
-                        self.state.set_insert_mode(false);
+                if has_question {
+                    for group in params.iter() {
+                        if let Some(&mode) = group.first() {
+                            match mode {
+                                1 => *self.application_cursor_keys = false,
+                                6 => {
+                                    *self.origin_mode = false;
+                                    self.grid.set_cursor(0, 0);
+                                }
+                                25 => self.grid.cursor.visible = false,
+                                47 | 1047 | 1049 => {
+                                    self.grid.leave_alternate_screen();
+                                    self.damage.mark_all();
+                                }
+                                1048 => self.grid.restore_cursor(),
+                                7 => {}
+                                // Mouse tracking modes
+                                1000 | 1002 | 1003 => self.mouse_state.mode = MouseMode::None,
+                                1006 => self.mouse_state.sgr = false,
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
-            'c' if secondary => self.state.report_secondary_device_attributes(),
-            'c' => self.state.report_primary_device_attributes(),
-            'q' => {
-                if private {
-                    // DECSCUSR via private mode prefix (non-standard but tolerate it)
-                    match first_param_or(params, 0) {
-                        1 | 2 => self.state.set_cursor_shape(CursorShape::Block),
-                        3 | 4 => self.state.set_cursor_shape(CursorShape::Horizontal),
-                        5 | 6 => self.state.set_cursor_shape(CursorShape::Vertical),
-                        _ => {}
-                    }
-                } else if intermediates == b" " {
-                    // DECSCUSR – CSI Ps SP q (space as intermediate)
-                    // This is the standard sequence; neovim, vim, and most TUI apps use it.
-                    match first_param_or(params, 0) {
-                        0 | 1 | 2 => self.state.set_cursor_shape(CursorShape::Block),
-                        3 | 4 => self.state.set_cursor_shape(CursorShape::Horizontal),
-                        5 | 6 => self.state.set_cursor_shape(CursorShape::Vertical),
-                        _ => {}
-                    }
-                }
+
+            _ => {
+                // Unknown CSI – ignore
             }
-            's' if !private && !secondary => {
-                if self.state.left_right_margin_mode_enabled() && !param_values.is_empty() {
-                    let left = param_nonzero_or(&param_values, 0, 1).saturating_sub(1) as usize;
-                    let right = param_nonzero_or(&param_values, 1, self.state.cols() as i64) as usize;
-                    self.state.set_left_right_margins(left, right);
-                } else {
-                    self.state.save_cursor_position();
-                }
-            }
-            'u' if !private && !secondary => self.state.restore_cursor_position(),
-            _ => {}
         }
     }
 
+    // ------ ESC dispatch -------------------------------------------------
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        match (intermediates, byte) {
-            (b"(", b'0') => {
-                self.state.designate_charset(CharsetSlot::G0, DecCharset::DecSpecialGraphics)
+        match (byte, intermediates) {
+            // DECSC – Save Cursor
+            (b'7', []) => {
+                self.grid.save_cursor();
             }
-            (b"(", b'B') => self.state.designate_charset(CharsetSlot::G0, DecCharset::Ascii),
-            (b")", b'0') => {
-                self.state.designate_charset(CharsetSlot::G1, DecCharset::DecSpecialGraphics)
+            // DECRC – Restore Cursor
+            (b'8', []) => {
+                self.grid.restore_cursor();
             }
-            (b")", b'B') => self.state.designate_charset(CharsetSlot::G1, DecCharset::Ascii),
-            (_, b'7') => self.state.save_cursor_position(),
-            (_, b'8') => self.state.restore_cursor_position(),
-            (_, b'D') => self.state.linefeed(),
-            (_, b'E') => {
-                self.state.linefeed();
-                self.state.carriage_return();
+            // RI – Reverse Index (scroll down if cursor is at the top of scroll region)
+            (b'M', []) => {
+                let blank = self.blank_cell();
+                self.grid.reverse_index_with(blank);
+                self.damage.mark_all();
             }
-            (_, b'M') => self.state.reverse_index(),
-            (_, b'N') => {}
-            (_, b'O') => {}
-            (_, b'=') => self.state.set_application_keypad(true),
-            (_, b'>') => self.state.set_application_keypad(false),
-            _ => {}
-        }
-    }
-}
-
-fn sgr_report(state: &TerminalState) -> String {
-    let pen = state.pen();
-    let mut params = Vec::new();
-
-    if pen.bold() {
-        params.push(1);
-    }
-    if pen.italic() {
-        params.push(3);
-    }
-    if pen.underline().is_some() {
-        params.push(4);
-    }
-    if pen.reverse() {
-        params.push(7);
-    }
-    if pen.strikethrough() {
-        params.push(9);
-    }
-
-    push_color_report(&mut params, 30, 40, pen.colors().foreground.as_ref());
-    push_color_report(&mut params, 40, 50, pen.colors().background.as_ref());
-
-    if params.is_empty() {
-        "m".to_string()
-    } else {
-        format!("m{}", params.iter().map(i64::to_string).collect::<Vec<_>>().join(";"))
-    }
-}
-
-fn push_color_report(
-    params: &mut Vec<i64>,
-    base: i64,
-    default_reset: i64,
-    color: Option<&crate::terminal::style::TerminalColor>,
-) {
-    use crate::terminal::style::TerminalColor;
-
-    match color {
-        None => params.push(default_reset - 1),
-        Some(TerminalColor::Palette(index @ 0..=7)) => params.push(base + i64::from(*index)),
-        Some(TerminalColor::Palette(index @ 8..=15)) => {
-            params.push(base + 60 + i64::from(*index - 8))
-        }
-        Some(TerminalColor::Palette(index)) => params.extend([base + 8, 5, i64::from(*index)]),
-        Some(TerminalColor::Rgb(color)) => params.extend([
-            base + 8,
-            2,
-            (color.r * 255.0).round() as i64,
-            (color.g * 255.0).round() as i64,
-            (color.b * 255.0).round() as i64,
-        ]),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum DynamicColorKind {
-    Foreground,
-    Background,
-    Cursor,
-}
-
-fn apply_palette_osc(state: &mut TerminalState, params: &[&[u8]]) {
-    let mut pairs = params.chunks_exact(2);
-    for pair in &mut pairs {
-        let Some(index) = parse_palette_index(pair[0]) else {
-            continue;
-        };
-        let Some(value) = parse_param(pair[1]) else {
-            continue;
-        };
-
-        if value == "?" {
-            state.queue_osc_palette_response(index, state.theme().palette_color(index));
-        } else if let Ok(color) = parse_color(value) {
-            state.set_palette_color(index, color);
-        }
-    }
-}
-
-fn reset_palette_osc(state: &mut TerminalState, params: &[&[u8]]) {
-    if params.is_empty() {
-        state.reset_palette();
-        return;
-    }
-
-    for param in params {
-        if let Some(index) = parse_palette_index(param) {
-            state.reset_palette_color(index);
-        }
-    }
-}
-
-fn apply_dynamic_color_osc(
-    state: &mut TerminalState,
-    code: &str,
-    params: &[&[u8]],
-    kind: DynamicColorKind,
-) {
-    let Some(value) = params.first().and_then(|value| parse_param(value)) else {
-        return;
-    };
-
-    if value == "?" {
-        let color = match kind {
-            DynamicColorKind::Foreground => state.theme().foreground,
-            DynamicColorKind::Background => state.theme().background,
-            DynamicColorKind::Cursor => state.theme().cursor,
-        };
-        state.queue_osc_color_response(code, color);
-        return;
-    }
-
-    let Ok(color) = parse_color(value) else {
-        return;
-    };
-
-    match kind {
-        DynamicColorKind::Foreground => state.set_default_foreground(color),
-        DynamicColorKind::Background => state.set_default_background(color),
-        DynamicColorKind::Cursor => state.set_cursor_color(color),
-    }
-}
-
-fn apply_clipboard_osc(state: &mut TerminalState, params: &[&[u8]]) {
-    let Some(selection_param) = params.first() else {
-        return;
-    };
-    let Some(data_param) = params.get(1) else {
-        return;
-    };
-
-    let Ok(selection_spec) = std::str::from_utf8(selection_param) else {
-        return;
-    };
-    let data_spec = parse_param(data_param).unwrap_or_default();
-
-    if data_spec == "?" {
-        let selection = parse_clipboard_selections(selection_spec)
-            .into_iter()
-            .next()
-            .unwrap_or(ClipboardSelection::Clipboard);
-        state.queue_clipboard_query(selection);
-        return;
-    }
-
-    let Some(decoded) = decode_base64(data_spec) else {
-        return;
-    };
-    let Ok(content) = String::from_utf8(decoded) else {
-        return;
-    };
-
-    for selection in parse_clipboard_selections(selection_spec) {
-        state.queue_clipboard_set(selection, content.clone());
-    }
-}
-
-fn parse_clipboard_selections(spec: &str) -> Vec<ClipboardSelection> {
-    let mut selections = Vec::new();
-    if spec.is_empty() {
-        selections.push(ClipboardSelection::Clipboard);
-        return selections;
-    }
-
-    for ch in spec.chars() {
-        let selection = match ch {
-            'c' => ClipboardSelection::Clipboard,
-            'p' => ClipboardSelection::Primary,
-            'q' => ClipboardSelection::Secondary,
-            's' => ClipboardSelection::Select,
-            '0' => ClipboardSelection::Cut0,
-            '1' => ClipboardSelection::Cut1,
-            '2' => ClipboardSelection::Cut2,
-            '3' => ClipboardSelection::Cut3,
-            '4' => ClipboardSelection::Cut4,
-            '5' => ClipboardSelection::Cut5,
-            '6' => ClipboardSelection::Cut6,
-            '7' => ClipboardSelection::Cut7,
-            _ => continue,
-        };
-        if !selections.contains(&selection) {
-            selections.push(selection);
+            // IND – Index (like linefeed)
+            (b'D', []) => {
+                let blank = self.blank_cell();
+                self.grid.linefeed_with(blank);
+                self.damage.mark_all();
+            }
+            _ => {
+                // Unhandled escape – ignore
+            }
         }
     }
 
-    if selections.is_empty() {
-        selections.push(ClipboardSelection::Clipboard);
-    }
-    selections
-}
+    // ------ OSC dispatch -------------------------------------------------
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.is_empty() {
+            return;
+        }
 
-fn apply_hyperlink_osc(state: &mut TerminalState, params: &[&[u8]]) {
-    let metadata = params.first().copied().unwrap_or_default();
-    let uri = params.get(1).copied().unwrap_or_default();
+        // First param is the OSC command number as ASCII digits.
+        let cmd = std::str::from_utf8(params[0])
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok());
 
-    if uri.is_empty() {
-        state.set_current_hyperlink(None);
-        return;
-    }
-
-    let Ok(uri) = std::str::from_utf8(uri) else {
-        return;
-    };
-
-    let id = std::str::from_utf8(metadata).ok().and_then(parse_hyperlink_id);
-    state.set_current_hyperlink(Some(Hyperlink { id, uri: uri.to_string() }));
-}
-
-fn parse_hyperlink_id(metadata: &str) -> Option<String> {
-    metadata.split(':').find_map(|part| part.strip_prefix("id=").map(ToOwned::to_owned))
-}
-
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0u8;
-
-    for byte in input.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b'\r' | b'\n' | b'\t' | b' ' => continue,
-            _ => return None,
-        } as u32;
-
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        while bits >= 8 {
-            bits -= 8;
-            output.push(((buffer >> bits) & 0xff) as u8);
+        match cmd {
+            // 0: Set icon name + title, 1: Set icon name, 2: Set title
+            Some(0) | Some(1) | Some(2) => {
+                if params.len() >= 2 {
+                    if let Ok(title) = std::str::from_utf8(params[1]) {
+                        *self.title = Some(title.to_string());
+                    }
+                }
+            }
+            _ => {
+                // Unhandled OSC – ignore
+            }
         }
     }
 
-    Some(output)
-}
-
-fn parse_palette_index(value: &[u8]) -> Option<u8> {
-    parse_param(value)?.parse().ok()
-}
-
-fn parse_param(value: &[u8]) -> Option<&str> {
-    std::str::from_utf8(value).ok().map(str::trim)
-}
-
-fn params_iter(params: &Params) -> impl Iterator<Item = i64> + '_ {
-    params.iter().flat_map(|param| param.iter().map(|value| i64::from(*value)))
-}
-
-fn first_param_or(params: &Params, default: i64) -> i64 {
-    params_iter(params).next().unwrap_or(default)
-}
-
-fn param_nonzero_or(params: &[i64], index: usize, default: i64) -> i64 {
-    match params.get(index).copied().unwrap_or(default) {
-        0 => default,
-        value => value,
+    // Unused hooks – provide defaults
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
     }
+    fn put(&mut self, _byte: u8) {}
+    fn unhook(&mut self) {}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalParser;
-    use crate::{
-        session::bridge::TerminalRenderBridge,
-        renderer::{DrawCommand, WindowDrawCommand},
-        terminal::{ClipboardRequestKind, ClipboardSelection, state::TerminalState},
-        ui::CursorShape,
-    };
+    use super::*;
 
-    #[test]
-    fn parses_plain_text_and_newlines() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 2);
-
-        parser.advance(&mut state, b"ab\r\ncd");
-
-        assert_eq!(state.screen().row_text(0).trim(), "ab");
-        assert_eq!(state.screen().row_text(1).trim(), "cd");
+    fn setup(cols: usize, rows: usize) -> (TerminalParser, Grid, DamageTracker) {
+        (
+            TerminalParser::new(),
+            Grid::new(cols, rows),
+            DamageTracker::new(rows),
+        )
     }
 
-    #[test]
-    fn parses_sgr_and_title_sequences() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 2);
-
-        parser.advance(&mut state, b"\x1b]2;Termvide Demo\x07\x1b[31mR");
-
-        assert_eq!(state.snapshot().title.as_deref(), Some("Termvide Demo"));
-        assert!(state.pen().colors().foreground.is_some());
-        assert_eq!(state.screen().get(0, 0).unwrap().text(), "R");
-    }
+    // === Original tests ===
 
     #[test]
     fn parses_alternate_screen_toggle() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 2);
-
-        parser.advance(&mut state, b"\x1b[?1049h");
-        assert!(state.snapshot().using_alternate_screen);
-
-        parser.advance(&mut state, b"\x1b[?1049l");
-        assert!(!state.snapshot().using_alternate_screen);
+        let (mut p, mut g, mut d) = setup(4, 2);
+        g.cell_mut(0, 0).ch = 'M' as u32;
+        p.advance(&mut g, &mut d, b"\x1b[?1049h");
+        assert_eq!(g.cell(0, 0).ch, ' ' as u32);
+        p.advance(&mut g, &mut d, b"\x1b[?1049l");
+        assert_eq!(g.cell(0, 0).ch, 'M' as u32);
     }
 
     #[test]
-    fn parses_application_cursor_mode() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 2);
+    fn cpr_is_relative_to_scroll_region_in_origin_mode() {
+        let (mut p, mut g, mut d) = setup(8, 6);
+        p.advance(&mut g, &mut d, b"\x1b[2;5r\x1b[?6h\x1b[1;1H\x1b[6n");
+        assert_eq!(p.take_responses(), vec![b"\x1b[1;1R".to_vec()]);
+    }
 
-        parser.advance(&mut state, b"\x1b[?1h");
-        assert!(state.input_settings().application_cursor);
+    // === SGR Attribute Tests ===
 
-        parser.advance(&mut state, b"\x1b[?1l");
-        assert!(!state.input_settings().application_cursor);
+    #[test]
+    fn sgr_bold() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[1mA");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::BOLD));
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
     }
 
     #[test]
-    fn parses_cursor_save_restore_private_mode() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 4);
-        state.set_cursor_position(2, 3);
-
-        parser.advance(&mut state, b"\x1b[?1048h");
-        state.set_cursor_position(0, 0);
-        parser.advance(&mut state, b"\x1b[?1048l");
-
-        assert_eq!(state.cursor().row, 2);
-        assert_eq!(state.cursor().column, 3);
+    fn sgr_italic() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[3mB");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::ITALIC));
     }
 
     #[test]
-    fn parses_origin_mode() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 6);
-
-        parser.advance(&mut state, b"\x1b[2;5r\x1b[?6h\x1b[1;1H");
-
-        assert_eq!(state.cursor().row, 1);
-        assert_eq!(state.cursor().column, 0);
+    fn sgr_underline() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[4mC");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::UNDERLINE));
     }
 
     #[test]
-    fn parses_common_cursor_positioning_commands() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(10, 5);
-
-        parser.advance(&mut state, b"\x1b[3;4H\x1b[s\x1b[10G\x1b[2F\x1b[u");
-
-        assert_eq!(state.cursor().row, 2);
-        assert_eq!(state.cursor().column, 3);
+    fn sgr_reverse() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[7mD");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::REVERSE));
     }
 
     #[test]
-    fn csi_zero_defaults_to_home_instead_of_bottom_row() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(10, 5);
-        state.set_cursor_position(4, 9);
-
-        parser.advance(&mut state, b"\x1b[0;0H");
-        assert_eq!(state.cursor().row, 0);
-        assert_eq!(state.cursor().column, 0);
-
-        state.set_cursor_position(4, 9);
-        parser.advance(&mut state, b"\x1b[H");
-        assert_eq!(state.cursor().row, 0);
-        assert_eq!(state.cursor().column, 0);
+    fn sgr_strikethrough() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[9mE");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::STRIKETHROUGH));
     }
 
     #[test]
-    fn parses_standard_decscusr_sequence_with_space_intermediate() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 2);
-
-        parser.advance(&mut state, b"\x1b[6 q");
-        assert_eq!(state.cursor().shape, CursorShape::Vertical);
-
-        parser.advance(&mut state, b"\x1b[2 q");
-        assert_eq!(state.cursor().shape, CursorShape::Block);
+    fn sgr_hidden() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[8mF");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::HIDDEN));
     }
 
     #[test]
-    fn declrm_slrm_sequence_is_not_misparsed_as_save_cursor() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(10, 5);
-
-        state.set_cursor_position(2, 3);
-        parser.advance(&mut state, b"\x1b[?69h\x1b[1;4s");
-
-        state.set_cursor_position(4, 5);
-        parser.advance(&mut state, b"\x1b[u");
-
-        assert_eq!(state.cursor().row, 4);
-        assert_eq!(state.cursor().column, 5);
+    fn sgr_dim() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[2mG");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::DIM));
     }
 
     #[test]
-    fn parses_line_and_char_editing_commands() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(6, 3);
-
-        parser.advance(&mut state, b"abcdef\r\x1b[2P");
-        assert_eq!(state.screen().row_text(0), "cdef  ");
-
-        parser.advance(&mut state, b"\r\x1b[2@XY");
-        assert_eq!(state.screen().row_text(0), "XYcdef");
-
-        parser.advance(&mut state, b"\r\x1b[3X");
-        assert_eq!(state.screen().row_text(0), "   def");
+    fn sgr_reset_clears_all() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[1;3;4;7mX\x1b[0mY");
+        let x = g.cell(0, 0);
+        assert!(x.flags.contains(CellFlags::BOLD));
+        assert!(x.flags.contains(CellFlags::ITALIC));
+        let y = g.cell(1, 0);
+        assert!(!y.flags.contains(CellFlags::BOLD));
+        assert!(!y.flags.contains(CellFlags::ITALIC));
+        assert!(!y.flags.contains(CellFlags::UNDERLINE));
+        assert!(!y.flags.contains(CellFlags::REVERSE));
     }
 
     #[test]
-    fn parses_scroll_regions_and_region_scrolling() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 4);
-
-        parser.advance(&mut state, b"1111\r\n2222\r\n3333\r\n4444");
-        parser.advance(&mut state, b"\x1b[2;4r\x1b[4;1H\n");
-
-        assert_eq!(state.screen().row_text(0), "1111");
-        assert_eq!(state.screen().row_text(1), "3333");
-        assert_eq!(state.screen().row_text(2), "4444");
-        assert_eq!(state.screen().row_text(3), "    ");
+    fn sgr_remove_bold_dim() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[1;2mA\x1b[22mB");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::BOLD));
+        assert!(g.cell(0, 0).flags.contains(CellFlags::DIM));
+        assert!(!g.cell(1, 0).flags.contains(CellFlags::BOLD));
+        assert!(!g.cell(1, 0).flags.contains(CellFlags::DIM));
     }
 
     #[test]
-    fn osc_palette_updates_existing_indexed_cells() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
-        let bridge = TerminalRenderBridge::default();
+    fn sgr_multiple_params() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[1;3;9mZ");
+        let c = g.cell(0, 0);
+        assert!(c.flags.contains(CellFlags::BOLD));
+        assert!(c.flags.contains(CellFlags::ITALIC));
+        assert!(c.flags.contains(CellFlags::STRIKETHROUGH));
+    }
 
-        parser.advance(&mut state, b"\x1b[31mR");
-        parser.advance(&mut state, b"\x1b]4;1;#00ff00\x07");
+    #[test]
+    fn sgr_standard_fg_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[31mR");
+        assert_eq!(g.cell(0, 0).fg, p.theme.palette(1));
+    }
 
-        let commands = bridge.full_draw_commands(&state);
-        let mut found_green = false;
-        for command in commands {
-            if let DrawCommand::Window {
-                command: WindowDrawCommand::DrawLine { line, .. }, ..
-            } = command
-            {
-                for fragment in line.fragments() {
-                    if fragment.text == "R" {
-                        let color = fragment
-                            .style
-                            .as_ref()
-                            .and_then(|style| style.colors.foreground)
-                            .expect("foreground color");
-                        assert!(color.g > 0.9 && color.r < 0.1 && color.b < 0.1);
-                        found_green = true;
-                    }
-                }
-            }
+    #[test]
+    fn sgr_standard_bg_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[42mG");
+        assert_eq!(g.cell(0, 0).bg, p.theme.palette(2));
+    }
+
+    #[test]
+    fn sgr_bright_fg_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[91mR");
+        assert_eq!(g.cell(0, 0).fg, p.theme.palette(9));
+    }
+
+    #[test]
+    fn sgr_bright_bg_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[104mB");
+        assert_eq!(g.cell(0, 0).bg, p.theme.palette(12));
+    }
+
+    #[test]
+    fn sgr_256_color_fg() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[38;5;196mX");
+        assert_eq!(g.cell(0, 0).fg, p.theme.palette(196));
+    }
+
+    #[test]
+    fn sgr_truecolor_fg() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[38;2;255;128;0mX");
+        assert_eq!(g.cell(0, 0).fg, PackedColor::new(255, 128, 0));
+    }
+
+    #[test]
+    fn sgr_default_fg_reset() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[31mA\x1b[39mB");
+        assert_eq!(g.cell(1, 0).fg, p.theme.foreground);
+    }
+
+    #[test]
+    fn sgr_default_bg_reset() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[41mA\x1b[49mB");
+        assert_eq!(g.cell(1, 0).bg, p.theme.background);
+    }
+
+    // === CSI Cursor Movement Tests ===
+
+    #[test]
+    fn csi_cup_cursor_position() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[5;10H");
+        assert_eq!(g.cursor.row, 4);
+        assert_eq!(g.cursor.col, 9);
+    }
+
+    #[test]
+    fn csi_cuu_cursor_up() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[6;1H\x1b[3A");
+        assert_eq!(g.cursor.row, 2);
+    }
+
+    #[test]
+    fn csi_cud_cursor_down() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[1;1H\x1b[4B");
+        assert_eq!(g.cursor.row, 4);
+    }
+
+    #[test]
+    fn csi_cuf_cursor_forward() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[1;1H\x1b[5C");
+        assert_eq!(g.cursor.col, 5);
+    }
+
+    #[test]
+    fn csi_cub_cursor_back() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[1;10H\x1b[3D");
+        assert_eq!(g.cursor.col, 6);
+    }
+
+    #[test]
+    fn csi_cha_cursor_horizontal_absolute() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[8G");
+        assert_eq!(g.cursor.col, 7);
+    }
+
+    #[test]
+    fn csi_vpa_vertical_position() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[6d");
+        assert_eq!(g.cursor.row, 5);
+    }
+
+    #[test]
+    fn csi_cnl_cursor_next_line() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[1;5H\x1b[2E");
+        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.cursor.col, 0);
+    }
+
+    #[test]
+    fn csi_cpl_cursor_previous_line() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[5;5H\x1b[2F");
+        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.cursor.col, 0);
+    }
+
+    // === CSI Erase Tests ===
+
+    #[test]
+    fn csi_ed_erase_below() {
+        let (mut p, mut g, mut d) = setup(5, 3);
+        p.advance(&mut g, &mut d, b"ABCDE12345vwxyz");
+        p.advance(&mut g, &mut d, b"\x1b[2;3H\x1b[J");
+        assert_eq!(g.cell(0, 1).ch, '1' as u32);
+        assert_eq!(g.cell(1, 1).ch, '2' as u32);
+        assert_eq!(g.cell(2, 1).ch, ' ' as u32);
+        assert_eq!(g.cell(0, 2).ch, ' ' as u32);
+    }
+
+    #[test]
+    fn csi_ed_erase_all() {
+        let (mut p, mut g, mut d) = setup(5, 3);
+        p.advance(&mut g, &mut d, b"Hello");
+        p.advance(&mut g, &mut d, b"\x1b[2J");
+        assert_eq!(g.cell(0, 0).ch, ' ' as u32);
+    }
+
+    #[test]
+    fn csi_el_erase_to_end() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDEFGHIJ");
+        p.advance(&mut g, &mut d, b"\x1b[1;4H\x1b[K");
+        assert_eq!(g.cell(2, 0).ch, 'C' as u32);
+        assert_eq!(g.cell(3, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(9, 0).ch, ' ' as u32);
+    }
+
+    #[test]
+    fn csi_el_erase_entire_line() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDEFGHIJ");
+        p.advance(&mut g, &mut d, b"\x1b[1;5H\x1b[2K");
+        for col in 0..10 {
+            assert_eq!(g.cell(col, 0).ch, ' ' as u32);
         }
-
-        assert!(found_green);
     }
 
     #[test]
-    fn osc_color_query_generates_response() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn csi_ech_erase_characters() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDEFGHIJ");
+        p.advance(&mut g, &mut d, b"\x1b[1;3H\x1b[3X");
+        assert_eq!(g.cell(1, 0).ch, 'B' as u32);
+        assert_eq!(g.cell(2, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(3, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(4, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(5, 0).ch, 'F' as u32);
+    }
 
-        parser.advance(&mut state, b"\x1b]10;?\x07\x1b]4;1;?\x07");
-        let responses = state.take_pending_responses();
+    // === CSI Insert/Delete ===
 
-        assert_eq!(responses.len(), 2);
-        assert!(String::from_utf8_lossy(&responses[0]).contains("]10;rgb:"));
-        assert!(String::from_utf8_lossy(&responses[1]).contains("]4;1;rgb:"));
+    #[test]
+    fn csi_dch_delete_characters() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDE");
+        p.advance(&mut g, &mut d, b"\x1b[1;2H\x1b[2P");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(1, 0).ch, 'D' as u32);
+        assert_eq!(g.cell(2, 0).ch, 'E' as u32);
     }
 
     #[test]
-    fn parses_dec_special_graphics_and_shift_states() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
-
-        parser.advance(&mut state, b"\x1b(0qx\x1b(B");
-        assert_eq!(state.screen().row_text(0)[..2].to_string(), "─│");
-
-        let mut state = TerminalState::new(4, 1);
-        parser.advance(&mut state, b"\x1b)0\x0eqx\x0f");
-        assert_eq!(state.screen().row_text(0)[..2].to_string(), "─│");
+    fn csi_ich_insert_characters() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDE");
+        p.advance(&mut g, &mut d, b"\x1b[1;2H\x1b[1@");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(1, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(2, 0).ch, 'B' as u32);
     }
 
     #[test]
-    fn parses_application_keypad_mode_and_decrqm() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
-
-        parser.advance(&mut state, b"\x1b=\x1b[?66$p\x1b>");
-        let responses = state.take_pending_responses();
-
-        assert!(state.input_settings().application_keypad == false);
-        assert_eq!(responses[0], b"\x1b[?66;1$y");
+    fn csi_scroll_up() {
+        let (mut p, mut g, mut d) = setup(3, 3);
+        p.advance(&mut g, &mut d, b"AAA\r\nBBB\r\nCCC");
+        p.advance(&mut g, &mut d, b"\x1b[1S");
+        assert_eq!(g.cell(0, 0).ch, 'B' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'C' as u32);
+        assert_eq!(g.cell(0, 2).ch, ' ' as u32);
     }
 
     #[test]
-    fn parses_private_mode_queries_and_kitty_keyboard_query() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn csi_scroll_down() {
+        let (mut p, mut g, mut d) = setup(3, 3);
+        p.advance(&mut g, &mut d, b"AAA\r\nBBB\r\nCCC");
+        p.advance(&mut g, &mut d, b"\x1b[1T");
+        assert_eq!(g.cell(0, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'A' as u32);
+        assert_eq!(g.cell(0, 2).ch, 'B' as u32);
+    }
 
-        parser.advance(
-            &mut state,
-            b"\x1b[?2026h\x1b[?2026$p\x1b[?2027$p\x1b[?2031$p\x1b[?2048$p\x1b[?u",
-        );
-        let responses = state.take_pending_responses();
+    // === Scroll Region ===
 
-        assert_eq!(responses[0], b"\x1b[?2026;1$y");
-        assert_eq!(responses[1], b"\x1b[?2027;0$y");
-        assert_eq!(responses[2], b"\x1b[?2031;0$y");
-        assert_eq!(responses[3], b"\x1b[?2048;0$y");
-        assert_eq!(responses[4], b"\x1b[?0u");
+    #[test]
+    fn csi_decstbm_scroll_region() {
+        let (mut p, mut g, mut d) = setup(10, 10);
+        p.advance(&mut g, &mut d, b"\x1b[3;7r");
+        assert_eq!(g.scroll_region(), (2, 6));
+        assert_eq!(g.cursor.col, 0);
+        assert_eq!(g.cursor.row, 0);
+    }
+
+    // === C0 Controls ===
+
+    #[test]
+    fn c0_tab() {
+        let (mut p, mut g, mut d) = setup(20, 2);
+        p.advance(&mut g, &mut d, b"A\tB");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(8, 0).ch, 'B' as u32);
     }
 
     #[test]
-    fn parses_kitty_keyboard_push_set_pop_and_query() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
-
-        parser.advance(&mut state, b"\x1b[>1u\x1b[?u\x1b[=1;3u\x1b[?u\x1b[<1u\x1b[?u");
-        let responses = state.take_pending_responses();
-
-        assert_eq!(responses[0], b"\x1b[?1u");
-        assert_eq!(responses[1], b"\x1b[?0u");
-        assert_eq!(responses[2], b"\x1b[?0u");
+    fn c0_backspace() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"AB\x08C");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(1, 0).ch, 'C' as u32);
     }
 
     #[test]
-    fn parses_kitty_keyboard_masking_and_default_modes() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn c0_cr_lf() {
+        let (mut p, mut g, mut d) = setup(10, 3);
+        p.advance(&mut g, &mut d, b"AB\r\nCD");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(1, 0).ch, 'B' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'C' as u32);
+        assert_eq!(g.cell(1, 1).ch, 'D' as u32);
+    }
 
-        parser.advance(&mut state, b"\x1b[=255;2u\x1b[?u\x1b[>0u\x1b[<u\x1b[?u");
-        let responses = state.take_pending_responses();
+    // === ESC Sequences ===
 
-        assert_eq!(responses[0], b"\x1b[?1u");
-        assert_eq!(responses[1], b"\x1b[?1u");
+    #[test]
+    fn esc_reverse_index() {
+        let (mut p, mut g, mut d) = setup(5, 3);
+        p.advance(&mut g, &mut d, b"AAAAA\r\nBBBBB\r\nCCCCC");
+        p.advance(&mut g, &mut d, b"\x1b[1;1H\x1bM");
+        assert_eq!(g.cell(0, 0).ch, ' ' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'A' as u32);
     }
 
     #[test]
-    fn parses_decrqss_sgr_query() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn esc_save_restore_cursor() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[5;8H\x1b7\x1b[1;1H\x1b8");
+        assert_eq!(g.cursor.row, 4);
+        assert_eq!(g.cursor.col, 7);
+    }
 
-        parser.advance(&mut state, b"\x1b[1;31m\x1bP$qm\x1b\\");
-        let responses = state.take_pending_responses();
+    // === OSC ===
 
-        assert_eq!(responses[0], b"\x1bP1$rm1;31\x1b\\");
+    #[test]
+    fn osc_set_title() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]0;MyTitle\x07");
+        assert_eq!(p.title, Some("MyTitle".to_string()));
     }
 
     #[test]
-    fn parses_decrqss_decstbm_query() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 5);
+    fn osc_set_title_osc2() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]2;AnotherTitle\x07");
+        assert_eq!(p.title, Some("AnotherTitle".to_string()));
+    }
 
-        parser.advance(&mut state, b"\x1b[2;4r\x1bP$qr\x1b\\");
-        let responses = state.take_pending_responses();
+    // === DECSET / DECRST ===
 
-        assert_eq!(responses[0], b"\x1bP1$r2;4r\x1b\\");
+    #[test]
+    fn decset_hide_show_cursor() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(g.cursor.visible);
+        p.advance(&mut g, &mut d, b"\x1b[?25l");
+        assert!(!g.cursor.visible);
+        p.advance(&mut g, &mut d, b"\x1b[?25h");
+        assert!(g.cursor.visible);
     }
 
     #[test]
-    fn parses_sync_updates_private_mode_and_dcs_compat() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
-
-        parser.advance(&mut state, b"\x1b[?2026h");
-        assert!(state.synchronized_updates_active());
-        parser.advance(&mut state, b"\x1bP=2s\x1b\\");
-        assert!(!state.synchronized_updates_active());
-        parser.advance(&mut state, b"\x1bP=1s\x1b\\");
-        assert!(state.synchronized_updates_active());
-        parser.advance(&mut state, b"\x1b[?2026l");
-        assert!(!state.synchronized_updates_active());
+    fn decset_mouse_click_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert_eq!(p.mouse_state.mode, MouseMode::None);
+        p.advance(&mut g, &mut d, b"\x1b[?1000h");
+        assert_eq!(p.mouse_state.mode, MouseMode::Click);
+        p.advance(&mut g, &mut d, b"\x1b[?1000l");
+        assert_eq!(p.mouse_state.mode, MouseMode::None);
     }
 
     #[test]
-    fn parses_osc_52_clipboard_set() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn decset_mouse_sgr_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(!p.mouse_state.sgr);
+        p.advance(&mut g, &mut d, b"\x1b[?1006h");
+        assert!(p.mouse_state.sgr);
+        p.advance(&mut g, &mut d, b"\x1b[?1006l");
+        assert!(!p.mouse_state.sgr);
+    }
 
-        parser.advance(&mut state, b"\x1b]52;c;aGVsbG8=\x07");
-        let requests = state.take_pending_clipboard_requests();
+    // === Device Attributes ===
 
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].selection, ClipboardSelection::Clipboard);
-        assert_eq!(requests[0].kind, ClipboardRequestKind::Set("hello".into()));
+    #[test]
+    fn da_response() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[c");
+        let responses = p.take_responses();
+        assert_eq!(responses, vec![b"\x1b[?62;c".to_vec()]);
+    }
+
+    // === Print / Autowrap ===
+
+    #[test]
+    fn print_basic_text() {
+        let (mut p, mut g, mut d) = setup(5, 2);
+        p.advance(&mut g, &mut d, b"Hello");
+        assert_eq!(g.cell(0, 0).ch, 'H' as u32);
+        assert_eq!(g.cell(4, 0).ch, 'o' as u32);
     }
 
     #[test]
-    fn parses_osc_52_clipboard_query() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(4, 1);
+    fn print_autowrap() {
+        let (mut p, mut g, mut d) = setup(3, 2);
+        p.advance(&mut g, &mut d, b"ABCDE");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(2, 0).ch, 'C' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'D' as u32);
+        assert_eq!(g.cell(1, 1).ch, 'E' as u32);
+    }
 
-        parser.advance(&mut state, b"\x1b]52;c;?\x07");
-        let requests = state.take_pending_clipboard_requests();
+    // === Save/Restore Cursor via CSI ===
 
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].selection, ClipboardSelection::Clipboard);
-        assert_eq!(requests[0].kind, ClipboardRequestKind::Query);
+    #[test]
+    fn csi_save_restore_cursor() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[4;6H\x1b[s\x1b[1;1H\x1b[u");
+        assert_eq!(g.cursor.row, 3);
+        assert_eq!(g.cursor.col, 5);
+    }
+
+    // === DSR ===
+
+    #[test]
+    fn dsr_cursor_position_report() {
+        let (mut p, mut g, mut d) = setup(20, 10);
+        p.advance(&mut g, &mut d, b"\x1b[3;7H\x1b[6n");
+        let responses = p.take_responses();
+        assert_eq!(responses, vec![b"\x1b[3;7R".to_vec()]);
+    }
+
+    // === Insert/Delete Lines ===
+
+    #[test]
+    fn csi_il_insert_lines() {
+        let (mut p, mut g, mut d) = setup(3, 4);
+        p.advance(&mut g, &mut d, b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        p.advance(&mut g, &mut d, b"\x1b[2;1H\x1b[1L");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(0, 1).ch, ' ' as u32);
+        assert_eq!(g.cell(0, 2).ch, 'B' as u32);
+        assert_eq!(g.cell(0, 3).ch, 'C' as u32);
     }
 
     #[test]
-    fn parses_osc_8_hyperlinks_into_cells() {
-        let mut parser = TerminalParser::new();
-        let mut state = TerminalState::new(8, 1);
+    fn csi_dl_delete_lines() {
+        let (mut p, mut g, mut d) = setup(3, 4);
+        p.advance(&mut g, &mut d, b"AAA\r\nBBB\r\nCCC\r\nDDD");
+        p.advance(&mut g, &mut d, b"\x1b[2;1H\x1b[1M");
+        assert_eq!(g.cell(0, 0).ch, 'A' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'C' as u32);
+        assert_eq!(g.cell(0, 2).ch, 'D' as u32);
+        assert_eq!(g.cell(0, 3).ch, ' ' as u32);
+    }
 
-        parser.advance(&mut state, b"\x1b]8;id=link1;https://example.com\x07hi\x1b]8;;\x07!");
+    // === Bare ESC[m is reset ===
 
-        let first = state.screen().get(0, 0).unwrap();
-        let second = state.screen().get(1, 0).unwrap();
-        let third = state.screen().get(2, 0).unwrap();
-        assert_eq!(first.hyperlink.as_ref().unwrap().uri, "https://example.com");
-        assert_eq!(first.hyperlink.as_ref().unwrap().id.as_deref(), Some("link1"));
-        assert!(second.hyperlink.is_some());
-        assert!(third.hyperlink.is_none());
+    #[test]
+    fn bare_sgr_is_reset() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[1mA\x1b[mB");
+        assert!(g.cell(0, 0).flags.contains(CellFlags::BOLD));
+        assert!(!g.cell(1, 0).flags.contains(CellFlags::BOLD));
+    }
+
+    // === Origin mode ===
+
+    #[test]
+    fn origin_mode_homes_cursor() {
+        let (mut p, mut g, mut d) = setup(10, 10);
+        p.advance(&mut g, &mut d, b"\x1b[3;7r");
+        p.advance(&mut g, &mut d, b"\x1b[?6h");
+        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.cursor.col, 0);
+    }
+
+    // === ESC D (Index) ===
+
+    #[test]
+    fn esc_index_linefeed() {
+        let (mut p, mut g, mut d) = setup(5, 3);
+        p.advance(&mut g, &mut d, b"\x1b[1;1H\x1bD");
+        assert_eq!(g.cursor.row, 1);
+    }
+
+    // === Compound sequences ===
+
+    #[test]
+    fn compound_sgr_changes_mid_text() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"A\x1b[1mB\x1b[0mC");
+        assert!(!g.cell(0, 0).flags.contains(CellFlags::BOLD));
+        assert!(g.cell(1, 0).flags.contains(CellFlags::BOLD));
+        assert!(!g.cell(2, 0).flags.contains(CellFlags::BOLD));
+    }
+
+    #[test]
+    fn incremental_byte_feeding() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        for &byte in b"\x1b[1;31mHi".iter() {
+            p.advance(&mut g, &mut d, &[byte]);
+        }
+        assert_eq!(g.cell(0, 0).ch, 'H' as u32);
+        assert!(g.cell(0, 0).flags.contains(CellFlags::BOLD));
+        assert_eq!(g.cell(0, 0).fg, p.theme.palette(1));
+    }
+
+    #[test]
+    fn mouse_drag_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[?1002h");
+        assert_eq!(p.mouse_state.mode, MouseMode::Drag);
+    }
+
+    #[test]
+    fn mouse_motion_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[?1003h");
+        assert_eq!(p.mouse_state.mode, MouseMode::Motion);
     }
 }

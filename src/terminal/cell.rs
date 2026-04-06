@@ -1,103 +1,178 @@
-use std::sync::Arc;
+//! Compact terminal cell representation.
+//! Inspired by foot's 12-byte cell design for cache efficiency.
 
-use compact_str::CompactString;
+/// Cell text attributes packed into 2 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CellFlags(u16);
 
-use crate::terminal::{Hyperlink, style::TerminalStyle};
+impl CellFlags {
+    pub const BOLD: Self = Self(1 << 0);
+    pub const DIM: Self = Self(1 << 1);
+    pub const ITALIC: Self = Self(1 << 2);
+    pub const UNDERLINE: Self = Self(1 << 3);
+    pub const STRIKETHROUGH: Self = Self(1 << 4);
+    pub const BLINK: Self = Self(1 << 5);
+    pub const REVERSE: Self = Self(1 << 6);
+    pub const HIDDEN: Self = Self(1 << 7);
+    pub const WIDE: Self = Self(1 << 8);
+    pub const WIDE_SPACER: Self = Self(1 << 9);
+    pub const DIRTY: Self = Self(1 << 10);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CellWidth {
-    Zero,
-    Single,
-    Double,
-    Continuation,
+    #[inline]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    #[inline]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+    #[inline]
+    pub const fn from_bits_truncate(bits: u16) -> Self {
+        Self(bits)
+    }
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    #[inline]
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    #[inline]
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
-const BLANK_SPACE: CompactString = CompactString::const_new(" ");
-const EMPTY: CompactString = CompactString::const_new("");
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TerminalCell {
-    text: CompactString,
-    pub style: Option<Arc<TerminalStyle>>,
-    pub hyperlink: Option<Arc<Hyperlink>>,
-    pub width: CellWidth,
+impl std::ops::BitAnd for CellFlags {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
 }
 
-impl Default for TerminalCell {
+impl std::ops::BitOr for CellFlags {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::Not for CellFlags {
+    type Output = Self;
+    #[inline]
+    fn not(self) -> Self {
+        Self(!self.0)
+    }
+}
+
+/// Color source - how fg/bg was specified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ColorSource {
+    #[default]
+    Default = 0,
+    Palette = 1,
+    Rgb = 2,
+}
+
+/// Packed RGB color (24-bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PackedColor(pub u32);
+
+impl PackedColor {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self(((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+    }
+
+    pub const fn r(self) -> u8 {
+        (self.0 >> 16) as u8
+    }
+    pub const fn g(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
+    pub const fn b(self) -> u8 {
+        self.0 as u8
+    }
+
+    pub const fn to_rgba_f32(self) -> [f32; 4] {
+        [
+            self.r() as f32 / 255.0,
+            self.g() as f32 / 255.0,
+            self.b() as f32 / 255.0,
+            1.0,
+        ]
+    }
+}
+
+/// A single terminal cell - kept compact for cache performance.
+/// 16 bytes total (char32 + flags + fg + bg).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct Cell {
+    /// Unicode codepoint (or combined chars index if > 0x200000).
+    pub ch: u32,
+    /// Cell attribute flags.
+    pub flags: CellFlags,
+    /// Foreground color source.
+    pub fg_src: ColorSource,
+    /// Background color source.
+    pub bg_src: ColorSource,
+    /// Foreground color (24-bit packed).
+    pub fg: PackedColor,
+    /// Background color (24-bit packed).
+    pub bg: PackedColor,
+}
+
+impl Default for Cell {
     fn default() -> Self {
-        Self::blank(None, None)
+        Self {
+            ch: ' ' as u32,
+            flags: CellFlags::empty(),
+            fg_src: ColorSource::Default,
+            bg_src: ColorSource::Default,
+            fg: PackedColor(0xd4d4d4), // light gray
+            bg: PackedColor(0x1e1e1e), // dark
+        }
     }
 }
 
-impl TerminalCell {
-    pub fn blank(style: Option<Arc<TerminalStyle>>, hyperlink: Option<Arc<Hyperlink>>) -> Self {
-        Self { text: BLANK_SPACE, style, hyperlink, width: CellWidth::Single }
+#[allow(dead_code)]
+impl Cell {
+    pub fn character(&self) -> char {
+        char::from_u32(self.ch).unwrap_or(' ')
     }
 
-    pub fn blank_plain(style: Option<Arc<TerminalStyle>>) -> Self {
-        Self::blank(style, None)
+    pub fn is_wide(&self) -> bool {
+        self.flags.contains(CellFlags::WIDE)
     }
 
-    pub fn continuation(
-        style: Option<Arc<TerminalStyle>>,
-        hyperlink: Option<Arc<Hyperlink>>,
-    ) -> Self {
-        Self { text: EMPTY, style, hyperlink, width: CellWidth::Continuation }
+    pub fn is_wide_spacer(&self) -> bool {
+        self.flags.contains(CellFlags::WIDE_SPACER)
     }
 
-    pub fn zero_width(
-        text: impl Into<String>,
-        style: Option<Arc<TerminalStyle>>,
-        hyperlink: Option<Arc<Hyperlink>>,
-    ) -> Self {
-        Self { text: CompactString::from(text.into()), style, hyperlink, width: CellWidth::Zero }
+    pub fn is_dirty(&self) -> bool {
+        self.flags.contains(CellFlags::DIRTY)
     }
 
-    pub fn occupied(
-        text: impl Into<String>,
-        style: Option<Arc<TerminalStyle>>,
-        width: CellWidth,
-    ) -> Self {
-        Self { text: CompactString::from(text.into()), style, hyperlink: None, width }
+    pub fn mark_dirty(&mut self) {
+        self.flags.insert(CellFlags::DIRTY);
     }
 
-    pub fn occupied_hyperlink(
-        text: impl Into<String>,
-        style: Option<Arc<TerminalStyle>>,
-        hyperlink: Option<Arc<Hyperlink>>,
-        width: CellWidth,
-    ) -> Self {
-        Self { text: CompactString::from(text.into()), style, hyperlink, width }
+    pub fn clear_dirty(&mut self) {
+        self.flags.remove(CellFlags::DIRTY);
     }
 
-    /// Create a cell from a single character without an intermediate `String` allocation.
-    pub fn from_char(
-        ch: char,
-        style: Option<Arc<TerminalStyle>>,
-        hyperlink: Option<Arc<Hyperlink>>,
-        width: CellWidth,
-    ) -> Self {
-        let mut text = CompactString::with_capacity(ch.len_utf8());
-        text.push(ch);
-        Self { text, style, hyperlink, width }
+    pub fn fg_rgba(&self) -> [f32; 4] {
+        self.fg.to_rgba_f32()
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn text_mut(&mut self) -> &mut CompactString {
-        &mut self.text
-    }
-
-    pub fn into_text(self) -> String {
-        self.text.into_string()
-    }
-
-    pub fn is_blank(&self) -> bool {
-        matches!(self.width, CellWidth::Single)
-            && self.text == " "
-            && self.style.is_none()
-            && self.hyperlink.is_none()
+    pub fn bg_rgba(&self) -> [f32; 4] {
+        self.bg.to_rgba_f32()
     }
 }
+
+// Verify our cell is compact
+const _: () = assert!(std::mem::size_of::<Cell>() == 16);
