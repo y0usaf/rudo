@@ -109,6 +109,10 @@ impl GridRenderer {
         self.get_default_background_color().with_a((alpha * 255.0) as u8)
     }
 
+    fn uses_default_background(&self, style: &Style) -> bool {
+        !style.reverse && style.colors.background.is_none()
+    }
+
     pub fn background_paint_color(&self, style: &Option<Arc<Style>>, opacity: f32) -> Color4f {
         let style = style.as_ref().unwrap_or(&self.default_style);
         let style_background = style.background(&self.default_style.colors).to_color();
@@ -118,15 +122,18 @@ impl GridRenderer {
         paint.set_blend_mode(BlendMode::Src);
         paint.set_color(style_background);
 
-        let is_default_background = style_background == self.get_default_background_color();
+        let uses_default_background = self.uses_default_background(style);
         let normal_opacity = self.settings.get::<WindowSettings>().normal_opacity;
 
-        let alpha = if normal_opacity < 1.0 && is_default_background {
+        let alpha = if normal_opacity < 1.0 && uses_default_background {
             normal_opacity
         } else if style.blend > 0 {
-            ((100 - style.blend) as f32 / 100.0) * opacity
-        } else {
+            ((100 - style.blend) as f32 / 100.0)
+                * if uses_default_background { opacity } else { 1.0 }
+        } else if uses_default_background {
             opacity
+        } else {
+            1.0
         };
 
         paint.set_alpha_f(alpha);
@@ -157,19 +164,23 @@ impl GridRenderer {
         paint.set_blend_mode(BlendMode::Src);
         paint.set_color(style_background);
 
-        let is_default_background = style_background == self.get_default_background_color();
+        let uses_default_background = self.uses_default_background(style);
         let normal_opacity = self.settings.get::<WindowSettings>().normal_opacity;
 
-        let alpha = if normal_opacity < 1.0 && is_default_background {
+        let alpha = if normal_opacity < 1.0 && uses_default_background {
             normal_opacity
         } else if style.blend > 0 {
-            ((100 - style.blend) as f32 / 100.0) * opacity
-        } else {
+            ((100 - style.blend) as f32 / 100.0)
+                * if uses_default_background { opacity } else { 1.0 }
+        } else if uses_default_background {
             opacity
+        } else {
+            1.0
         };
         paint.set_alpha_f(alpha);
 
-        let custom_color = paint.color4f() != self.default_style.colors.background.unwrap();
+        let custom_color = !uses_default_background
+            || paint.color4f() != self.default_style.colors.background.unwrap();
         if custom_color {
             canvas.draw_rect(to_skia_rect(&region), &paint);
         }
