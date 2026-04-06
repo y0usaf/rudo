@@ -311,12 +311,14 @@ impl WinitWindowWrapper {
         let terminal_runtime =
             self.terminal_runtime.as_mut().expect("terminal runtime has not been initialized");
         let initial_grid_size = desired_grid_size.unwrap_or(DEFAULT_GRID_SIZE);
+        let command = self.settings.get::<CmdLineSettings>().command.clone();
         let terminal_handle = match terminal_runtime.launch(
             route_id,
             proxy.clone(),
             self.runtime_tracker.clone(),
             pty_size_with_pixels(initial_grid_size, PixelSize::default()),
             None,
+            command,
             None,
         ) {
             Ok(handle) => handle,
@@ -1832,6 +1834,7 @@ impl WinitWindowWrapper {
                 self.runtime_tracker.clone(),
                 pty_size_with_pixels(initial_grid_size, PixelSize::default()),
                 None,
+                Vec::new(),
                 cwd.map(Path::to_path_buf),
             ) {
                 Ok(handle) => handle,

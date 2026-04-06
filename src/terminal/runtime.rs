@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use anyhow::Result;
 use tokio::{runtime::{Builder, Runtime}, sync::watch};
@@ -55,13 +55,21 @@ impl TerminalRuntime {
         running_tracker: RunningTracker,
         size: PtySize,
         shell: Option<String>,
+        command: Vec<OsString>,
         cwd: Option<PathBuf>,
     ) -> Result<TerminalHandle> {
         let system = NativePtySystem;
-        let shell = platform_default_shell(shell.as_deref());
+        let (shell, args) = if command.is_empty() {
+            (Some(platform_default_shell(shell.as_deref())), Vec::new())
+        } else {
+            let mut iter = command.into_iter();
+            let program = iter.next().unwrap();
+            let args = iter.collect();
+            (Some(program), args)
+        };
         let process = system.spawn(PtySpawnConfig {
-            shell: Some(shell),
-            args: Vec::new(),
+            shell,
+            args,
             cwd,
             env: terminal_environment(),
             size,

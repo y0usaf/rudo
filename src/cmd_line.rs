@@ -1,4 +1,4 @@
-use std::iter;
+use std::{ffi::OsString, iter};
 
 use crate::{dimensions::Dimensions, frame::Frame, settings::*, version::BUILD_VERSION};
 
@@ -102,6 +102,14 @@ pub struct CmdLineSettings {
     /// Change to this directory during startup.
     #[arg(long = "chdir", env = "TERMVIDE_CHDIR")]
     pub chdir: Option<String>,
+
+    /// Ignored (for compatibility with xterm -e)
+    #[arg(short = 'e', hide = true)]
+    _xterm_compat: bool,
+
+    /// Command to execute instead of the default shell
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<OsString>,
 }
 
 // geometry, size and maximized are mutually exclusive
