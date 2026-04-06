@@ -3,18 +3,23 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
   };
 
   outputs = {
     self,
     nixpkgs,
-    flake-utils,
     crane,
-  }:
-    flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import nixpkgs {inherit system;};
+  }: let
+    systems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
+    forAllSystems = nixpkgs.lib.genAttrs systems;
+    pkgsFor = forAllSystems (system: import nixpkgs {inherit system;});
+  in {
+    packages = forAllSystems (system: let
+      pkgs = pkgsFor.${system};
       lib = pkgs.lib;
 
       runtimeLibs = with pkgs; [
@@ -36,19 +41,6 @@
       rustLinkEnv = lib.optionalAttrs useMold {
         CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
       };
-
-      nativeTools = with pkgs;
-        [
-          pkg-config
-          clang
-          cmake
-          ninja
-          python3
-          makeWrapper
-        ]
-        ++ lib.optionals useMold [
-          pkgs.mold
-        ];
 
       packageNativeBuildInputs = [
         pkgs.makeWrapper
@@ -121,13 +113,56 @@
           '';
         });
     in {
-      packages.default = termvide;
-      apps.default = flake-utils.lib.mkApp {
-        drv = termvide;
-        name = "termvide";
+      default = termvide;
+    });
+
+    apps = forAllSystems (system: let
+      termvide = self.packages.${system}.default;
+    in {
+      default = {
+        type = "app";
+        program = "${termvide}/bin/termvide";
+      };
+    });
+
+    devShells = forAllSystems (system: let
+      pkgs = pkgsFor.${system};
+      lib = pkgs.lib;
+
+      runtimeLibs = with pkgs; [
+        fontconfig
+        freetype
+        libGL
+        libxkbcommon
+        wayland
+        libx11
+        libxcursor
+        libxi
+        libxrandr
+        libxext
+        libxinerama
+        libxcb
+      ];
+
+      useMold = pkgs.stdenv.isLinux;
+      rustLinkEnv = lib.optionalAttrs useMold {
+        CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
       };
 
-      devShells.default = pkgs.mkShell ({
+      nativeTools = with pkgs;
+        [
+          pkg-config
+          clang
+          cmake
+          ninja
+          python3
+          makeWrapper
+        ]
+        ++ lib.optionals useMold [
+          pkgs.mold
+        ];
+    in {
+      default = pkgs.mkShell ({
           packages = with pkgs;
             [
               cargo
@@ -146,4 +181,5 @@
         }
         // rustLinkEnv);
     });
+  };
 }
