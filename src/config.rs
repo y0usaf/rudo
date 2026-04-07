@@ -12,6 +12,7 @@ use crate::defaults::{
     DEFAULT_WINDOW_INITIAL_WIDTH, DEFAULT_WINDOW_PADDING_PX, LEGACY_CONFIG_DIR_NAME,
 };
 use crate::info_log;
+use crate::keybindings::{parse_binding_list, KeybindingsConfig};
 use crate::toml_parser::TomlTable;
 use crate::warn_log;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub terminal: TerminalConfig,
     pub scrollback: ScrollbackConfig,
+    pub keybindings: KeybindingsConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +106,7 @@ impl Default for Config {
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
             scrollback: ScrollbackConfig::default(),
+            keybindings: KeybindingsConfig::default(),
         }
     }
 }
@@ -252,6 +255,32 @@ impl Config {
     fn from_toml(t: &TomlTable) -> Self {
         let def = Config::default();
 
+        fn keybinding_field(
+            t: &TomlTable,
+            key: &str,
+            default: &[crate::keybindings::KeyBinding],
+        ) -> Vec<crate::keybindings::KeyBinding> {
+            if let Some(false) = t.get_bool("keybindings", key) {
+                return Vec::new();
+            }
+
+            let Some(spec) = t.get_str("keybindings", key) else {
+                return default.to_vec();
+            };
+
+            match parse_binding_list(spec) {
+                Ok(bindings) => bindings,
+                Err(err) => {
+                    warn_log!(
+                        "Invalid keybinding for [keybindings].{}: {}, using defaults",
+                        key,
+                        err
+                    );
+                    default.to_vec()
+                }
+            }
+        }
+
         /// Helper macro to extract a string config value with fallback to default
         macro_rules! str_field {
             ($section:expr, $key:expr, $default:expr) => {
@@ -339,6 +368,13 @@ impl Config {
                     .get_usize("scrollback", "lines")
                     .unwrap_or(def.scrollback.lines),
             },
+            keybindings: KeybindingsConfig {
+                copy: keybinding_field(t, "copy", &def.keybindings.copy),
+                paste: keybinding_field(t, "paste", &def.keybindings.paste),
+                zoom_in: keybinding_field(t, "zoom_in", &def.keybindings.zoom_in),
+                zoom_out: keybinding_field(t, "zoom_out", &def.keybindings.zoom_out),
+                zoom_reset: keybinding_field(t, "zoom_reset", &def.keybindings.zoom_reset),
+            },
         }
     }
 
@@ -397,6 +433,12 @@ fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{Key, KeyEvent, Modifiers};
+    use crate::keybindings::LocalAction;
+
+    fn mods(ctrl: bool, shift: bool, alt: bool) -> Modifiers {
+        Modifiers { ctrl, shift, alt }
+    }
 
     #[test]
     fn test_parse_hex_color_with_hash() {
@@ -522,5 +564,63 @@ shell_fallback = "/usr/bin/zsh"
         assert_eq!(colors.bright_magenta, DEFAULT_ANSI_HEX[13]);
         assert_eq!(colors.bright_cyan, DEFAULT_ANSI_HEX[14]);
         assert_eq!(colors.bright_white, DEFAULT_ANSI_HEX[15]);
+    }
+
+    #[test]
+    fn test_custom_keybindings_parse() {
+        let toml_str = r##"
+[keybindings]
+copy = "alt+c"
+paste = "alt+v"
+zoom_in = "alt+equal, alt+plus"
+zoom_out = "alt+minus"
+zoom_reset = "alt+0"
+"##;
+        let table = TomlTable::parse(toml_str).unwrap();
+        let config = Config::from_toml(&table);
+
+        assert!(config.keybindings.matches(
+            LocalAction::Copy,
+            &KeyEvent {
+                pressed: true,
+                key: Key::Text("c".to_string()),
+            },
+            mods(false, false, true)
+        ));
+        assert!(config.keybindings.matches(
+            LocalAction::ZoomIn,
+            &KeyEvent {
+                pressed: true,
+                key: Key::Text("+".to_string()),
+            },
+            mods(false, true, true)
+        ));
+        assert!(config.keybindings.matches(
+            LocalAction::ZoomOut,
+            &KeyEvent {
+                pressed: true,
+                key: Key::Text("-".to_string()),
+            },
+            mods(false, false, true)
+        ));
+    }
+
+    #[test]
+    fn test_keybindings_can_be_disabled() {
+        let toml_str = r##"
+[keybindings]
+paste = false
+"##;
+        let table = TomlTable::parse(toml_str).unwrap();
+        let config = Config::from_toml(&table);
+
+        assert!(!config.keybindings.matches(
+            LocalAction::Paste,
+            &KeyEvent {
+                pressed: true,
+                key: Key::Text("v".to_string()),
+            },
+            mods(true, true, false)
+        ));
     }
 }

@@ -7,6 +7,7 @@ pub(crate) mod font;
 pub(crate) mod fontconfig_ffi;
 pub(crate) mod freetype_ffi;
 pub(crate) mod input;
+pub(crate) mod keybindings;
 pub(crate) mod logging;
 pub(crate) mod platform;
 pub(crate) mod pty;

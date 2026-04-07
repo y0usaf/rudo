@@ -23,6 +23,7 @@ use crate::core_app::CoreApp;
 use crate::defaults::{DEFAULT_WINDOW_INITIAL_HEIGHT, DEFAULT_WINDOW_INITIAL_WIDTH};
 use crate::info_log;
 use crate::input::{KeyEvent, Modifiers};
+use crate::keybindings::LocalAction;
 use crate::software_renderer::{FrameBuffer, SoftwareRenderer};
 
 use keyboard::{fallback_key_event, RepeatState, XkbContextData};
@@ -325,18 +326,14 @@ impl WaylandState {
     }
 
     fn local_key_action_for(&self, event: &KeyEvent) -> Option<ZoomAction> {
-        if !event.pressed || !self.app.modifiers().control_key() {
-            return None;
-        }
-
-        match &event.key {
-            crate::input::Key::Text(text) => match text.as_str() {
-                "+" | "=" => Some(ZoomAction::In),
-                "-" => Some(ZoomAction::Out),
-                "0" => Some(ZoomAction::Reset),
-                _ => None,
-            },
-            _ => None,
+        if self.app.matches_local_keybinding(LocalAction::ZoomIn, event) {
+            Some(ZoomAction::In)
+        } else if self.app.matches_local_keybinding(LocalAction::ZoomOut, event) {
+            Some(ZoomAction::Out)
+        } else if self.app.matches_local_keybinding(LocalAction::ZoomReset, event) {
+            Some(ZoomAction::Reset)
+        } else {
+            None
         }
     }
 

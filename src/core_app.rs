@@ -8,6 +8,7 @@ use crate::{
     cursor::CursorRenderer,
     defaults::{DEFAULT_CLIPBOARD_COPY_COMMAND, DEFAULT_CLIPBOARD_PASTE_COMMAND},
     input::{Key, KeyEvent, Modifiers, MouseButton},
+    keybindings::LocalAction,
     pty::{Pty, PtySpawnConfig},
     terminal::{
         damage::DamageTracker,
@@ -222,31 +223,31 @@ impl CoreApp {
             return;
         }
         let Some(pty) = &self.pty else { return };
-        let ctrl = self.modifiers.control_key();
-        let shift = self.modifiers.shift_key();
 
-        if ctrl && shift {
-            if let Key::Text(ref c) = event.key {
-                match c.as_str() {
-                    "C" | "c" => {
-                        if self.selection.has_selection() {
-                            let text = self.selection.selected_text(&self.grid);
-                            clipboard_set(&text);
-                        }
-                        return;
-                    }
-                    "V" | "v" => {
-                        if let Some(text) = clipboard_get() {
-                            let _ = pty.write(text.as_bytes());
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
+        if self
+            .config
+            .keybindings
+            .matches(LocalAction::Copy, event, self.modifiers)
+        {
+            if self.selection.has_selection() {
+                let text = self.selection.selected_text(&self.grid);
+                clipboard_set(&text);
             }
+            return;
         }
 
-        if ctrl {
+        if self
+            .config
+            .keybindings
+            .matches(LocalAction::Paste, event, self.modifiers)
+        {
+            if let Some(text) = clipboard_get() {
+                let _ = pty.write(text.as_bytes());
+            }
+            return;
+        }
+
+        if self.modifiers.control_key() {
             if let Key::Text(ref c) = event.key {
                 let ch = c.chars().next().unwrap_or('\0');
                 if ch.is_ascii_alphabetic() {
@@ -296,6 +297,12 @@ impl CoreApp {
         if let Some(seq) = seq {
             let _ = pty.write(seq);
         }
+    }
+
+    pub fn matches_local_keybinding(&self, action: LocalAction, event: &KeyEvent) -> bool {
+        self.config
+            .keybindings
+            .matches(action, event, self.modifiers)
     }
 
     pub fn handle_mouse_button(&mut self, pressed: bool, button: MouseButton) {
