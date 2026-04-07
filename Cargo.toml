@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 # Wayland-only software frontend
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 # Terminal
 vte = "0.15"

@@ -9,6 +9,8 @@ use crate::xkb_ffi::xkb as xkb_fns;
 
 use crate::input::{Key, KeyEvent, Modifiers, MouseButton};
 
+const EVDEV_TO_XKB_OFFSET: u32 = 8;
+
 // ─── Key repeat state machine ────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
@@ -140,14 +142,16 @@ impl XkbContextData {
 
     pub fn key_repeats(&self, key: u32) -> bool {
         let xkbh = xkb_fns();
-        // SAFETY: self.keymap is a valid xkb_keymap (NonNull). key + 8
+        // SAFETY: self.keymap is a valid xkb_keymap (NonNull). key + EVDEV_TO_XKB_OFFSET
         // converts from evdev keycode to XKB keycode.
-        unsafe { (xkbh.xkb_keymap_key_repeats)(self.keymap.as_ptr(), key + 8) > 0 }
+        unsafe {
+            (xkbh.xkb_keymap_key_repeats)(self.keymap.as_ptr(), key + EVDEV_TO_XKB_OFFSET) > 0
+        }
     }
 
     pub fn key_event(&mut self, key: u32, pressed: bool) -> KeyEvent {
         let xkbh = xkb_fns();
-        let code = key + 8;
+        let code = key + EVDEV_TO_XKB_OFFSET;
         // SAFETY: self.state is a valid xkb_state (NonNull). code is a valid
         // XKB keycode. XKB_KEY_DOWN/XKB_KEY_UP are valid key directions.
         unsafe {
@@ -166,7 +170,7 @@ impl XkbContextData {
     }
 
     pub fn repeat_key_event(&mut self, key: u32) -> KeyEvent {
-        self.key_event_inner(key + 8, true)
+        self.key_event_inner(key + EVDEV_TO_XKB_OFFSET, true)
     }
 
     fn key_event_inner(&mut self, code: u32, pressed: bool) -> KeyEvent {

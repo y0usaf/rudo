@@ -6,20 +6,24 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
-    wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_shm, wl_surface,
+    wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
+use crate::cli::CliArgs;
 use crate::core_app::CoreApp;
+use crate::defaults::{DEFAULT_WINDOW_INITIAL_HEIGHT, DEFAULT_WINDOW_INITIAL_WIDTH};
 use crate::input::{KeyEvent, Modifiers};
 use crate::software_renderer::{FrameBuffer, SoftwareRenderer};
 
 use keyboard::{fallback_key_event, RepeatState, XkbContextData};
 use shm::ShmBuffer;
 
-const INITIAL_WIDTH: u32 = 800;
-const INITIAL_HEIGHT: u32 = 600;
 const BUFFER_COUNT: usize = 3;
 
 // ─── Zoom ────────────────────────────────────────────────────────────────────
@@ -31,14 +35,28 @@ enum ZoomAction {
     Reset,
 }
 
+// ─── Output tracking ─────────────────────────────────────────────────────────
+
+struct OutputInfo {
+    output: wl_output::WlOutput,
+    /// Registry name (unique id for this global).
+    name: u32,
+    /// Integer scale factor from wl_output.scale (default 1).
+    scale: i32,
+}
+
 // ─── Wayland state ───────────────────────────────────────────────────────────
 
 struct WaylandState {
     running: bool,
     configured: bool,
     frame_ready: bool,
+    /// Logical (surface-local) width from xdg_toplevel configure.
     width: u32,
+    /// Logical (surface-local) height from xdg_toplevel configure.
     height: u32,
+    /// Current effective scale factor (≥ 1.0).
+    scale: f32,
     app: CoreApp,
     renderer: SoftwareRenderer,
     compositor: Option<wl_compositor::WlCompositor>,
@@ -54,6 +72,18 @@ struct WaylandState {
     xkb: Option<XkbContextData>,
     fallback_mods: Modifiers,
     repeat: RepeatState,
+    // ── Output / scale tracking ──
+    /// All known wl_output globals.
+    outputs: Vec<OutputInfo>,
+    /// Registry names of outputs the surface is currently on.
+    surface_outputs: Vec<u32>,
+    // ── Fractional scale + viewporter ──
+    viewporter: Option<wp_viewporter::WpViewporter>,
+    viewport: Option<wp_viewport::WpViewport>,
+    fractional_scale_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
+    fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+    /// Scale value from wp_fractional_scale_v1 (if available).
+    fractional_scale_value: Option<f32>,
 }
 
 impl WaylandState {
@@ -87,6 +117,17 @@ impl WaylandState {
             .get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_title(self.app.title().into());
+        toplevel.set_app_id(self.app.app_id().into());
+
+        // Create viewport (for fractional scaling)
+        if let Some(viewporter) = &self.viewporter {
+            self.viewport = Some(viewporter.get_viewport(&surface, qh, ()));
+        }
+        // Create fractional scale listener
+        if let Some(manager) = &self.fractional_scale_manager {
+            self.fractional_scale = Some(manager.get_fractional_scale(&surface, qh, ()));
+        }
+
         surface.commit();
         self.surface = Some(surface);
         self.xdg_surface = Some(xdg_surface);
@@ -94,24 +135,38 @@ impl WaylandState {
         self.update_opaque_region(qh);
     }
 
+    /// Physical (buffer) dimensions = logical × scale.
+    fn physical_size(&self) -> (u32, u32) {
+        let w = (self.width as f32 * self.scale).round() as u32;
+        let h = (self.height as f32 * self.scale).round() as u32;
+        (w.max(1), h.max(1))
+    }
+
+    /// Returns true when fractional scaling path should be used
+    /// (both viewporter and fractional_scale are available).
+    fn use_fractional_scaling(&self) -> bool {
+        self.viewport.is_some() && self.fractional_scale.is_some()
+    }
+
     fn ensure_buffers(&mut self, qh: &QueueHandle<Self>) {
+        let (phys_w, phys_h) = self.physical_size();
         if self.buffers.len() == BUFFER_COUNT
             && self
                 .buffers
                 .iter()
-                .all(|b| b.width == self.width && b.height == self.height)
+                .all(|b| b.width == phys_w && b.height == phys_h)
         {
             return;
         }
         self.buffers.clear();
         for idx in 0..BUFFER_COUNT {
             if let Some(shm) = &self.shm {
-                if let Ok(buf) = ShmBuffer::new(shm, self.width, self.height, qh, idx) {
+                if let Ok(buf) = ShmBuffer::new(shm, phys_w, phys_h, qh, idx) {
                     self.buffers.push(buf);
                 }
             }
         }
-        let (cols, rows) = self.renderer.grid_size_for_window(self.width, self.height);
+        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
         let (ox, oy) = self.renderer.grid_offset();
         self.app.set_grid_offset(ox, oy);
         self.app.handle_resize(cols, rows);
@@ -150,14 +205,31 @@ impl WaylandState {
         );
         self.app.clear_damage();
 
+        let buf_w = buf.width as i32;
+        let buf_h = buf.height as i32;
+
         let surface = self.surface.as_ref().unwrap();
-        surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        // damage_buffer uses buffer (physical) coordinates
+        surface.damage_buffer(0, 0, buf_w, buf_h);
         surface.attach(Some(&buf.buffer), 0, 0);
+        buf.busy = true;
+
+        // Apply scaling to the surface
+        if self.use_fractional_scaling() {
+            // Fractional path: buffer at physical pixels, viewport maps to logical
+            surface.set_buffer_scale(1);
+            if let Some(viewport) = &self.viewport {
+                viewport.set_destination(self.width as i32, self.height as i32);
+            }
+        } else {
+            // Integer path: set_buffer_scale tells compositor the ratio
+            surface.set_buffer_scale(self.scale.round().max(1.0) as i32);
+        }
+
         if keep_animating || self.repeat.key.is_some() {
             surface.frame(qh, ());
         }
         surface.commit();
-        buf.busy = true;
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
@@ -169,11 +241,55 @@ impl WaylandState {
         }
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
-        let (cols, rows) = self.renderer.grid_size_for_window(self.width, self.height);
+        let (phys_w, phys_h) = self.physical_size();
+        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
         let (ox, oy) = self.renderer.grid_offset();
         self.app.set_grid_offset(ox, oy);
         self.app.handle_resize(cols, rows);
+        self.buffers.clear();
         self.frame_ready = true;
+    }
+
+    /// Recalculate the effective scale from available sources.
+    /// Returns true if the scale actually changed.
+    fn update_scale(&mut self) -> bool {
+        let new_scale = if let Some(frac) = self.fractional_scale_value {
+            // Best: fractional scale protocol gives exact value
+            frac
+        } else if !self.surface_outputs.is_empty() {
+            // Integer scale from the output(s) the surface is on
+            self.surface_outputs
+                .iter()
+                .filter_map(|name| self.outputs.iter().find(|o| o.name == *name))
+                .map(|o| o.scale)
+                .max()
+                .unwrap_or(1) as f32
+        } else {
+            // Fallback: highest scale of any known output, or 1.0
+            self.outputs.iter().map(|o| o.scale).max().unwrap_or(1) as f32
+        };
+
+        let new_scale = new_scale.max(1.0);
+
+        if (self.scale - new_scale).abs() < 0.001 {
+            return false;
+        }
+
+        eprintln!(
+            "[INFO] Scale changed: {:.3} -> {:.3}",
+            self.scale, new_scale
+        );
+        self.scale = new_scale;
+        self.renderer.set_scale(new_scale);
+        let (cw, ch) = self.renderer.cell_size();
+        self.app.set_cell_size(cw, ch);
+        let (phys_w, phys_h) = self.physical_size();
+        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
+        let (ox, oy) = self.renderer.grid_offset();
+        self.app.set_grid_offset(ox, oy);
+        self.app.handle_resize(cols, rows);
+        self.buffers.clear();
+        true
     }
 
     fn local_key_action_for(&self, event: &KeyEvent) -> Option<ZoomAction> {
@@ -234,23 +350,48 @@ impl WaylandState {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
     conn.display().get_registry(&qh, ());
 
-    let mut app = CoreApp::new();
+    let mut app = CoreApp::new(cli);
     let padding = app.config().window.padding;
+    let configured_width = app.config().window.initial_width.max(1);
+    let configured_height = app.config().window.initial_height.max(1);
+    let configured_cols = app.config().terminal.cols.max(2) as u32;
+    let configured_rows = app.config().terminal.rows.max(2) as u32;
     let mut renderer = SoftwareRenderer::new(
         app.config().font.size,
+        app.config().font.family.clone(),
         app.theme().clone(),
         padding,
         app.config().window.opacity,
     );
     let (cw, ch) = renderer.cell_size();
+    let cell_width = cw.ceil() as u32;
+    let cell_height = ch.ceil() as u32;
+    let initial_width = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
+        && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
+    {
+        configured_cols
+            .saturating_mul(cell_width)
+            .saturating_add(padding * 2)
+    } else {
+        configured_width
+    };
+    let initial_height = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
+        && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
+    {
+        configured_rows
+            .saturating_mul(cell_height)
+            .saturating_add(padding * 2)
+    } else {
+        configured_height
+    };
     app.set_cell_size(cw, ch);
-    let (cols, rows) = renderer.grid_size_for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
+    let (cols, rows) = renderer.grid_size_for_window(initial_width, initial_height);
     let (ox, oy) = renderer.grid_offset();
     app.set_grid_offset(ox, oy);
     app.init_terminal(cols, rows);
@@ -259,8 +400,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         running: true,
         configured: false,
         frame_ready: false,
-        width: INITIAL_WIDTH,
-        height: INITIAL_HEIGHT,
+        width: initial_width,
+        height: initial_height,
+        scale: 1.0,
         app,
         renderer,
         compositor: None,
@@ -276,6 +418,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         xkb: None,
         fallback_mods: Modifiers::empty(),
         repeat: RepeatState::default(),
+        outputs: Vec::new(),
+        surface_outputs: Vec::new(),
+        viewporter: None,
+        viewport: None,
+        fractional_scale_manager: None,
+        fractional_scale: None,
+        fractional_scale_value: None,
     };
 
     while state.running {

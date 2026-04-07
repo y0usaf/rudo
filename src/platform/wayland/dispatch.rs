@@ -6,21 +6,27 @@ use std::io::Read;
 use wayland_client::{
     delegate_noop,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-        wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
+        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, QueueHandle, WEnum,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::input::Key;
+
+const FRACTIONAL_SCALE_DIVISOR: f32 = 120.0;
+const WAYLAND_SCROLL_DISCRETE_FACTOR: f64 = 120.0;
 
 use super::keyboard::{
     fallback_key_event, fallback_key_is_repeatable, map_pointer_button, update_fallback_modifiers,
     XkbContextData,
 };
-use super::WaylandState;
-use super::ZoomAction;
+use super::{OutputInfo, WaylandState, ZoomAction};
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
     fn event(
@@ -32,7 +38,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
-            name, interface, ..
+            name,
+            interface,
+            version,
         } = event
         {
             match interface.as_str() {
@@ -54,6 +62,29 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.wm_base = Some(wm_base);
                     state.init_window(qh);
                 }
+                "wl_output" => {
+                    let ver = version.min(4);
+                    let output = registry.bind::<wl_output::WlOutput, _, _>(name, ver, qh, name);
+                    state.outputs.push(OutputInfo {
+                        output,
+                        name,
+                        scale: 1,
+                    });
+                }
+                "wp_viewporter" => {
+                    let vp = registry.bind::<wp_viewporter::WpViewporter, _, _>(name, 1, qh, ());
+                    state.viewporter = Some(vp);
+                }
+                "wp_fractional_scale_manager_v1" => {
+                    let mgr = registry
+                        .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(
+                            name,
+                            1,
+                            qh,
+                            (),
+                        );
+                    state.fractional_scale_manager = Some(mgr);
+                }
                 _ => {}
             }
         }
@@ -61,10 +92,102 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
 }
 
 delegate_noop!(WaylandState: ignore wl_compositor::WlCompositor);
-delegate_noop!(WaylandState: ignore wl_surface::WlSurface);
 delegate_noop!(WaylandState: ignore wl_region::WlRegion);
 delegate_noop!(WaylandState: ignore wl_shm::WlShm);
 delegate_noop!(WaylandState: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(WaylandState: ignore wp_viewporter::WpViewporter);
+delegate_noop!(WaylandState: ignore wp_viewport::WpViewport);
+delegate_noop!(WaylandState: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+
+// ─── wl_output: track per-output integer scale ──────────────────────────────────
+
+impl Dispatch<wl_output::WlOutput, u32> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        name: &u32,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Scale { factor } => {
+                if let Some(info) = state.outputs.iter_mut().find(|o| o.name == *name) {
+                    info.scale = factor;
+                }
+            }
+            wl_output::Event::Done => {
+                // All output properties received; recalculate effective scale.
+                if state.update_scale() {
+                    state.frame_ready = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── wl_surface: track enter/leave for output scale ─────────────────────────────
+
+impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _surface: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_surface::Event::Enter { output } => {
+                if let Some(info) = state.outputs.iter().find(|o| o.output == output) {
+                    let name = info.name;
+                    if !state.surface_outputs.contains(&name) {
+                        state.surface_outputs.push(name);
+                        if state.update_scale() {
+                            state.frame_ready = true;
+                        }
+                    }
+                }
+            }
+            wl_surface::Event::Leave { output } => {
+                if let Some(info) = state.outputs.iter().find(|o| o.output == output) {
+                    let name = info.name;
+                    state.surface_outputs.retain(|n| *n != name);
+                    if state.update_scale() {
+                        state.frame_ready = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── wp_fractional_scale_v1: precise fractional scale ────────────────────────────
+
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_fractional_scale_v1::Event::PreferredScale { scale } => {
+                // Wire format: scale × 120 (e.g. 180 = 1.5×, 240 = 2.0×)
+                let new_scale = scale as f32 / FRACTIONAL_SCALE_DIVISOR;
+                state.fractional_scale_value = Some(new_scale);
+                if state.update_scale() {
+                    state.frame_ready = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
     fn event(
@@ -194,7 +317,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 ..
             } => {
                 state.pointer_focus = true;
-                state.app.handle_mouse_move(surface_x, surface_y);
+                // Convert surface-local (logical) coords to physical pixels
+                let s = state.scale as f64;
+                state.app.handle_mouse_move(surface_x * s, surface_y * s);
                 state.frame_ready = true;
             }
             wl_pointer::Event::Leave { .. } => {
@@ -206,17 +331,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 ..
             } => {
                 if state.pointer_focus {
-                    let selection_before = state.app.selection().state;
-                    let selection_start_before = state.app.selection().start;
-                    let selection_end_before = state.app.selection().end;
-                    state.app.handle_mouse_move(surface_x, surface_y);
-                    let selection_after = state.app.selection().state;
-                    let selection_start_after = state.app.selection().start;
-                    let selection_end_after = state.app.selection().end;
-                    if selection_before != selection_after
-                        || selection_start_before != selection_start_after
-                        || selection_end_before != selection_end_after
-                    {
+                    let s = state.scale as f64;
+                    let before = state.app.selection().snapshot();
+                    state.app.handle_mouse_move(surface_x * s, surface_y * s);
+                    let after = state.app.selection().snapshot();
+                    if before != after {
                         state.frame_ready = true;
                     }
                 }
@@ -249,7 +368,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                         };
                         state.apply_zoom_action(action);
                     } else {
-                        state.app.handle_scroll_lines(-value / 120.0);
+                        state
+                            .app
+                            .handle_scroll_lines(-value / WAYLAND_SCROLL_DISCRETE_FACTOR);
                         state.frame_ready = true;
                     }
                 }
