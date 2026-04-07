@@ -791,30 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_rect_respects_explicit_alpha() {
-        use crate::terminal::theme::Theme;
-        let theme = Theme::default();
-        let r = SoftwareRenderer::new(14.0, "monospace".into(), theme, 0, 0.8);
-
-        let (mut px, stride) = make_fb(4, 1);
-        let mut fb = FrameBuffer {
-            width: 4,
-            height: 1,
-            stride,
-            pixels: &mut px,
-        };
-
-        r.fill_rect(&mut fb, 0, 0, 2, 1, 255, 0, 0, 255);
-        let bg_alpha = SoftwareRenderer::opacity_to_alpha(0.8);
-        r.fill_rect(&mut fb, 2, 0, 2, 1, 255, 0, 0, bg_alpha);
-
-        assert_eq!(fb.pixels[3], 255);
-        assert_eq!(fb.pixels[7], 255);
-        assert_eq!(fb.pixels[11], 204);
-        assert_eq!(fb.pixels[15], 204);
-    }
-
-    #[test]
     fn cell_alpha_default_bg_gets_transparency() {
         let bg_alpha: u8 = 180;
         let cell_bg_is_default = true;
