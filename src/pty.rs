@@ -181,14 +181,29 @@ impl Pty {
         }
     }
 
-    /// Write to the PTY.
+    /// Write the full buffer to the PTY or return an error.
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
-        loop {
-            // SAFETY: buf is a valid slice; write reads at most buf.len() bytes.
+        let mut written = 0;
+
+        while written < buf.len() {
+            // SAFETY: buf[written..] is a valid slice; write reads at most the remaining bytes.
             // The fd is the PTY master owned by self.
-            let n = unsafe { libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-            if n >= 0 {
-                return Ok(n as usize);
+            let n = unsafe {
+                libc::write(
+                    self.master.as_raw_fd(),
+                    buf[written..].as_ptr().cast(),
+                    buf.len() - written,
+                )
+            };
+            if n > 0 {
+                written += n as usize;
+                continue;
+            }
+            if n == 0 {
+                return Err(Box::new(PtyError(format!(
+                    "write failed after writing {written} of {} bytes: write returned 0",
+                    buf.len()
+                ))));
             }
 
             // SAFETY: __errno_location returns a valid pointer to the thread-local errno.
@@ -196,11 +211,49 @@ impl Pty {
             if errno == libc::EINTR {
                 continue;
             }
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                let mut pollfd = libc::pollfd {
+                    fd: self.master.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+
+                loop {
+                    let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                    if rc > 0 {
+                        if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                            return Err(Box::new(PtyError(format!(
+                                "write failed after writing {written} of {} bytes: poll returned revents=0x{:x}",
+                                buf.len(),
+                                pollfd.revents
+                            ))));
+                        }
+                        break;
+                    }
+                    if rc == 0 {
+                        continue;
+                    }
+
+                    let poll_errno = unsafe { *libc::__errno_location() };
+                    if poll_errno == libc::EINTR {
+                        continue;
+                    }
+                    return Err(Box::new(PtyError(format!(
+                        "write failed after writing {written} of {} bytes: {}",
+                        buf.len(),
+                        std::io::Error::from_raw_os_error(poll_errno)
+                    ))));
+                }
+                continue;
+            }
             return Err(Box::new(PtyError(format!(
-                "write failed: {}",
+                "write failed after writing {written} of {} bytes: {}",
+                buf.len(),
                 std::io::Error::from_raw_os_error(errno)
             ))));
         }
+
+        Ok(written)
     }
 
     /// Resize the PTY.
@@ -268,5 +321,72 @@ impl Drop for Pty {
         unsafe {
             libc::kill(-self.child_pid, libc::SIGHUP);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn write_retries_after_partial_write_until_full_buffer_written() {
+        use std::thread;
+        use std::time::Duration;
+
+        let (mut sink, peer) = UnixStream::pair().unwrap();
+        let mut reader = sink.try_clone().unwrap();
+        let reader_for_thread = sink.try_clone().unwrap();
+
+        let write_end = unsafe { OwnedFd::from_raw_fd(peer.into_raw_fd()) };
+        unsafe {
+            let flags = libc::fcntl(write_end.as_raw_fd(), libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(
+                libc::fcntl(write_end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0
+            );
+        }
+
+        let reader_thread = thread::spawn(move || {
+            let requested = 1 << 20;
+            let mut reader = reader_for_thread;
+            let mut drain = vec![0u8; requested];
+            let mut read_total = 0;
+
+            while read_total < requested {
+                let n = reader.read(&mut drain[read_total..]).unwrap();
+                assert!(n > 0);
+                read_total += n;
+                if read_total < requested {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+
+            drain
+        });
+
+        let pty = Pty {
+            master: write_end,
+            child_pid: 0,
+        };
+
+        let requested = 1 << 20;
+        let buf = vec![b'x'; requested];
+
+        sink.write_all(&vec![b'y'; 1 << 20]).unwrap();
+
+        thread::sleep(Duration::from_millis(10));
+        let mut tmp = vec![0u8; 1 << 20];
+        let _ = reader.read(&mut tmp).unwrap();
+
+        let written = pty.write(&buf).unwrap();
+        assert_eq!(written, requested);
+
+        let drain = reader_thread.join().unwrap();
+        assert_eq!(drain.len(), requested);
+        assert_eq!(drain, vec![b'x'; requested]);
     }
 }
