@@ -79,6 +79,10 @@ impl SoftwareRenderer {
         self.scale
     }
 
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     pub fn set_scale(&mut self, scale: f32) {
         let scale = scale.max(1.0);
         if (self.scale - scale).abs() < FLOAT_CHANGE_EPSILON {

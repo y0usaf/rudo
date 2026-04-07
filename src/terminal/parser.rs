@@ -37,6 +37,51 @@ fn parse_extended_color(params: &[u16], theme: &Theme) -> (PackedColor, ColorSou
     }
 }
 
+fn parse_osc_color_component(component: &str) -> Option<u8> {
+    if component.is_empty() || !component.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let digits = component.len();
+    let value = u32::from_str_radix(component, 16).ok()?;
+    let max = (1u32 << (digits * 4)) - 1;
+    Some(((value * 255 + max / 2) / max) as u8)
+}
+
+fn parse_osc_color(spec: &str) -> Option<PackedColor> {
+    let spec = spec.trim();
+
+    if let Some(rgb) = spec.strip_prefix("rgb:") {
+        let mut parts = rgb.split('/');
+        let r = parse_osc_color_component(parts.next()?)?;
+        let g = parse_osc_color_component(parts.next()?)?;
+        let b = parse_osc_color_component(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(PackedColor::new(r, g, b));
+    }
+
+    let hex = spec.strip_prefix('#').unwrap_or(spec);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(PackedColor::new(r, g, b))
+}
+
+fn format_osc_color(color: PackedColor) -> String {
+    format!(
+        "rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}",
+        color.r(),
+        color.g(),
+        color.b()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Public parser
 // ---------------------------------------------------------------------------
@@ -48,6 +93,8 @@ pub struct TerminalParser {
     title: Option<String>,
     responses: Vec<Vec<u8>>,
     theme: Theme,
+    base_theme: Theme,
+    theme_changed: bool,
     mouse_state: MouseState,
     application_cursor_keys: bool,
     origin_mode: bool,
@@ -57,6 +104,7 @@ pub struct TerminalParser {
 impl TerminalParser {
     pub fn new() -> Self {
         let theme = Theme::default();
+        let base_theme = theme.clone();
         let mut default_cell = Cell::default();
         default_cell.fg = theme.foreground;
         default_cell.bg = theme.background;
@@ -66,6 +114,8 @@ impl TerminalParser {
             title: None,
             responses: Vec::new(),
             theme,
+            base_theme,
+            theme_changed: false,
             mouse_state: MouseState::new(),
             application_cursor_keys: false,
             origin_mode: false,
@@ -73,6 +123,7 @@ impl TerminalParser {
     }
 
     pub fn with_theme(theme: Theme) -> Self {
+        let base_theme = theme.clone();
         let mut default_cell = Cell::default();
         default_cell.fg = theme.foreground;
         default_cell.bg = theme.background;
@@ -82,6 +133,8 @@ impl TerminalParser {
             title: None,
             responses: Vec::new(),
             theme,
+            base_theme,
+            theme_changed: false,
             mouse_state: MouseState::new(),
             application_cursor_keys: false,
             origin_mode: false,
@@ -96,7 +149,9 @@ impl TerminalParser {
             current_attrs: &mut self.current_attrs,
             title: &mut self.title,
             responses: &mut self.responses,
-            theme: &self.theme,
+            theme: &mut self.theme,
+            base_theme: &self.base_theme,
+            theme_changed: &mut self.theme_changed,
             mouse_state: &mut self.mouse_state,
             application_cursor_keys: &mut self.application_cursor_keys,
             origin_mode: &mut self.origin_mode,
@@ -117,6 +172,10 @@ impl TerminalParser {
     /// Get a reference to the current theme.
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    pub fn take_theme_changed(&mut self) -> bool {
+        std::mem::take(&mut self.theme_changed)
     }
 
     /// Get a reference to the mouse tracking state.
@@ -140,13 +199,104 @@ struct Performer<'a> {
     current_attrs: &'a mut Cell,
     title: &'a mut Option<String>,
     responses: &'a mut Vec<Vec<u8>>,
-    theme: &'a Theme,
+    theme: &'a mut Theme,
+    base_theme: &'a Theme,
+    theme_changed: &'a mut bool,
     mouse_state: &'a mut MouseState,
     application_cursor_keys: &'a mut bool,
     origin_mode: &'a mut bool,
 }
 
 impl<'a> Performer<'a> {
+    fn sync_default_attrs_with_theme(&mut self) {
+        if self.current_attrs.fg_src == ColorSource::Default {
+            self.current_attrs.fg = self.theme.foreground;
+        }
+        if self.current_attrs.bg_src == ColorSource::Default {
+            self.current_attrs.bg = self.theme.background;
+        }
+    }
+
+    fn mark_theme_changed(&mut self) {
+        *self.theme_changed = true;
+    }
+
+    fn osc_terminator(bell_terminated: bool) -> &'static str {
+        if bell_terminated {
+            "\x07"
+        } else {
+            "\x1b\\"
+        }
+    }
+
+    fn respond_with_dynamic_color(&mut self, code: u16, color: PackedColor, bell_terminated: bool) {
+        let response = format!(
+            "\x1b]{};{}{}",
+            code,
+            format_osc_color(color),
+            Self::osc_terminator(bell_terminated)
+        );
+        self.responses.push(response.into_bytes());
+    }
+
+    fn set_dynamic_color(&mut self, code: u16, color: PackedColor) {
+        let changed = match code {
+            10 => {
+                let changed = self.theme.foreground != color;
+                self.theme.foreground = color;
+                changed
+            }
+            11 => {
+                let changed = self.theme.background != color;
+                self.theme.background = color;
+                changed
+            }
+            12 => {
+                let changed = self.theme.cursor != color;
+                self.theme.cursor = color;
+                changed
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.sync_default_attrs_with_theme();
+            self.mark_theme_changed();
+        }
+    }
+
+    fn reset_dynamic_color(&mut self, code: u16) {
+        match code {
+            110 => self.set_dynamic_color(10, self.base_theme.foreground),
+            111 => self.set_dynamic_color(11, self.base_theme.background),
+            112 => self.set_dynamic_color(12, self.base_theme.cursor),
+            _ => {}
+        }
+    }
+
+    fn query_dynamic_color(&mut self, code: u16, bell_terminated: bool) {
+        let color = match code {
+            10 => Some(self.theme.foreground),
+            11 => Some(self.theme.background),
+            12 => Some(self.theme.cursor),
+            _ => None,
+        };
+        if let Some(color) = color {
+            self.respond_with_dynamic_color(code, color, bell_terminated);
+        }
+    }
+
+    fn set_palette_color(&mut self, index: u8, color: PackedColor) {
+        if self.theme.palette(index) != color {
+            self.theme.set_palette(index, color);
+            self.mark_theme_changed();
+        }
+    }
+
+    fn reset_palette_color(&mut self, index: u8) {
+        self.set_palette_color(index, self.base_theme.palette(index));
+    }
+
     // -----------------------------------------------------------------------
     // SGR attribute handling
     // -----------------------------------------------------------------------
@@ -765,7 +915,7 @@ impl<'a> vte::Perform for Performer<'a> {
     }
 
     // ------ OSC dispatch -------------------------------------------------
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
@@ -779,11 +929,83 @@ impl<'a> vte::Perform for Performer<'a> {
             // 0: Set icon name + title, 1: Set icon name, 2: Set title
             Some(0) | Some(1) | Some(2) => {
                 if params.len() >= 2 {
-                    if let Ok(title) = std::str::from_utf8(params[1]) {
-                        *self.title = Some(title.to_string());
+                    let title = params[1..]
+                        .iter()
+                        .filter_map(|param| std::str::from_utf8(param).ok())
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    *self.title = Some(title);
+                }
+            }
+            // 4: Set/query palette color indexes.
+            Some(4) => {
+                for chunk in params[1..].chunks(2) {
+                    let Some(index_bytes) = chunk.first() else {
+                        continue;
+                    };
+                    let Some(index) = std::str::from_utf8(index_bytes)
+                        .ok()
+                        .and_then(|s| s.parse::<u8>().ok())
+                    else {
+                        continue;
+                    };
+
+                    let Some(color_bytes) = chunk.get(1) else {
+                        continue;
+                    };
+                    let Some(color_spec) = std::str::from_utf8(color_bytes).ok() else {
+                        continue;
+                    };
+
+                    if color_spec == "?" {
+                        let response = format!(
+                            "\x1b]4;{};{}{}",
+                            index,
+                            format_osc_color(self.theme.palette(index)),
+                            Self::osc_terminator(bell_terminated)
+                        );
+                        self.responses.push(response.into_bytes());
+                    } else if let Some(color) = parse_osc_color(color_spec) {
+                        self.set_palette_color(index, color);
                     }
                 }
             }
+            // 10/11/12: foreground/background/cursor dynamic colors.
+            Some(10) | Some(11) | Some(12) => {
+                let mut dynamic_code = cmd.unwrap();
+                for param in &params[1..] {
+                    let Some(spec) = std::str::from_utf8(param).ok() else {
+                        dynamic_code += 1;
+                        continue;
+                    };
+                    if spec == "?" {
+                        self.query_dynamic_color(dynamic_code, bell_terminated);
+                    } else if let Some(color) = parse_osc_color(spec) {
+                        self.set_dynamic_color(dynamic_code, color);
+                    }
+                    dynamic_code += 1;
+                }
+            }
+            // 104: reset palette indexes.
+            Some(104) => {
+                if params.len() == 1 {
+                    for index in 0u8..=255 {
+                        self.reset_palette_color(index);
+                    }
+                } else {
+                    for param in &params[1..] {
+                        let Some(index) = std::str::from_utf8(param)
+                            .ok()
+                            .and_then(|s| s.parse::<u8>().ok())
+                        else {
+                            continue;
+                        };
+                        self.reset_palette_color(index);
+                    }
+                }
+            }
+            // 110/111/112: reset dynamic foreground/background/cursor.
+            Some(110) | Some(111) | Some(112) => self.reset_dynamic_color(cmd.unwrap()),
             _ => {
                 // Unhandled OSC – ignore
             }
@@ -1205,6 +1427,64 @@ mod tests {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b]2;AnotherTitle\x07");
         assert_eq!(p.title(), Some("AnotherTitle"));
+    }
+
+    #[test]
+    fn osc_10_query_foreground() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]10;?\x07");
+        assert_eq!(
+            p.take_responses(),
+            vec![b"\x1b]10;rgb:d4d4/d4d4/d4d4\x07".to_vec()]
+        );
+    }
+
+    #[test]
+    fn osc_11_query_background() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]11;?\x07");
+        assert_eq!(
+            p.take_responses(),
+            vec![b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07".to_vec()]
+        );
+    }
+
+    #[test]
+    fn osc_4_query_palette_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]4;1;?\x07");
+        assert_eq!(
+            p.take_responses(),
+            vec![b"\x1b]4;1;rgb:cccc/0000/0000\x07".to_vec()]
+        );
+    }
+
+    #[test]
+    fn osc_10_set_and_reset_foreground() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]10;#112233\x07");
+        assert_eq!(p.theme().foreground, PackedColor::new(0x11, 0x22, 0x33));
+        assert!(p.take_theme_changed());
+
+        p.advance(&mut g, &mut d, b"\x1b]110\x07");
+        assert_eq!(p.theme().foreground, Theme::default().foreground);
+        assert!(p.take_theme_changed());
+    }
+
+    #[test]
+    fn osc_11_set_background_from_rgb_spec() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]11;rgb:11/22/33\x07");
+        assert_eq!(p.theme().background, PackedColor::new(0x11, 0x22, 0x33));
+        assert!(p.take_theme_changed());
+    }
+
+    #[test]
+    fn osc_4_set_palette_color() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]4;1;#123456\x07");
+        assert_eq!(p.theme().palette(1), PackedColor::new(0x12, 0x34, 0x56));
+        assert!(p.take_theme_changed());
     }
 
     // === DECSET / DECRST ===

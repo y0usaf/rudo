@@ -189,6 +189,9 @@ impl WaylandState {
                 toplevel.set_title(self.app.title().into());
             }
         }
+        if self.app.take_theme_changed() {
+            self.renderer.set_theme(self.app.theme().clone());
+        }
 
         let mut fb = FrameBuffer {
             width: buf.width,

@@ -43,6 +43,7 @@ pub struct CoreApp {
     cell_size: (f32, f32),
     grid_offset: (f32, f32),
     title_changed: bool,
+    theme_changed: bool,
     mouse_pressed: bool,
     mouse_button: Option<MouseButton>,
     last_mouse_pos: (f64, f64),
@@ -122,6 +123,7 @@ impl CoreApp {
             cell_size: DEFAULT_CELL_SIZE,
             grid_offset: (0.0, 0.0),
             title_changed: false,
+            theme_changed: false,
             mouse_pressed: false,
             mouse_button: None,
             last_mouse_pos: (0.0, 0.0),
@@ -202,6 +204,12 @@ impl CoreApp {
     pub fn take_title_changed(&mut self) -> bool {
         let changed = self.title_changed;
         self.title_changed = false;
+        changed
+    }
+
+    pub fn take_theme_changed(&mut self) -> bool {
+        let changed = self.theme_changed;
+        self.theme_changed = false;
         changed
     }
 
@@ -457,6 +465,11 @@ impl CoreApp {
             for resp in responses {
                 let _ = pty.write(&resp);
             }
+        }
+        if self.parser.take_theme_changed() {
+            self.theme = self.parser.theme().clone();
+            self.theme_changed = true;
+            self.needs_redraw = true;
         }
         if self.parser.title() != self.last_title.as_deref() {
             self.last_title = self.parser.title().map(str::to_string);
