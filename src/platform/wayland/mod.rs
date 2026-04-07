@@ -56,10 +56,14 @@ struct WaylandState {
     running: bool,
     configured: bool,
     frame_ready: bool,
-    /// Logical (surface-local) width from xdg_toplevel configure.
+    /// Current logical (surface-local) width that we may render/commit.
     width: u32,
-    /// Logical (surface-local) height from xdg_toplevel configure.
+    /// Current logical (surface-local) height that we may render/commit.
     height: u32,
+    /// Pending logical width from xdg_toplevel.configure.
+    pending_width: u32,
+    /// Pending logical height from xdg_toplevel.configure.
+    pending_height: u32,
     /// Current effective scale factor (≥ 1.0).
     scale: f32,
     app: CoreApp,
@@ -75,7 +79,10 @@ struct WaylandState {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     pointer_focus: bool,
+    /// Buffers eligible for the next attach.
     buffers: Vec<ShmBuffer>,
+    /// Old buffers kept alive until the compositor releases them.
+    retired_buffers: Vec<ShmBuffer>,
     xkb: Option<XkbContextData>,
     fallback_mods: Modifiers,
     repeat: RepeatState,
@@ -180,6 +187,59 @@ impl WaylandState {
         self.viewport.is_some() && self.fractional_scale.is_some()
     }
 
+    fn sync_terminal_geometry_to_window(&mut self) {
+        let (phys_w, phys_h) = self.physical_size();
+        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
+        let (ox, oy) = self.renderer.grid_offset();
+        self.app.set_grid_offset(ox, oy);
+        self.app.handle_resize(cols, rows);
+    }
+
+    fn prune_retired_buffers(&mut self) {
+        self.retired_buffers.retain(|buf| buf.busy);
+    }
+
+    fn retire_active_buffers(&mut self) {
+        let old_buffers = std::mem::take(&mut self.buffers);
+        for buf in old_buffers {
+            if buf.busy {
+                self.retired_buffers.push(buf);
+            }
+        }
+        self.prune_retired_buffers();
+    }
+
+    fn apply_pending_configure(&mut self) {
+        let mut changed = false;
+
+        if self.pending_width > 0 && self.pending_width != self.width {
+            self.width = self.pending_width;
+            changed = true;
+        }
+        if self.pending_height > 0 && self.pending_height != self.height {
+            self.height = self.pending_height;
+            changed = true;
+        }
+
+        if changed {
+            // Match foot's configure handling: only start using the new logical
+            // size after xdg_surface.configure has been acked. Also keep any
+            // busy old buffers alive until the compositor releases them.
+            self.retire_active_buffers();
+            self.sync_terminal_geometry_to_window();
+        }
+    }
+
+    fn resize_window_to_grid(&mut self, cols: usize, rows: usize) {
+        let (target_phys_w, target_phys_h) = self.renderer.window_size_for_grid(cols, rows);
+        self.width = ((target_phys_w as f32) / self.scale).round().max(1.0) as u32;
+        self.height = ((target_phys_h as f32) / self.scale).round().max(1.0) as u32;
+        self.pending_width = self.width;
+        self.pending_height = self.height;
+        self.sync_terminal_geometry_to_window();
+        self.retire_active_buffers();
+    }
+
     fn ensure_buffers(&mut self, qh: &QueueHandle<Self>) {
         let (phys_w, phys_h) = self.physical_size();
         if self.buffers.len() == BUFFER_COUNT
@@ -190,7 +250,7 @@ impl WaylandState {
         {
             return;
         }
-        self.buffers.clear();
+        self.retire_active_buffers();
         for idx in 0..BUFFER_COUNT {
             if let Some(shm) = &self.shm {
                 if let Ok(buf) = ShmBuffer::new(shm, phys_w, phys_h, qh, idx) {
@@ -198,10 +258,8 @@ impl WaylandState {
                 }
             }
         }
-        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
-        let (ox, oy) = self.renderer.grid_offset();
-        self.app.set_grid_offset(ox, oy);
-        self.app.handle_resize(cols, rows);
+        self.sync_terminal_geometry_to_window();
+        self.prune_retired_buffers();
     }
 
     fn render_frame(&mut self, qh: &QueueHandle<Self>) {
@@ -269,6 +327,8 @@ impl WaylandState {
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
+        let cols = self.app.grid().cols();
+        let rows = self.app.grid().rows();
         let step = self.app.config().font.size_adjustment.max(0.1);
         match action {
             ZoomAction::In => self.renderer.increase_font_size(step),
@@ -277,12 +337,7 @@ impl WaylandState {
         }
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
-        let (phys_w, phys_h) = self.physical_size();
-        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
-        let (ox, oy) = self.renderer.grid_offset();
-        self.app.set_grid_offset(ox, oy);
-        self.app.handle_resize(cols, rows);
-        self.buffers.clear();
+        self.resize_window_to_grid(cols, rows);
         self.frame_ready = true;
     }
 
@@ -311,26 +366,32 @@ impl WaylandState {
             return false;
         }
 
+        let cols = self.app.grid().cols();
+        let rows = self.app.grid().rows();
         info_log!("Scale changed: {:.3} -> {:.3}", self.scale, new_scale);
         self.scale = new_scale;
         self.renderer.set_scale(new_scale);
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
-        let (phys_w, phys_h) = self.physical_size();
-        let (cols, rows) = self.renderer.grid_size_for_window(phys_w, phys_h);
-        let (ox, oy) = self.renderer.grid_offset();
-        self.app.set_grid_offset(ox, oy);
-        self.app.handle_resize(cols, rows);
-        self.buffers.clear();
+        self.resize_window_to_grid(cols, rows);
         true
     }
 
     fn local_key_action_for(&self, event: &KeyEvent) -> Option<ZoomAction> {
-        if self.app.matches_local_keybinding(LocalAction::ZoomIn, event) {
+        if self
+            .app
+            .matches_local_keybinding(LocalAction::ZoomIn, event)
+        {
             Some(ZoomAction::In)
-        } else if self.app.matches_local_keybinding(LocalAction::ZoomOut, event) {
+        } else if self
+            .app
+            .matches_local_keybinding(LocalAction::ZoomOut, event)
+        {
             Some(ZoomAction::Out)
-        } else if self.app.matches_local_keybinding(LocalAction::ZoomReset, event) {
+        } else if self
+            .app
+            .matches_local_keybinding(LocalAction::ZoomReset, event)
+        {
             Some(ZoomAction::Reset)
         } else {
             None
@@ -398,23 +459,19 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         padding,
     );
     let (cw, ch) = renderer.cell_size();
-    let cell_width = cw.ceil() as u32;
-    let cell_height = ch.ceil() as u32;
+    let (fit_width, fit_height) =
+        renderer.window_size_for_grid(configured_cols as usize, configured_rows as usize);
     let initial_width = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
         && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
     {
-        configured_cols
-            .saturating_mul(cell_width)
-            .saturating_add(padding * 2)
+        fit_width
     } else {
         configured_width
     };
     let initial_height = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
         && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
     {
-        configured_rows
-            .saturating_mul(cell_height)
-            .saturating_add(padding * 2)
+        fit_height
     } else {
         configured_height
     };
@@ -430,6 +487,8 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         frame_ready: false,
         width: initial_width,
         height: initial_height,
+        pending_width: initial_width,
+        pending_height: initial_height,
         scale: 1.0,
         app,
         renderer,
@@ -445,6 +504,7 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         pointer: None,
         pointer_focus: false,
         buffers: Vec::new(),
+        retired_buffers: Vec::new(),
         xkb: None,
         fallback_mods: Modifiers::empty(),
         repeat: RepeatState::default(),

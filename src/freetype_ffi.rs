@@ -150,6 +150,8 @@ pub struct FtHandle {
     ) -> FT_Error,
     pub done_face: unsafe extern "C" fn(FT_Face) -> FT_Error,
     pub set_pixel_sizes: unsafe extern "C" fn(FT_Face, FT_UInt, FT_UInt) -> FT_Error,
+    pub set_char_size:
+        unsafe extern "C" fn(FT_Face, FT_F26Dot6, FT_F26Dot6, FT_UInt, FT_UInt) -> FT_Error,
     pub load_char: unsafe extern "C" fn(FT_Face, FT_ULong, FT_Int32) -> FT_Error,
     pub get_char_index: unsafe extern "C" fn(FT_Face, FT_ULong) -> FT_UInt,
 }
@@ -190,6 +192,7 @@ impl FtHandle {
                 new_memory_face: sym!("FT_New_Memory_Face"),
                 done_face: sym!("FT_Done_Face"),
                 set_pixel_sizes: sym!("FT_Set_Pixel_Sizes"),
+                set_char_size: sym!("FT_Set_Char_Size"),
                 load_char: sym!("FT_Load_Char"),
                 get_char_index: sym!("FT_Get_Char_Index"),
             })

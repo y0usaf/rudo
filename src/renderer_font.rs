@@ -68,10 +68,15 @@ impl FtFont {
         Ok(Self { face, _data: data })
     }
 
-    fn set_pixel_size(&self, size_px: u32) {
+    fn set_size_px(&self, size_px: f32) {
         let fth = ft::ft();
+        let size_px = size_px.max(1.0);
+        let size_26_6 = (size_px * FREETYPE_FIXED_POINT_SCALE).round() as ft::FT_F26Dot6;
         unsafe {
-            (fth.set_pixel_sizes)(self.face, 0, size_px);
+            let err = (fth.set_char_size)(self.face, 0, size_26_6, 72, 72);
+            if err != 0 {
+                (fth.set_pixel_sizes)(self.face, 0, size_px.round().max(1.0) as u32);
+            }
         }
     }
 
@@ -375,7 +380,7 @@ impl FontAtlas {
             let path = self.fallback_font_paths[self.next_fallback_font].clone();
             self.next_fallback_font += 1;
 
-            match load_font_from_path(&path, self.font_size.round() as u32) {
+            match load_font_from_path(&path, self.font_size) {
                 Ok(font) => {
                     info_log!("Fallback font: {}", path.display());
                     let has_glyph = font.has_glyph(ch);
@@ -419,7 +424,7 @@ impl FontAtlas {
     fn ensure_bold_font(&mut self) {
         if self.font_bold.is_none() {
             if let Some(path) = self.font_bold_path.clone() {
-                self.font_bold = load_optional_style_font(&path, self.font_size.round() as u32);
+                self.font_bold = load_optional_style_font(&path, self.font_size);
             }
         }
     }
@@ -427,7 +432,7 @@ impl FontAtlas {
     fn ensure_italic_font(&mut self) {
         if self.font_italic.is_none() {
             if let Some(path) = self.font_italic_path.clone() {
-                self.font_italic = load_optional_style_font(&path, self.font_size.round() as u32);
+                self.font_italic = load_optional_style_font(&path, self.font_size);
             }
         }
     }
@@ -435,8 +440,7 @@ impl FontAtlas {
     fn ensure_bold_italic_font(&mut self) {
         if self.font_bold_italic.is_none() {
             if let Some(path) = self.font_bold_italic_path.clone() {
-                self.font_bold_italic =
-                    load_optional_style_font(&path, self.font_size.round() as u32);
+                self.font_bold_italic = load_optional_style_font(&path, self.font_size);
             }
         }
     }
@@ -823,8 +827,7 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
 }
 
 fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
-    let px = font_size.round() as u32;
-    load_font_from_path(&font_plan.regular, px).unwrap_or_else(|e| {
+    load_font_from_path(&font_plan.regular, font_size).unwrap_or_else(|e| {
         error_log!(
             "Failed to load primary font {}: {}",
             font_plan.regular.display(),
@@ -834,7 +837,7 @@ fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
     })
 }
 
-fn load_optional_style_font(path: &Path, size_px: u32) -> Option<FtFont> {
+fn load_optional_style_font(path: &Path, size_px: f32) -> Option<FtFont> {
     match load_font_from_path(path, size_px) {
         Ok(font) => Some(font),
         Err(e) => {
@@ -844,12 +847,12 @@ fn load_optional_style_font(path: &Path, size_px: u32) -> Option<FtFont> {
     }
 }
 
-fn load_font_from_path(path: &Path, size_px: u32) -> Result<FtFont, String> {
+fn load_font_from_path(path: &Path, size_px: f32) -> Result<FtFont, String> {
     let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let lib = ft_library();
     let font =
         FtFont::from_bytes(lib, bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    font.set_pixel_size(size_px);
+    font.set_size_px(size_px);
     Ok(font)
 }
 
@@ -860,16 +863,16 @@ fn compute_cell_width(font: &FtFont, _font_size: f32) -> f32 {
         let (bw, _, _, _, advance, _) = font.rasterize(ch);
         width = width.max(advance.max(bw as f32));
     }
-    width.ceil().max(1.0)
+    width.max(1.0)
 }
 
 fn compute_cell_height(font: &FtFont) -> f32 {
     let (asc, desc, line_height) = font.line_metrics();
     let from_metrics = line_height.max(asc - desc);
     if from_metrics > 0.0 {
-        from_metrics.ceil().max(1.0)
+        from_metrics.max(1.0)
     } else {
         let (_, bh, _, _, _, _) = font.rasterize('M');
-        (bh as f32).ceil().max(1.0)
+        (bh as f32).max(1.0)
     }
 }

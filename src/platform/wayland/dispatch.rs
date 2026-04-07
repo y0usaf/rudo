@@ -224,15 +224,41 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
 impl Dispatch<wl_buffer::WlBuffer, usize> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &wl_buffer::WlBuffer,
+        released_buffer: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
-        idx: &usize,
+        _idx: &usize,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
-            if let Some(buf) = state.buffers.get_mut(*idx) {
+            // Match strictly by wl_buffer object. Buffer slots are recreated on
+            // resize/scale changes, and old release events can arrive after a
+            // new generation has reused the same logical slot index.
+            let mut released = false;
+
+            if let Some(buf) = state
+                .buffers
+                .iter_mut()
+                .find(|buf| buf.buffer == *released_buffer)
+            {
                 buf.busy = false;
+                released = true;
+            }
+
+            if !released {
+                if let Some(buf) = state
+                    .retired_buffers
+                    .iter_mut()
+                    .find(|buf| buf.buffer == *released_buffer)
+                {
+                    buf.busy = false;
+                    released = true;
+                }
+            }
+
+            if released {
+                state.prune_retired_buffers();
+                state.frame_ready = true;
             }
         }
     }
@@ -263,8 +289,13 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
+            // Like foot, only apply the pending toplevel configure after we've
+            // acked the matching xdg_surface.configure. Rendering/attaching a
+            // buffer for the new logical size before that can trip protocol
+            // errors during fast fullscreen/resize transitions.
             xdg_surface.ack_configure(serial);
             state.configured = true;
+            state.apply_pending_configure();
             state.frame_ready = true;
         }
     }
@@ -283,10 +314,10 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
             xdg_toplevel::Event::Close => state.running = false,
             xdg_toplevel::Event::Configure { width, height, .. } => {
                 if width > 0 {
-                    state.width = width as u32;
+                    state.pending_width = width as u32;
                 }
                 if height > 0 {
-                    state.height = height as u32;
+                    state.pending_height = height as u32;
                 }
             }
             _ => {}
