@@ -15,7 +15,9 @@ use crate::defaults::{
     APP_NAME, DEFAULT_ANSI_HEX, DEFAULT_BACKGROUND_HEX, DEFAULT_CURSOR_HEX, DEFAULT_FOREGROUND_HEX,
     DEFAULT_SELECTION_HEX, THEME_ENV_VAR, THEME_FILE_NAME,
 };
+use crate::info_log;
 use crate::toml_parser::TomlTable;
+use crate::warn_log;
 
 const COLOR_CUBE_START: usize = 16;
 const COLOR_CUBE_SIDE: usize = 6;
@@ -180,15 +182,15 @@ impl Theme {
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match ThemeFile::parse(&contents) {
                     Some(tf) => {
-                        eprintln!("[INFO] Loaded theme from {}", path.display());
+                        info_log!("Loaded theme from {}", path.display());
                         return Some(Self::from_theme_file(&tf));
                     }
                     None => {
-                        eprintln!("[WARN] Failed to parse theme file {}", path.display());
+                        warn_log!("Failed to parse theme file {}", path.display());
                     }
                 },
                 Err(e) => {
-                    eprintln!("[WARN] Failed to read theme file {}: {}", path.display(), e);
+                    warn_log!("Failed to read theme file {}: {}", path.display(), e);
                 }
             }
         }

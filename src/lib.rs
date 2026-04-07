@@ -6,6 +6,7 @@ pub(crate) mod defaults;
 pub(crate) mod font;
 pub(crate) mod freetype_ffi;
 pub(crate) mod input;
+pub(crate) mod logging;
 pub(crate) mod platform;
 pub(crate) mod pty;
 pub(crate) mod renderer_font;
@@ -18,7 +19,7 @@ pub(crate) mod xkb_ffi;
 /// the Wayland event loop. This is the only public API surface.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::CliArgs::parse();
-    eprintln!("[INFO] {} starting (Wayland)...", defaults::APP_NAME);
+    info_log!("{} starting (Wayland)...", defaults::APP_NAME);
     pty::install_sigchld_reaper();
     platform::wayland::run(cli)
 }
