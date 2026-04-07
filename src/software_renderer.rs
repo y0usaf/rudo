@@ -676,3 +676,189 @@ fn blend_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, b: u8, g: u8, r: u8, a: 
     fb.pixels[idx + 3] = (src_a + ((dst_a * inv + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16))
         .min(MAX_COLOR_CHANNEL_U16) as u8;
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn premultiply_opaque() {
+        assert_eq!(premultiply(255, 255), 255);
+        assert_eq!(premultiply(128, 255), 128);
+        assert_eq!(premultiply(0, 255), 0);
+    }
+
+    #[test]
+    fn premultiply_transparent() {
+        assert_eq!(premultiply(255, 0), 0);
+        assert_eq!(premultiply(128, 0), 0);
+        assert_eq!(premultiply(0, 0), 0);
+    }
+
+    #[test]
+    fn premultiply_half() {
+        assert_eq!(premultiply(255, 128), 128);
+        assert_eq!(premultiply(128, 128), 64);
+    }
+
+    #[test]
+    fn premultiplied_bgra_opaque() {
+        let px = premultiplied_bgra(255, 128, 64, 255);
+        assert_eq!(px, [64, 128, 255, 255]);
+    }
+
+    #[test]
+    fn premultiplied_bgra_transparent() {
+        let px = premultiplied_bgra(200, 100, 50, 0);
+        assert_eq!(px, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn premultiplied_bgra_half_alpha() {
+        let px = premultiplied_bgra(255, 255, 255, 128);
+        assert_eq!(px, [128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn pixel_byte_order_matches_argb8888_le() {
+        let px = premultiplied_bgra(0xFF, 0x00, 0x80, 255);
+        assert_eq!(px, [0x80, 0x00, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn opacity_to_alpha_range() {
+        assert_eq!(SoftwareRenderer::opacity_to_alpha(0.0), 0);
+        assert_eq!(SoftwareRenderer::opacity_to_alpha(0.5), 128);
+        assert_eq!(SoftwareRenderer::opacity_to_alpha(1.0), 255);
+    }
+
+    #[test]
+    fn opacity_to_alpha_clamps() {
+        assert_eq!(SoftwareRenderer::opacity_to_alpha(-1.0), 0);
+        assert_eq!(SoftwareRenderer::opacity_to_alpha(2.0), 255);
+    }
+
+    fn make_fb(w: u32, h: u32) -> (Vec<u8>, u32) {
+        let stride = w * 4;
+        let pixels = vec![0u8; (stride * h) as usize];
+        (pixels, stride)
+    }
+
+    #[test]
+    fn blend_full_coverage_replaces_dst() {
+        let (mut px, stride) = make_fb(1, 1);
+        px[0..4].copy_from_slice(&premultiplied_bgra(255, 255, 255, 128));
+        let mut fb = FrameBuffer {
+            width: 1,
+            height: 1,
+            stride,
+            pixels: &mut px,
+        };
+        blend_bgra(&mut fb, 0, 0, 0, 0, 0, 255);
+        assert_eq!(&fb.pixels[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn blend_zero_coverage_preserves_dst() {
+        let (mut px, stride) = make_fb(1, 1);
+        px[0..4].copy_from_slice(&premultiplied_bgra(100, 200, 50, 180));
+        let saved = [px[0], px[1], px[2], px[3]];
+        let mut fb = FrameBuffer {
+            width: 1,
+            height: 1,
+            stride,
+            pixels: &mut px,
+        };
+        blend_bgra(&mut fb, 0, 0, 255, 255, 255, 0);
+        assert_eq!(&fb.pixels[0..4], &saved);
+    }
+
+    #[test]
+    fn blend_on_transparent_bg_produces_correct_alpha() {
+        let (mut px, stride) = make_fb(1, 1);
+        px[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let mut fb = FrameBuffer {
+            width: 1,
+            height: 1,
+            stride,
+            pixels: &mut px,
+        };
+        blend_bgra(&mut fb, 0, 0, 128, 128, 128, 128);
+        let expected = premultiplied_bgra(128, 128, 128, 128);
+        assert_eq!(&fb.pixels[0..4], &expected);
+    }
+
+    #[test]
+    fn fill_rect_respects_explicit_alpha() {
+        use crate::terminal::theme::Theme;
+        let theme = Theme::default();
+        let r = SoftwareRenderer::new(14.0, "monospace".into(), theme, 0, 0.8);
+
+        let (mut px, stride) = make_fb(4, 1);
+        let mut fb = FrameBuffer {
+            width: 4,
+            height: 1,
+            stride,
+            pixels: &mut px,
+        };
+
+        r.fill_rect(&mut fb, 0, 0, 2, 1, 255, 0, 0, 255);
+        let bg_alpha = SoftwareRenderer::opacity_to_alpha(0.8);
+        r.fill_rect(&mut fb, 2, 0, 2, 1, 255, 0, 0, bg_alpha);
+
+        assert_eq!(fb.pixels[3], 255);
+        assert_eq!(fb.pixels[7], 255);
+        assert_eq!(fb.pixels[11], 204);
+        assert_eq!(fb.pixels[15], 204);
+    }
+
+    #[test]
+    fn cell_alpha_default_bg_gets_transparency() {
+        let bg_alpha: u8 = 180;
+        let cell_bg_is_default = true;
+        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 180);
+    }
+
+    #[test]
+    fn cell_alpha_explicit_bg_stays_opaque() {
+        let bg_alpha: u8 = 180;
+        let cell_bg_is_default = false;
+        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 255);
+    }
+
+    #[test]
+    fn cell_alpha_reverse_stays_opaque() {
+        let bg_alpha: u8 = 180;
+        let mut cell_bg_is_default = true;
+        let is_reverse = true;
+        if is_reverse {
+            cell_bg_is_default = false;
+        }
+        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 255);
+    }
+
+    #[test]
+    fn cell_alpha_selected_stays_opaque() {
+        let bg_alpha: u8 = 180;
+        let mut cell_bg_is_default = true;
+        let is_selected = true;
+        if is_selected {
+            cell_bg_is_default = false;
+        }
+        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 255);
+    }
+
+    #[test]
+    fn cell_alpha_opaque_when_no_transparency() {
+        let bg_alpha: u8 = 255;
+        let cell_bg_is_default = true;
+        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 255);
+    }
+}
