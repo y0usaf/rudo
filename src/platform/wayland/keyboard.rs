@@ -79,7 +79,7 @@ impl XkbContextData {
         // SAFETY: context is a valid xkb_context (NonNull). ptr points to
         // the keymap string buffer with s.len() bytes. Format and flags are
         // valid XKB constants.
-        let keymap = NonNull::new(unsafe {
+        let keymap = match NonNull::new(unsafe {
             (xkbh.xkb_keymap_new_from_buffer)(
                 context.as_ptr(),
                 ptr,
@@ -87,10 +87,33 @@ impl XkbContextData {
                 xkb::XKB_KEYMAP_FORMAT_TEXT_V1,
                 xkb::XKB_KEYMAP_COMPILE_NO_FLAGS,
             )
-        })?;
+        }) {
+            Some(keymap) => keymap,
+            None => {
+                // SAFETY: context is a valid xkb_context created above and has
+                // not yet been transferred into Self, so it must be unref'd on
+                // this early return path.
+                unsafe {
+                    (xkbh.xkb_context_unref)(context.as_ptr());
+                }
+                return None;
+            }
+        };
         // SAFETY: keymap is a valid xkb_keymap (NonNull). Returns null on
         // failure, which NonNull::new handles.
-        let state = NonNull::new(unsafe { (xkbh.xkb_state_new)(keymap.as_ptr()) })?;
+        let state = match NonNull::new(unsafe { (xkbh.xkb_state_new)(keymap.as_ptr()) }) {
+            Some(state) => state,
+            None => {
+                // SAFETY: keymap and context are valid XKB objects created
+                // above and not yet owned by Self, so both must be unref'd on
+                // this early return path.
+                unsafe {
+                    (xkbh.xkb_keymap_unref)(keymap.as_ptr());
+                    (xkbh.xkb_context_unref)(context.as_ptr());
+                }
+                return None;
+            }
+        };
         Some(Self {
             context,
             keymap,

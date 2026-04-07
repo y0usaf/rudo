@@ -2,6 +2,7 @@ mod dispatch;
 mod keyboard;
 mod shm;
 
+use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -239,14 +240,15 @@ impl WaylandState {
         }
     }
 
-    fn resize_window_to_grid(&mut self, cols: usize, rows: usize) {
-        let (target_phys_w, target_phys_h) = self.renderer.window_size_for_grid(cols, rows);
-        self.width = ((target_phys_w as f32) / self.scale).round().max(1.0) as u32;
-        self.height = ((target_phys_h as f32) / self.scale).round().max(1.0) as u32;
-        self.pending_width = self.width;
-        self.pending_height = self.height;
+    fn refresh_terminal_layout_after_metrics_change(&mut self) {
+        // Keep the compositor-provided logical window size unchanged.
+        // Font/scale changes should reflow the terminal within the existing
+        // container instead of resizing the toplevel itself.
         self.sync_terminal_geometry_to_window();
-        self.retire_active_buffers();
+        self.app.damage_mut().mark_all();
+        self.last_presented_buffer = None;
+        self.last_cursor_rows = None;
+        self.last_cursor_corners = None;
     }
 
     fn ensure_buffers(&mut self, qh: &QueueHandle<Self>) {
@@ -459,8 +461,6 @@ impl WaylandState {
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
-        let cols = self.app.grid().cols();
-        let rows = self.app.grid().rows();
         let step = self.app.config().font.size_adjustment.max(0.1);
         match action {
             ZoomAction::In => self.renderer.increase_font_size(step),
@@ -469,7 +469,7 @@ impl WaylandState {
         }
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
-        self.resize_window_to_grid(cols, rows);
+        self.refresh_terminal_layout_after_metrics_change();
         self.frame_ready = true;
     }
 
@@ -498,14 +498,12 @@ impl WaylandState {
             return false;
         }
 
-        let cols = self.app.grid().cols();
-        let rows = self.app.grid().rows();
         info_log!("Scale changed: {:.3} -> {:.3}", self.scale, new_scale);
         self.scale = new_scale;
         self.renderer.set_scale(new_scale);
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
-        self.resize_window_to_grid(cols, rows);
+        self.refresh_terminal_layout_after_metrics_change();
         true
     }
 
@@ -662,7 +660,12 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        event_queue.flush()?;
+        match event_queue.flush() {
+            Ok(()) => {}
+            Err(wayland_client::backend::WaylandError::Io(err))
+                if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => return Err(Box::new(err)),
+        }
 
         let timeout_ms = state.repeat.timeout_ms();
         let pty_fd = state.app.pty_raw_fd();
@@ -693,7 +696,12 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             if rc > 0 {
                 if (pfds[0].revents & libc::POLLIN) != 0 {
-                    let _ = guard.read()?;
+                    match guard.read() {
+                        Ok(_) => {}
+                        Err(wayland_client::backend::WaylandError::Io(err))
+                            if err.kind() == ErrorKind::WouldBlock => {}
+                        Err(err) => return Err(Box::new(err)),
+                    }
                 }
                 if pty_fd.is_some()
                     && (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
