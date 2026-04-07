@@ -3,7 +3,7 @@
 
 use crate::cursor::CursorRenderer;
 use crate::font::FontAtlas;
-use crate::terminal::cell::CellFlags;
+use crate::terminal::cell::{CellFlags, ColorSource, PackedColor};
 use crate::terminal::damage::DamageTracker;
 use crate::terminal::grid::Grid;
 use crate::terminal::selection::Selection;
@@ -90,6 +90,20 @@ impl SoftwareRenderer {
 
     fn opacity_to_alpha(opacity: f32) -> u8 {
         (opacity.clamp(0.0, 1.0) * MAX_COLOR_CHANNEL).round() as u8
+    }
+
+    fn cell_uses_background_opacity(
+        bg_src: ColorSource,
+        bg: PackedColor,
+        theme_bg: PackedColor,
+        reversed: bool,
+        selected: bool,
+    ) -> bool {
+        if reversed || selected {
+            return false;
+        }
+
+        bg_src == ColorSource::Default || bg == theme_bg
     }
 
     fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
@@ -214,37 +228,42 @@ impl SoftwareRenderer {
 
             for col in 0..grid.cols() {
                 let cell = grid.view_cell(col, row);
-                let mut fg = if cell.fg_src == crate::terminal::cell::ColorSource::Default {
+                let mut fg = if cell.fg_src == ColorSource::Default {
                     self.theme.foreground
                 } else {
                     cell.fg
                 };
-                let mut bg = if cell.bg_src == crate::terminal::cell::ColorSource::Default {
+                let mut bg = if cell.bg_src == ColorSource::Default {
                     self.theme.background
                 } else {
                     cell.bg
                 };
 
-                // Track whether this cell uses the default background.
-                // Only the default background gets transparency; explicit
-                // cell backgrounds (escape-sequence colors, selection,
-                // reverse video) are always fully opaque — matching foot's
-                // ALPHA_MODE_DEFAULT behaviour.
-                let mut cell_bg_is_default =
-                    cell.bg_src == crate::terminal::cell::ColorSource::Default;
+                let reversed = cell.flags.contains(CellFlags::REVERSE);
+                let selected = selected_range
+                    .map(|(start, end)| col >= start && col <= end)
+                    .unwrap_or(false);
 
-                if cell.flags.contains(CellFlags::REVERSE) {
+                // Treat explicit backgrounds that *match* the default theme
+                // background as transparent too. Many TUIs paint the default
+                // background color explicitly, which would otherwise punch
+                // opaque holes through the window.
+                let cell_uses_bg_opacity = Self::cell_uses_background_opacity(
+                    cell.bg_src,
+                    bg,
+                    self.theme.background,
+                    reversed,
+                    selected,
+                );
+
+                if reversed {
                     std::mem::swap(&mut fg, &mut bg);
-                    cell_bg_is_default = false;
                 }
-                if let Some((start, end)) = selected_range {
-                    if col >= start && col <= end {
-                        bg = self.theme.selection;
-                        cell_bg_is_default = false;
-                    }
+                if selected {
+                    bg = self.theme.selection;
                 }
 
-                let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+                let cell_alpha = if cell_uses_bg_opacity { bg_alpha } else { 255 };
 
                 let x = ox + col as u32 * self.cell_width;
                 self.fill_rect(
@@ -793,48 +812,87 @@ mod tests {
     #[test]
     fn cell_alpha_default_bg_gets_transparency() {
         let bg_alpha: u8 = 180;
-        let cell_bg_is_default = true;
-        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Default,
+            PackedColor::new(0x1e, 0x1e, 0x1e),
+            PackedColor::new(0x1e, 0x1e, 0x1e),
+            false,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
         assert_eq!(cell_alpha, 180);
     }
 
     #[test]
-    fn cell_alpha_explicit_bg_stays_opaque() {
+    fn cell_alpha_matching_explicit_bg_gets_transparency() {
         let bg_alpha: u8 = 180;
-        let cell_bg_is_default = false;
-        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Rgb,
+            theme_bg,
+            theme_bg,
+            false,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 180);
+    }
+
+    #[test]
+    fn cell_alpha_explicit_non_matching_bg_stays_opaque() {
+        let bg_alpha: u8 = 180;
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Rgb,
+            PackedColor::new(0x26, 0x4f, 0x78),
+            PackedColor::new(0x1e, 0x1e, 0x1e),
+            false,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
         assert_eq!(cell_alpha, 255);
     }
 
     #[test]
     fn cell_alpha_reverse_stays_opaque() {
         let bg_alpha: u8 = 180;
-        let mut cell_bg_is_default = true;
-        let is_reverse = true;
-        if is_reverse {
-            cell_bg_is_default = false;
-        }
-        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Default,
+            theme_bg,
+            theme_bg,
+            true,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
         assert_eq!(cell_alpha, 255);
     }
 
     #[test]
     fn cell_alpha_selected_stays_opaque() {
         let bg_alpha: u8 = 180;
-        let mut cell_bg_is_default = true;
-        let is_selected = true;
-        if is_selected {
-            cell_bg_is_default = false;
-        }
-        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Default,
+            theme_bg,
+            theme_bg,
+            false,
+            true,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
         assert_eq!(cell_alpha, 255);
     }
 
     #[test]
     fn cell_alpha_opaque_when_no_transparency() {
         let bg_alpha: u8 = 255;
-        let cell_bg_is_default = true;
-        let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            ColorSource::Default,
+            PackedColor::new(0x1e, 0x1e, 0x1e),
+            PackedColor::new(0x1e, 0x1e, 0x1e),
+            false,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
         assert_eq!(cell_alpha, 255);
     }
 }
