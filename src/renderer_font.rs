@@ -94,14 +94,7 @@ impl FtFont {
             let h = bmp.rows;
             let advance = slot.metrics.horiAdvance as f32 / FREETYPE_FIXED_POINT_SCALE;
 
-            let mut pixels = Vec::with_capacity((w * h) as usize);
-            if !bmp.buffer.is_null() && w > 0 && h > 0 {
-                let pitch = bmp.pitch;
-                for row in 0..h {
-                    let src = bmp.buffer.offset(row as isize * pitch as isize);
-                    pixels.extend_from_slice(std::slice::from_raw_parts(src, w as usize));
-                }
-            }
+            let pixels = read_bitmap_rows(bmp.buffer, w, h, bmp.pitch);
 
             (w, h, slot.bitmap_left, slot.bitmap_top, advance, pixels)
         }
@@ -874,5 +867,53 @@ fn compute_cell_height(font: &FtFont) -> f32 {
     } else {
         let (_, bh, _, _, _, _) = font.rasterize('M');
         (bh as f32).max(1.0)
+    }
+}
+
+fn read_bitmap_rows(buffer: *const u8, width: u32, rows: u32, pitch: i32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((width * rows) as usize);
+    if buffer.is_null() || width == 0 || rows == 0 {
+        return pixels;
+    }
+
+    let abs_pitch = pitch.unsigned_abs() as usize;
+    if abs_pitch < width as usize {
+        return pixels;
+    }
+
+    unsafe {
+        if pitch < 0 {
+            for row in 0..rows {
+                let src = buffer.offset(row as isize * pitch as isize);
+                pixels.extend_from_slice(std::slice::from_raw_parts(src, width as usize));
+            }
+        } else {
+            let row_stride = abs_pitch as isize;
+            for row in 0..rows {
+                let src = buffer.offset(row as isize * row_stride);
+                pixels.extend_from_slice(std::slice::from_raw_parts(src, width as usize));
+            }
+        }
+    }
+
+    pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_bitmap_rows;
+
+    #[test]
+    fn read_bitmap_rows_handles_positive_pitch() {
+        let buffer = [1u8, 2, 3, 9, 4, 5, 6, 9];
+        let pixels = read_bitmap_rows(buffer.as_ptr(), 3, 2, 4);
+        assert_eq!(pixels, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn read_bitmap_rows_handles_negative_pitch() {
+        let buffer = [4u8, 5, 6, 9, 1, 2, 3, 9];
+        let pixels = read_bitmap_rows(buffer.as_ptr().wrapping_add(4), 3, 2, -4);
+        assert_eq!(pixels, vec![1, 2, 3, 4, 5, 6]);
     }
 }
