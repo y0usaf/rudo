@@ -8,6 +8,10 @@ use std::fmt;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const TERM_ENV_VAR: &str = "TERM";
+const COLORTERM_ENV_VAR: &str = "COLORTERM";
+const SHELL_ENV_VAR: &str = "SHELL";
+
 #[derive(Debug)]
 struct PtyError(String);
 impl fmt::Display for PtyError {
@@ -16,6 +20,13 @@ impl fmt::Display for PtyError {
     }
 }
 impl std::error::Error for PtyError {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PtySpawnConfig<'a> {
+    pub term: &'a str,
+    pub colorterm: &'a str,
+    pub shell_fallback: &'a str,
+}
 
 /// A PTY master with the child process.
 pub struct Pty {
@@ -26,7 +37,7 @@ pub struct Pty {
 #[allow(dead_code)]
 impl Pty {
     /// Spawn a new PTY with a shell process.
-    pub fn spawn(cols: u16, rows: u16) -> Result<Self> {
+    pub fn spawn(cols: u16, rows: u16, config: &PtySpawnConfig<'_>) -> Result<Self> {
         // SAFETY: posix_openpt returns a valid fd or -1. We check < 0 before use.
         let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         if master_raw < 0 {
@@ -99,15 +110,16 @@ impl Pty {
                     libc::close(slave_fd);
                 }
 
-                let term = CString::new("xterm-256color").unwrap();
-                let term_key = CString::new("TERM").unwrap();
+                let term = CString::new(config.term).unwrap();
+                let term_key = CString::new(TERM_ENV_VAR).unwrap();
                 libc::setenv(term_key.as_ptr(), term.as_ptr(), 1);
 
-                let colorterm = CString::new("truecolor").unwrap();
-                let colorterm_key = CString::new("COLORTERM").unwrap();
+                let colorterm = CString::new(config.colorterm).unwrap();
+                let colorterm_key = CString::new(COLORTERM_ENV_VAR).unwrap();
                 libc::setenv(colorterm_key.as_ptr(), colorterm.as_ptr(), 1);
 
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let shell = std::env::var(SHELL_ENV_VAR)
+                    .unwrap_or_else(|_| config.shell_fallback.to_string());
                 let shell_cstr = CString::new(shell).unwrap();
                 libc::execvp(
                     shell_cstr.as_ptr(),

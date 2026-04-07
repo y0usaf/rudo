@@ -1,5 +1,18 @@
 use crate::input::{Modifiers, MouseButton};
 
+const MOUSE_BUTTON_LEFT: u8 = 0;
+const MOUSE_BUTTON_MIDDLE: u8 = 1;
+const MOUSE_BUTTON_RIGHT: u8 = 2;
+const MOUSE_RELEASE_CODE: u8 = 3;
+const MOUSE_MOD_SHIFT: u8 = 4;
+const MOUSE_MOD_ALT: u8 = 8;
+const MOUSE_MOD_CTRL: u8 = 16;
+const MOUSE_COORD_OFFSET: u8 = 32;
+const MOUSE_MOTION_FLAG: u8 = 32;
+const MOUSE_MOVE_CODE: u8 = 35;
+const MOUSE_SCROLL_UP_CODE: u8 = 64;
+const MOUSE_SCROLL_DOWN_CODE: u8 = 65;
+
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum MouseMode {
     #[default]
@@ -29,9 +42,9 @@ impl MouseState {
 
 pub fn mouse_button_code(button: MouseButton) -> Option<u8> {
     match button {
-        MouseButton::Left => Some(0),
-        MouseButton::Middle => Some(1),
-        MouseButton::Right => Some(2),
+        MouseButton::Left => Some(MOUSE_BUTTON_LEFT),
+        MouseButton::Middle => Some(MOUSE_BUTTON_MIDDLE),
+        MouseButton::Right => Some(MOUSE_BUTTON_RIGHT),
         MouseButton::Other(_) => Option::None,
     }
 }
@@ -39,13 +52,13 @@ pub fn mouse_button_code(button: MouseButton) -> Option<u8> {
 pub fn modifier_bits(modifiers: Modifiers) -> u8 {
     let mut bits = 0u8;
     if modifiers.shift_key() {
-        bits |= 4;
+        bits |= MOUSE_MOD_SHIFT;
     }
     if modifiers.alt_key() {
-        bits |= 8;
+        bits |= MOUSE_MOD_ALT;
     }
     if modifiers.control_key() {
-        bits |= 16;
+        bits |= MOUSE_MOD_CTRL;
     }
     bits
 }
@@ -60,9 +73,9 @@ fn encode_normal(code: u8, col: u16, row: u16) -> Vec<u8> {
         b'\x1b',
         b'[',
         b'M',
-        code.wrapping_add(32),
-        (col + 1 + 32) as u8,
-        (row + 1 + 32) as u8,
+        code.wrapping_add(MOUSE_COORD_OFFSET),
+        (col + 1 + MOUSE_COORD_OFFSET as u16) as u8,
+        (row + 1 + MOUSE_COORD_OFFSET as u16) as u8,
     ]
 }
 
@@ -98,7 +111,7 @@ pub fn encode_mouse_release(
         let code = button_code | modifiers_bits;
         Some(encode_sgr(code, col, row, false))
     } else {
-        Some(encode_normal(3, col, row))
+        Some(encode_normal(MOUSE_RELEASE_CODE, col, row))
     }
 }
 
@@ -113,7 +126,7 @@ pub fn encode_mouse_drag(
         MouseMode::Drag | MouseMode::Motion => {}
         _ => return Option::None,
     }
-    let code = button_code | 32 | modifiers_bits;
+    let code = button_code | MOUSE_MOTION_FLAG | modifiers_bits;
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
@@ -130,7 +143,7 @@ pub fn encode_mouse_move(
     if state.mode != MouseMode::Motion {
         return Option::None;
     }
-    let code = 35 | modifiers_bits;
+    let code = MOUSE_MOVE_CODE | modifiers_bits;
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
@@ -148,7 +161,11 @@ pub fn encode_mouse_scroll(
     if state.mode == MouseMode::None {
         return Option::None;
     }
-    let base = if up { 64 } else { 65 };
+    let base = if up {
+        MOUSE_SCROLL_UP_CODE
+    } else {
+        MOUSE_SCROLL_DOWN_CODE
+    };
     let code = base | modifiers_bits;
     if state.sgr {
         Some(encode_sgr(code, col, row, true))

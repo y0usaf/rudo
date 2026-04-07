@@ -30,9 +30,9 @@ pub enum SelectionState {
 
 /// Represents a rectangular text selection on the terminal grid.
 pub struct Selection {
-    pub state: SelectionState,
-    pub start: GridPoint,
-    pub end: GridPoint,
+    state: SelectionState,
+    start: GridPoint,
+    end: GridPoint,
 }
 
 #[allow(dead_code)]
@@ -44,6 +44,16 @@ impl Selection {
             start: GridPoint::new(0, 0),
             end: GridPoint::new(0, 0),
         }
+    }
+
+    /// Get the current selection state.
+    pub fn state(&self) -> SelectionState {
+        self.state
+    }
+
+    /// Return a snapshot of the selection state for change detection.
+    pub fn snapshot(&self) -> (SelectionState, GridPoint, GridPoint) {
+        (self.state, self.start, self.end)
     }
 
     /// Begin a new selection at the given grid position (e.g., on mouse press).
@@ -168,7 +178,7 @@ impl Selection {
                 grid_cols.saturating_sub(1)
             };
 
-            let row_cells = &grid.row(row).cells;
+            let row_cells = grid.row(row).cells();
             let line_start = result.len();
             let mut last_non_space_len = line_start;
 

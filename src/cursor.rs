@@ -1,9 +1,26 @@
 //! Critically-damped spring cursor animation.
 //! Ported from termvide's cursor renderer.
 
+use crate::defaults::{
+    DEFAULT_CURSOR_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
+    DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_TRAIL_SIZE,
+};
+
+const CRITICAL_DAMPING_RATIO: f32 = 1.0;
+const SPRING_DAMPING_FACTOR: f32 = 4.0;
+const SPRING_SETTLE_THRESHOLD: f32 = 0.01;
+const POSITION_CHANGE_EPSILON: f32 = 0.001;
+const DESTINATION_CHANGE_EPSILON: f32 = 0.001;
+const MIN_CURSOR_HALF_SIZE: f32 = 0.02;
+const MAX_CURSOR_HALF_SIZE: f32 = 0.5;
+const SHORT_MOVE_THRESHOLD_COLS: f32 = 2.001;
+const CURSOR_CELL_CENTER: f32 = 0.5;
+const INITIAL_PREVIOUS_POSITION: f32 = -1000.0;
+const CELL_DIMENSION: f32 = 1.0;
+
 #[derive(Clone, Debug)]
-pub struct CriticallyDampedSpring {
-    pub position: f32,
+pub(crate) struct CriticallyDampedSpring {
+    position: f32,
     velocity: f32,
 }
 
@@ -23,14 +40,13 @@ impl CriticallyDampedSpring {
         if self.position == 0.0 {
             return false;
         }
-        let zeta = 1.0;
-        let omega = 4.0 / (zeta * animation_length);
+        let omega = SPRING_DAMPING_FACTOR / (CRITICAL_DAMPING_RATIO * animation_length);
         let a = self.position;
         let b = self.position * omega + self.velocity;
         let c = (-omega * dt).exp();
         self.position = (a + b * dt) * c;
         self.velocity = c * (-a * omega - b * dt * omega + b);
-        if self.position.abs() < 0.01 {
+        if self.position.abs() < SPRING_SETTLE_THRESHOLD {
             self.reset();
             false
         } else {
@@ -44,7 +60,12 @@ impl CriticallyDampedSpring {
     }
 }
 
-const STANDARD_CORNERS: [(f32, f32); 4] = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)];
+const STANDARD_CORNERS: [(f32, f32); 4] = [
+    (-CURSOR_CELL_CENTER, -CURSOR_CELL_CENTER),
+    (CURSOR_CELL_CENTER, -CURSOR_CELL_CENTER),
+    (CURSOR_CELL_CENTER, CURSOR_CELL_CENTER),
+    (-CURSOR_CELL_CENTER, CURSOR_CELL_CENTER),
+];
 const BEAM_WIDTH_CELLS: f32 = 0.12;
 const UNDERLINE_HEIGHT_CELLS: f32 = 0.16;
 
@@ -56,9 +77,9 @@ pub enum CursorShape {
 }
 
 #[derive(Clone, Debug)]
-pub struct Corner {
-    pub current_x: f32,
-    pub current_y: f32,
+pub(crate) struct Corner {
+    current_x: f32,
+    current_y: f32,
     relative_x: f32,
     relative_y: f32,
     prev_dest_x: f32,
@@ -75,8 +96,8 @@ impl Corner {
             current_y: 0.0,
             relative_x: rel_x,
             relative_y: rel_y,
-            prev_dest_x: -1000.0,
-            prev_dest_y: -1000.0,
+            prev_dest_x: INITIAL_PREVIOUS_POSITION,
+            prev_dest_y: INITIAL_PREVIOUS_POSITION,
             spring_x: CriticallyDampedSpring::new(),
             spring_y: CriticallyDampedSpring::new(),
             animation_length: 0.0,
@@ -94,7 +115,9 @@ impl Corner {
     ) -> bool {
         let dest_x = center_x + self.relative_x * cell_w;
         let dest_y = center_y + self.relative_y * cell_h;
-        if (dest_x - self.prev_dest_x).abs() > 0.001 || (dest_y - self.prev_dest_y).abs() > 0.001 {
+        if (dest_x - self.prev_dest_x).abs() > DESTINATION_CHANGE_EPSILON
+            || (dest_y - self.prev_dest_y).abs() > DESTINATION_CHANGE_EPSILON
+        {
             self.spring_x.position = dest_x - self.current_x;
             self.spring_y.position = dest_y - self.current_y;
             self.prev_dest_x = dest_x;
@@ -120,13 +143,13 @@ impl Corner {
         let dx = dest_x - self.current_x;
         let dy = dest_y - self.current_y;
         let len = (dx * dx + dy * dy).sqrt();
-        if len < 0.001 {
+        if len < POSITION_CHANGE_EPSILON {
             return 0.0;
         }
         let rx = self.relative_x;
         let ry = self.relative_y;
         let rlen = (rx * rx + ry * ry).sqrt();
-        if rlen < 0.001 {
+        if rlen < POSITION_CHANGE_EPSILON {
             return 0.0;
         }
         (dx / len) * (rx / rlen) + (dy / len) * (ry / rlen)
@@ -140,21 +163,23 @@ impl Corner {
                 self.relative_y = sy;
             }
             CursorShape::Beam => {
-                let half_width = (BEAM_WIDTH_CELLS * 0.5).clamp(0.02, 0.5);
+                let half_width = (BEAM_WIDTH_CELLS * CURSOR_CELL_CENTER)
+                    .clamp(MIN_CURSOR_HALF_SIZE, MAX_CURSOR_HALF_SIZE);
                 self.relative_x = if sx < 0.0 {
-                    -0.5
+                    -CURSOR_CELL_CENTER
                 } else {
-                    -0.5 + half_width * 2.0
+                    -CURSOR_CELL_CENTER + half_width * 2.0
                 };
                 self.relative_y = sy;
             }
             CursorShape::Underline => {
-                let half_height = (UNDERLINE_HEIGHT_CELLS * 0.5).clamp(0.02, 0.5);
+                let half_height = (UNDERLINE_HEIGHT_CELLS * CURSOR_CELL_CENTER)
+                    .clamp(MIN_CURSOR_HALF_SIZE, MAX_CURSOR_HALF_SIZE);
                 self.relative_x = sx;
                 self.relative_y = if sy < 0.0 {
-                    0.5 - half_height * 2.0
+                    CURSOR_CELL_CENTER - half_height * 2.0
                 } else {
-                    0.5
+                    CURSOR_CELL_CENTER
                 };
             }
         }
@@ -162,25 +187,27 @@ impl Corner {
 }
 
 #[derive(Clone, Debug)]
-pub struct CursorSettings {
-    pub animation_length: f32,
-    pub short_animation_length: f32,
-    pub trail_size: f32,
+pub(crate) struct CursorSettings {
+    animation_length: f32,
+    short_animation_length: f32,
+    trail_size: f32,
+    blink_interval: f32,
 }
 
 impl Default for CursorSettings {
     fn default() -> Self {
         Self {
-            animation_length: 0.150,
-            short_animation_length: 0.04,
-            trail_size: 1.0,
+            animation_length: DEFAULT_CURSOR_ANIMATION_LENGTH_SECS,
+            short_animation_length: DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS,
+            trail_size: DEFAULT_CURSOR_TRAIL_SIZE,
+            blink_interval: DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
         }
     }
 }
 
 pub struct CursorRenderer {
-    pub corners: [Corner; 4],
-    pub shape: CursorShape,
+    corners: [Corner; 4],
+    pub(crate) shape: CursorShape,
     settings: CursorSettings,
     prev_col: f32,
     prev_row: f32,
@@ -221,6 +248,10 @@ impl CursorRenderer {
         self.settings.animation_length = animation_length.max(0.0);
     }
 
+    pub fn set_short_animation_length(&mut self, animation_length: f32) {
+        self.settings.short_animation_length = animation_length.max(0.0);
+    }
+
     pub fn set_trail_size(&mut self, trail_size: f32) {
         self.settings.trail_size = trail_size;
     }
@@ -231,13 +262,19 @@ impl CursorRenderer {
         self.blink_timer = 0.0;
     }
 
+    pub fn set_blink_interval(&mut self, blink_interval: f32) {
+        self.settings.blink_interval = blink_interval.max(0.0);
+        self.blink_timer = 0.0;
+    }
+
     pub fn is_visible(&self) -> bool {
         !self.blink_enabled || self.blink_on
     }
 
     pub fn animate(&mut self, cursor_pos: (f32, f32), dt: f32) -> bool {
         let (col, row) = cursor_pos;
-        let moved = (col - self.prev_col).abs() > 0.001 || (row - self.prev_row).abs() > 0.001;
+        let moved = (col - self.prev_col).abs() > POSITION_CHANGE_EPSILON
+            || (row - self.prev_row).abs() > POSITION_CHANGE_EPSILON;
         if moved {
             self.jumped = true;
             self.blink_on = true;
@@ -245,35 +282,55 @@ impl CursorRenderer {
         }
         if self.blink_enabled {
             self.blink_timer += dt.max(0.0);
-            while self.blink_timer >= 0.6 {
-                self.blink_timer -= 0.6;
+            while self.settings.blink_interval > 0.0
+                && self.blink_timer >= self.settings.blink_interval
+            {
+                self.blink_timer -= self.settings.blink_interval;
                 self.blink_on = !self.blink_on;
             }
         } else {
             self.blink_on = true;
             self.blink_timer = 0.0;
         }
-        let cell_w = 1.0;
-        let cell_h = 1.0;
-        let center_x = col + 0.5;
-        let center_y = row + 0.5;
+        let center_x = col + CURSOR_CELL_CENTER;
+        let center_y = row + CURSOR_CELL_CENTER;
         if self.jumped {
             let mut alignments: [(usize, f32); 4] = [
                 (
                     0,
-                    self.corners[0].direction_alignment(center_x, center_y, cell_w, cell_h),
+                    self.corners[0].direction_alignment(
+                        center_x,
+                        center_y,
+                        CELL_DIMENSION,
+                        CELL_DIMENSION,
+                    ),
                 ),
                 (
                     1,
-                    self.corners[1].direction_alignment(center_x, center_y, cell_w, cell_h),
+                    self.corners[1].direction_alignment(
+                        center_x,
+                        center_y,
+                        CELL_DIMENSION,
+                        CELL_DIMENSION,
+                    ),
                 ),
                 (
                     2,
-                    self.corners[2].direction_alignment(center_x, center_y, cell_w, cell_h),
+                    self.corners[2].direction_alignment(
+                        center_x,
+                        center_y,
+                        CELL_DIMENSION,
+                        CELL_DIMENSION,
+                    ),
                 ),
                 (
                     3,
-                    self.corners[3].direction_alignment(center_x, center_y, cell_w, cell_h),
+                    self.corners[3].direction_alignment(
+                        center_x,
+                        center_y,
+                        CELL_DIMENSION,
+                        CELL_DIMENSION,
+                    ),
                 ),
             ];
             alignments.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -281,8 +338,8 @@ impl CursorRenderer {
             for (rank, &(idx, _)) in alignments.iter().enumerate() {
                 ranks[idx] = rank;
             }
-            let is_short =
-                (col - self.prev_col).abs() <= 2.001 && (row - self.prev_row).abs() < 0.001;
+            let is_short = (col - self.prev_col).abs() <= SHORT_MOVE_THRESHOLD_COLS
+                && (row - self.prev_row).abs() < POSITION_CHANGE_EPSILON;
             for (i, corner) in self.corners.iter_mut().enumerate() {
                 corner.animation_length = if is_short {
                     self.settings
@@ -305,7 +362,14 @@ impl CursorRenderer {
         self.prev_row = row;
         let mut animating = false;
         for corner in &mut self.corners {
-            animating |= corner.update(center_x, center_y, 1.0, 1.0, dt, false);
+            animating |= corner.update(
+                center_x,
+                center_y,
+                CELL_DIMENSION,
+                CELL_DIMENSION,
+                dt,
+                false,
+            );
         }
         self.jumped = false;
         animating || self.blink_enabled

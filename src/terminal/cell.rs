@@ -1,6 +1,8 @@
 //! Compact terminal cell representation.
 //! Inspired by foot's 12-byte cell design for cache efficiency.
 
+use crate::defaults::{DEFAULT_BACKGROUND_RGB, DEFAULT_FOREGROUND_RGB};
+
 /// Cell text attributes packed into 2 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CellFlags(u16);
@@ -133,8 +135,8 @@ impl Default for Cell {
             flags: CellFlags::empty(),
             fg_src: ColorSource::Default,
             bg_src: ColorSource::Default,
-            fg: PackedColor(0xd4d4d4), // light gray
-            bg: PackedColor(0x1e1e1e), // dark
+            fg: PackedColor(DEFAULT_FOREGROUND_RGB),
+            bg: PackedColor(DEFAULT_BACKGROUND_RGB),
         }
     }
 }

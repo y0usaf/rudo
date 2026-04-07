@@ -2,13 +2,15 @@
 
 use super::cell::Cell;
 
+pub const DEFAULT_TAB_WIDTH: usize = 8;
+
 // ─── Row ─────────────────────────────────────────────────────────────────────
 
 /// A single row of terminal cells.
 #[derive(Debug, Clone)]
 pub struct Row {
-    pub cells: Vec<Cell>,
-    pub dirty: bool,
+    cells: Vec<Cell>,
+    dirty: bool,
 }
 
 impl Row {
@@ -28,6 +30,23 @@ impl Row {
     pub fn clear_with(&mut self, blank: Cell) {
         self.cells.fill(blank);
         self.dirty = true;
+    }
+
+    #[inline]
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn cells_mut(&mut self) -> &mut [Cell] {
+        &mut self.cells
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 }
 
@@ -70,7 +89,7 @@ struct SavedGrid {
 /// Terminal grid backed by a circular buffer with power-of-2 row count.
 #[allow(dead_code)]
 pub struct Grid {
-    pub cursor: CursorState,
+    cursor: CursorState,
 
     /// Circular buffer of rows. Length is always a power of 2.
     rows: Vec<Row>,
@@ -307,6 +326,36 @@ impl Grid {
     }
 
     // ── Cursor ───────────────────────────────────────────────────────────
+
+    #[inline]
+    pub fn cursor_col(&self) -> usize {
+        self.cursor.col
+    }
+
+    #[inline]
+    pub fn cursor_row(&self) -> usize {
+        self.cursor.row
+    }
+
+    #[inline]
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor.visible
+    }
+
+    #[inline]
+    pub fn set_cursor_col(&mut self, col: usize) {
+        self.cursor.col = col;
+    }
+
+    #[inline]
+    pub fn set_cursor_row(&mut self, row: usize) {
+        self.cursor.row = row;
+    }
+
+    #[inline]
+    pub fn set_cursor_visible(&mut self, visible: bool) {
+        self.cursor.visible = visible;
+    }
 
     pub fn set_cursor(&mut self, col: usize, row: usize) {
         self.cursor.col = self.clamp_col(col);

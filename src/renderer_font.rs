@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::defaults::DEFAULT_FONT_FAMILY;
 use crate::freetype_ffi as ft;
 
 /// Information about a rasterized glyph's position in the atlas and its metrics.
@@ -23,6 +24,26 @@ const ATLAS_HEIGHT: u32 = 1024;
 const ASCII_RANGE: usize = 95;
 const ASCII_STYLES: usize = 4;
 const ASCII_CACHE_LEN: usize = ASCII_RANGE * ASCII_STYLES;
+const FREETYPE_FIXED_POINT_SCALE: f32 = 64.0;
+const FALLBACK_BASELINE_RATIO: f32 = 0.8;
+const FONT_EXTENSIONS: [&str; 3] = ["ttf", "otf", "ttc"];
+const HOME_ENV_VAR: &str = "HOME";
+const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
+const XDG_DATA_DIRS_ENV_VAR: &str = "XDG_DATA_DIRS";
+const NIX_PROFILES_ENV_VAR: &str = "NIX_PROFILES";
+const USER_FONT_SUBDIR: &str = ".local/share/fonts";
+const USER_NERD_FONT_SUBDIR: &str = ".nerd-fonts";
+const SHARE_FONTS_SUBDIR: &str = "share/fonts";
+const NIXOS_SYSTEM_FONT_DIR: &str = "/run/current-system/sw/share/fonts";
+
+#[cfg(target_os = "linux")]
+const SYSTEM_FONT_DIRS: &[&str] = &["/usr/share/fonts"];
+
+#[cfg(target_os = "freebsd")]
+const SYSTEM_FONT_DIRS: &[&str] = &["/usr/local/share/fonts", "/usr/share/fonts"];
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+const SYSTEM_FONT_DIRS: &[&str] = &[];
 
 #[inline]
 fn ascii_cache_idx(ch: u8, bold: bool, italic: bool) -> usize {
@@ -72,7 +93,7 @@ impl FtFont {
             let bmp = &slot.bitmap;
             let w = bmp.width;
             let h = bmp.rows;
-            let advance = slot.metrics.horiAdvance as f32 / 64.0;
+            let advance = slot.metrics.horiAdvance as f32 / FREETYPE_FIXED_POINT_SCALE;
 
             let mut pixels = Vec::with_capacity((w * h) as usize);
             if !bmp.buffer.is_null() && w > 0 && h > 0 {
@@ -96,9 +117,9 @@ impl FtFont {
     fn line_metrics(&self) -> (f32, f32, f32) {
         unsafe {
             let sm = &(*(*self.face).size).metrics;
-            let asc = sm.ascender as f32 / 64.0;
-            let desc = sm.descender as f32 / 64.0;
-            let height = sm.height as f32 / 64.0;
+            let asc = sm.ascender as f32 / FREETYPE_FIXED_POINT_SCALE;
+            let desc = sm.descender as f32 / FREETYPE_FIXED_POINT_SCALE;
+            let height = sm.height as f32 / FREETYPE_FIXED_POINT_SCALE;
             (asc, desc, height)
         }
     }
@@ -164,11 +185,11 @@ enum FontStyle {
 }
 
 impl FontAtlas {
-    pub fn new(font_size: f32) -> Self {
+    pub fn new(font_size: f32, preferred_family: &str) -> Self {
         let search_roots = build_search_roots();
         let font_files = collect_font_files(&search_roots);
         let (font_regular, font_bold, font_italic, font_bold_italic) =
-            load_fonts(&font_files, font_size);
+            load_fonts(&font_files, font_size, preferred_family);
         let fallback_fonts = load_fallback_fonts(&font_files, font_size);
         if !fallback_fonts.is_empty() {
             eprintln!(
@@ -223,7 +244,7 @@ impl FontAtlas {
         if asc > 0.0 {
             asc
         } else {
-            self.cell_height * 0.8
+            self.cell_height * FALLBACK_BASELINE_RATIO
         }
     }
 
@@ -374,52 +395,62 @@ impl FontAtlas {
 
 // ── Font loading helpers ─────────────────────────────────────────────────────
 
-fn build_search_roots() -> Vec<std::path::PathBuf> {
-    let mut roots = vec![std::path::PathBuf::from("/usr/share/fonts")];
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut local = std::path::PathBuf::from(&home);
-        local.push(".local/share/fonts");
-        roots.push(local);
-        let mut nerd = std::path::PathBuf::from(&home);
-        nerd.push(".nerd-fonts");
-        roots.push(nerd);
+fn build_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for dir in SYSTEM_FONT_DIRS {
+        push_unique_path(&mut roots, PathBuf::from(dir));
     }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+
+    if let Some(home) = std::env::var_os(HOME_ENV_VAR) {
+        let mut local = PathBuf::from(&home);
+        local.push(USER_FONT_SUBDIR);
+        push_unique_path(&mut roots, local);
+
+        let mut nerd = PathBuf::from(&home);
+        nerd.push(USER_NERD_FONT_SUBDIR);
+        push_unique_path(&mut roots, nerd);
+    }
+
+    if let Ok(xdg) = std::env::var(XDG_DATA_HOME_ENV_VAR) {
         if !xdg.is_empty() {
-            roots.push(std::path::PathBuf::from(&xdg).join("fonts"));
+            push_unique_path(&mut roots, PathBuf::from(&xdg).join("fonts"));
         }
     }
-    if let Ok(entries) = std::fs::read_dir("/nix/store") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if name.contains("dejavu")
-                    || name.contains("font")
-                    || name.contains("liberation")
-                    || name.contains("jetbrains")
-                    || name.contains("fira")
-                    || name.contains("nerd")
-                    || name.contains("symbol")
-                    || name.contains("noto")
-                    || name.contains("awesome")
-                    || name.contains("powerline")
-                {
-                    roots.push(path);
-                }
-            }
+
+    if let Ok(xdg_dirs) = std::env::var(XDG_DATA_DIRS_ENV_VAR) {
+        for dir in xdg_dirs.split(':').filter(|dir| !dir.is_empty()) {
+            push_unique_path(&mut roots, PathBuf::from(dir).join("fonts"));
         }
     }
-    roots.push(std::path::PathBuf::from(
-        "/run/current-system/sw/share/fonts",
-    ));
+
+    if let Ok(nix_profiles) = std::env::var(NIX_PROFILES_ENV_VAR) {
+        for profile in nix_profiles.split_whitespace() {
+            push_unique_path(&mut roots, PathBuf::from(profile).join(SHARE_FONTS_SUBDIR));
+        }
+    }
+
+    push_unique_path(&mut roots, PathBuf::from(NIXOS_SYSTEM_FONT_DIR));
     roots
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
 fn load_fonts(
-    font_files: &[std::path::PathBuf],
+    font_files: &[PathBuf],
     font_size: f32,
+    preferred_family: &str,
 ) -> (FtFont, Option<FtFont>, Option<FtFont>, Option<FtFont>) {
+    let px = font_size.round() as u32;
+
+    if let Some(fonts) = load_preferred_family(font_files, px, preferred_family) {
+        return fonts;
+    }
+
     let families: &[&[FontCandidate]] = &[
         &[
             FontCandidate {
@@ -543,8 +574,6 @@ fn load_fonts(
         ],
     ];
 
-    let px = font_size.round() as u32;
-
     for family in families {
         let Some(regular_candidate) = family.iter().find(|c| c.style == FontStyle::Regular) else {
             continue;
@@ -573,11 +602,79 @@ fn load_fonts(
     }
 
     eprintln!("[FATAL] No usable system monospace font found.");
-    eprintln!("        Install a monospace font: JetBrains Mono, Fira Code, DejaVu Sans Mono, or Liberation Mono.");
+    eprintln!(
+        "        Install a monospace font or set [font].family in the config (eg. JetBrains Mono, Fira Code, DejaVu Sans Mono, Liberation Mono)."
+    );
     std::process::exit(1);
 }
 
-fn load_fallback_fonts(font_files: &[std::path::PathBuf], font_size: f32) -> Vec<FtFont> {
+fn load_preferred_family(
+    font_files: &[PathBuf],
+    size_px: u32,
+    preferred_family: &str,
+) -> Option<(FtFont, Option<FtFont>, Option<FtFont>, Option<FtFont>)> {
+    let family = preferred_family.trim();
+    if family.is_empty() || family.eq_ignore_ascii_case(DEFAULT_FONT_FAMILY) {
+        return None;
+    }
+
+    let regular_path = find_font_file_by_style(font_files, family, FontStyle::Regular)?;
+    let regular_font = load_font_from_path(&regular_path, size_px).ok()?;
+    eprintln!(
+        "[INFO] Primary font (configured): {}",
+        regular_path.display()
+    );
+
+    let bold = find_font_file_by_style(font_files, family, FontStyle::Bold)
+        .and_then(|path| load_font_from_path(&path, size_px).ok());
+    let italic = find_font_file_by_style(font_files, family, FontStyle::Italic)
+        .and_then(|path| load_font_from_path(&path, size_px).ok());
+    let bold_italic = find_font_file_by_style(font_files, family, FontStyle::BoldItalic)
+        .and_then(|path| load_font_from_path(&path, size_px).ok());
+
+    Some((regular_font, bold, italic, bold_italic))
+}
+
+fn find_font_file_by_style(files: &[PathBuf], family: &str, style: FontStyle) -> Option<PathBuf> {
+    let family = normalize_font_name(family);
+    files
+        .iter()
+        .find(|path| {
+            let name = normalize_path_file_name(path);
+            name.contains(&family) && style_matches(path, style)
+        })
+        .cloned()
+}
+
+fn normalize_font_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn normalize_path_file_name(path: &Path) -> String {
+    normalize_font_name(&path.file_name().unwrap_or_default().to_string_lossy())
+}
+
+fn style_matches(path: &Path, style: FontStyle) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let has_bold = name.contains("bold");
+    let has_italic = name.contains("italic") || name.contains("oblique");
+
+    match style {
+        FontStyle::Regular => !has_bold && !has_italic,
+        FontStyle::Bold => has_bold && !has_italic,
+        FontStyle::Italic => !has_bold && has_italic,
+        FontStyle::BoldItalic => has_bold && has_italic,
+    }
+}
+
+fn load_fallback_fonts(font_files: &[PathBuf], font_size: f32) -> Vec<FtFont> {
     let fallback_fragments: &[&str] = &[
         "SymbolsNerdFontMono-Regular",
         "SymbolsNerdFont-Regular",
@@ -635,7 +732,7 @@ fn load_fallback_fonts(font_files: &[std::path::PathBuf], font_size: f32) -> Vec
     loaded
 }
 
-fn collect_font_files(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+fn collect_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in roots {
         collect_font_files_rec(root, &mut out);
@@ -643,14 +740,14 @@ fn collect_font_files(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     out
 }
 
-fn collect_font_files_rec(path: &Path, out: &mut Vec<std::path::PathBuf>) {
+fn collect_font_files_rec(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(meta) = fs::metadata(path) else {
         return;
     };
     if meta.is_file() {
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext = ext.to_ascii_lowercase();
-            if ext == "ttf" || ext == "otf" || ext == "ttc" {
+            if FONT_EXTENSIONS.contains(&ext.as_str()) {
                 out.push(path.to_path_buf());
             }
         }
@@ -664,7 +761,7 @@ fn collect_font_files_rec(path: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn find_font_file(files: &[std::path::PathBuf], name_fragment: &str) -> Option<std::path::PathBuf> {
+fn find_font_file(files: &[PathBuf], name_fragment: &str) -> Option<PathBuf> {
     let needle = name_fragment.to_ascii_lowercase();
     files
         .iter()

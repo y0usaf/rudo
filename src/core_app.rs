@@ -3,10 +3,12 @@ use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
 use crate::{
+    cli::CliArgs,
     config::Config,
     cursor::CursorRenderer,
+    defaults::{DEFAULT_CLIPBOARD_COPY_COMMAND, DEFAULT_CLIPBOARD_PASTE_COMMAND},
     input::{Key, KeyEvent, Modifiers, MouseButton},
-    pty::Pty,
+    pty::{Pty, PtySpawnConfig},
     terminal::{
         damage::DamageTracker,
         grid::Grid,
@@ -25,9 +27,6 @@ const SCROLL_MULTIPLIER: usize = 3;
 
 /// Default cell size before font metrics are available
 const DEFAULT_CELL_SIZE: (f32, f32) = (9.0, 18.0);
-
-/// Tab stop width in columns
-pub const DEFAULT_TAB_WIDTH: usize = 8;
 
 pub struct CoreApp {
     grid: Grid,
@@ -53,15 +52,50 @@ pub struct CoreApp {
 }
 
 impl CoreApp {
-    pub fn new() -> Self {
-        let config = Config::load();
-        let theme = Theme::load_theme_file().unwrap_or_else(|| Theme::from_config(&config.colors));
-        let cols = 80;
-        let rows = 24;
+    pub fn new(cli: CliArgs) -> Self {
+        let mut config = Config::load();
+        if let Some(app_id) = cli.app_id {
+            config.window.app_id = app_id;
+        }
+        if let Some(title) = cli.title {
+            config.window.title = title;
+        }
+        let theme = Theme::load_theme_file().unwrap_or_else(|| {
+            use crate::terminal::theme::ThemeColorStrings;
+            let c = &config.colors;
+            Theme::from_color_strings(&ThemeColorStrings {
+                foreground: &c.foreground,
+                background: &c.background,
+                cursor: &c.cursor,
+                selection: &c.selection,
+                ansi: [
+                    &c.black,
+                    &c.red,
+                    &c.green,
+                    &c.yellow,
+                    &c.blue,
+                    &c.magenta,
+                    &c.cyan,
+                    &c.white,
+                    &c.bright_black,
+                    &c.bright_red,
+                    &c.bright_green,
+                    &c.bright_yellow,
+                    &c.bright_blue,
+                    &c.bright_magenta,
+                    &c.bright_cyan,
+                    &c.bright_white,
+                ],
+            })
+        });
+        let cols = config.terminal.cols.max(2);
+        let rows = config.terminal.rows.max(2);
         let mut cursor_renderer = CursorRenderer::new();
         cursor_renderer.set_animation_length(config.cursor.animation_length);
+        cursor_renderer.set_short_animation_length(config.cursor.short_animation_length);
         cursor_renderer.set_trail_size(config.cursor.trail_size);
         cursor_renderer.set_blink_enabled(config.cursor.blink);
+        cursor_renderer.set_blink_interval(config.cursor.blink_interval);
         match config.cursor.style.as_str() {
             "beam" | "bar" | "vertical" => {
                 cursor_renderer.set_shape(crate::cursor::CursorShape::Beam)
@@ -97,6 +131,9 @@ impl CoreApp {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    pub fn app_id(&self) -> &str {
+        &self.config.window.app_id
     }
     pub fn theme(&self) -> &Theme {
         &self.theme
@@ -138,7 +175,12 @@ impl CoreApp {
         let rows = rows.max(2);
         self.grid = Grid::new(cols, rows);
         self.damage = DamageTracker::new(rows);
-        match Pty::spawn(cols as u16, rows as u16) {
+        let spawn_config = PtySpawnConfig {
+            term: &self.config.terminal.term,
+            colorterm: &self.config.terminal.colorterm,
+            shell_fallback: &self.config.terminal.shell_fallback,
+        };
+        match Pty::spawn(cols as u16, rows as u16, &spawn_config) {
             Ok(pty) => self.pty = Some(pty),
             Err(e) => eprintln!("[ERROR] Failed to spawn PTY: {e}"),
         }
@@ -150,10 +192,7 @@ impl CoreApp {
     }
 
     pub fn title(&self) -> &str {
-        self.parser
-            .title
-            .as_deref()
-            .unwrap_or(&self.config.window.title)
+        self.parser.title().unwrap_or(&self.config.window.title)
     }
 
     pub fn take_title_changed(&mut self) -> bool {
@@ -206,7 +245,7 @@ impl CoreApp {
             }
         }
 
-        let app_cursor = self.parser.application_cursor_keys;
+        let app_cursor = self.parser.application_cursor_keys();
         let seq: Option<&[u8]> = match &event.key {
             Key::Enter => Some(b"\r"),
             Key::Backspace => Some(b"\x7f"),
@@ -249,7 +288,7 @@ impl CoreApp {
 
     pub fn handle_mouse_button(&mut self, pressed: bool, button: MouseButton) {
         let (col, row) = self.pixel_to_grid(self.last_mouse_pos.0, self.last_mouse_pos.1);
-        let mouse_state = &self.parser.mouse_state;
+        let mouse_state = self.parser.mouse_state();
 
         if mouse_state.is_active() && !self.modifiers.shift_key() {
             if let Some(btn_code) = mouse::mouse_button_code(button) {
@@ -287,7 +326,7 @@ impl CoreApp {
     pub fn handle_mouse_move(&mut self, x: f64, y: f64) {
         self.last_mouse_pos = (x, y);
         let (col, row) = self.pixel_to_grid(x, y);
-        let mouse_state = &self.parser.mouse_state;
+        let mouse_state = self.parser.mouse_state();
 
         if mouse_state.is_active() && !self.modifiers.shift_key() {
             let mods = mouse::modifier_bits(self.modifiers);
@@ -314,7 +353,7 @@ impl CoreApp {
                 let _ = pty.write(&seq);
             }
         } else if self.mouse_pressed {
-            if self.selection.state == selection::SelectionState::None {
+            if self.selection.state() == selection::SelectionState::None {
                 self.selection.start_selection(col, row);
             } else {
                 self.selection.update_selection(col, row);
@@ -324,7 +363,7 @@ impl CoreApp {
     }
 
     pub fn handle_scroll_lines(&mut self, lines: f64) {
-        let mouse_state = &self.parser.mouse_state;
+        let mouse_state = self.parser.mouse_state();
 
         if mouse_state.is_active() && !self.modifiers.shift_key() {
             let (col, row) = self.pixel_to_grid(self.last_mouse_pos.0, self.last_mouse_pos.1);
@@ -415,8 +454,8 @@ impl CoreApp {
                 let _ = pty.write(&resp);
             }
         }
-        if self.parser.title != self.last_title {
-            self.last_title = self.parser.title.clone();
+        if self.parser.title() != self.last_title.as_deref() {
+            self.last_title = self.parser.title().map(str::to_string);
             self.title_changed = true;
         }
         got_output
@@ -435,7 +474,7 @@ impl CoreApp {
 }
 
 fn clipboard_set(text: &str) {
-    if let Ok(mut child) = Command::new("wl-copy")
+    if let Ok(mut child) = Command::new(DEFAULT_CLIPBOARD_COPY_COMMAND)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -449,7 +488,7 @@ fn clipboard_set(text: &str) {
 }
 
 fn clipboard_get() -> Option<String> {
-    if let Ok(out) = Command::new("wl-paste")
+    if let Ok(out) = Command::new(DEFAULT_CLIPBOARD_PASTE_COMMAND)
         .arg("--no-newline")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

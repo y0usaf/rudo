@@ -11,6 +11,15 @@ use crate::terminal::theme::Theme;
 
 /// Distance threshold for edge-strip rendering (cursor outline)
 const EDGE_STRIP_DISTANCE_SQ: f32 = 0.8;
+const FLOAT_CHANGE_EPSILON: f32 = 0.001;
+const BT709_LUMA_RED: f32 = 0.2126;
+const BT709_LUMA_GREEN: f32 = 0.7152;
+const BT709_LUMA_BLUE: f32 = 0.0722;
+const LUMA_CONTRAST_THRESHOLD: f32 = 0.5;
+const MAX_COLOR_CHANNEL: f32 = 255.0;
+const MAX_COLOR_CHANNEL_U16: u16 = 255;
+const ALPHA_ROUND_BIAS: u16 = 127;
+const DEGENERATE_EDGE_EPSILON_SQ: f32 = 0.0001;
 
 #[allow(dead_code)]
 pub struct FrameBuffer<'a> {
@@ -24,8 +33,10 @@ pub struct FrameBuffer<'a> {
 pub struct SoftwareRenderer {
     font: FontAtlas,
     theme: Theme,
+    font_family: String,
     font_size: f32,
     base_font_size: f32,
+    scale: f32,
     cell_width: u32,
     cell_height: u32,
     baseline: i32,
@@ -37,13 +48,21 @@ pub struct SoftwareRenderer {
 
 #[allow(dead_code)]
 impl SoftwareRenderer {
-    pub fn new(font_size: f32, theme: Theme, padding: u32, background_opacity: f32) -> Self {
+    pub fn new(
+        font_size: f32,
+        font_family: String,
+        theme: Theme,
+        padding: u32,
+        background_opacity: f32,
+    ) -> Self {
         let font_size = font_size.max(1.0);
         let mut renderer = Self {
-            font: FontAtlas::new(font_size),
+            font: FontAtlas::new(font_size, &font_family),
             theme,
+            font_family,
             font_size,
             base_font_size: font_size,
+            scale: 1.0,
             cell_width: 1,
             cell_height: 1,
             baseline: 0,
@@ -56,8 +75,21 @@ impl SoftwareRenderer {
         renderer
     }
 
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    pub fn set_scale(&mut self, scale: f32) {
+        let scale = scale.max(1.0);
+        if (self.scale - scale).abs() < FLOAT_CHANGE_EPSILON {
+            return;
+        }
+        self.scale = scale;
+        self.rebuild_font();
+    }
+
     fn opacity_to_alpha(opacity: f32) -> u8 {
-        (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
+        (opacity.clamp(0.0, 1.0) * MAX_COLOR_CHANNEL).round() as u8
     }
 
     fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
@@ -93,11 +125,13 @@ impl SoftwareRenderer {
         (self.cell_width as f32, self.cell_height as f32)
     }
 
+    /// Compute grid dimensions from physical (scaled) pixel dimensions.
     pub fn grid_size_for_window(&mut self, width: u32, height: u32) -> (usize, usize) {
         let cw = self.cell_width.max(1);
         let ch = self.cell_height.max(1);
-        let usable_w = width.saturating_sub(self.padding * 2);
-        let usable_h = height.saturating_sub(self.padding * 2);
+        let phys_pad = (self.padding as f32 * self.scale).round() as u32;
+        let usable_w = width.saturating_sub(phys_pad * 2);
+        let usable_h = height.saturating_sub(phys_pad * 2);
         let cols = (usable_w / cw).max(1) as usize;
         let rows = (usable_h / ch).max(1) as usize;
         // Center the grid: split leftover pixels evenly on both sides
@@ -115,7 +149,8 @@ impl SoftwareRenderer {
     }
 
     fn rebuild_font(&mut self) {
-        let mut font = FontAtlas::new(self.font_size);
+        let physical_size = (self.font_size * self.scale).round().max(1.0);
+        let mut font = FontAtlas::new(physical_size, &self.font_family);
         for ch in 32u8..=126u8 {
             font.get_glyph(ch as char, false, false);
             font.get_glyph(ch as char, true, false);
@@ -142,7 +177,9 @@ impl SoftwareRenderer {
         let ox = self.offset_x;
         let oy = self.offset_y;
 
-        // Fill top margin
+        let bg_alpha = self.background_alpha;
+
+        // Fill top margin (always uses background opacity)
         if oy > 0 {
             self.fill_rect(
                 fb,
@@ -153,6 +190,7 @@ impl SoftwareRenderer {
                 self.theme.background.r(),
                 self.theme.background.g(),
                 self.theme.background.b(),
+                bg_alpha,
             );
         }
 
@@ -160,7 +198,8 @@ impl SoftwareRenderer {
             let selected_range = selection.row_range(row);
             let y = oy + row as u32 * self.cell_height;
 
-            // Clear the entire row span (including left/right margins) with background
+            // Clear the entire row span (including left/right margins) with
+            // the default background at the configured opacity.
             self.fill_rect(
                 fb,
                 0,
@@ -170,6 +209,7 @@ impl SoftwareRenderer {
                 self.theme.background.r(),
                 self.theme.background.g(),
                 self.theme.background.b(),
+                bg_alpha,
             );
 
             for col in 0..grid.cols() {
@@ -184,14 +224,28 @@ impl SoftwareRenderer {
                 } else {
                     cell.bg
                 };
+
+                // Track whether this cell uses the default background.
+                // Only the default background gets transparency; explicit
+                // cell backgrounds (escape-sequence colors, selection,
+                // reverse video) are always fully opaque — matching foot's
+                // ALPHA_MODE_DEFAULT behaviour.
+                let mut cell_bg_is_default =
+                    cell.bg_src == crate::terminal::cell::ColorSource::Default;
+
                 if cell.flags.contains(CellFlags::REVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
+                    cell_bg_is_default = false;
                 }
                 if let Some((start, end)) = selected_range {
                     if col >= start && col <= end {
                         bg = self.theme.selection;
+                        cell_bg_is_default = false;
                     }
                 }
+
+                let cell_alpha = if cell_bg_is_default { bg_alpha } else { 255 };
+
                 let x = ox + col as u32 * self.cell_width;
                 self.fill_rect(
                     fb,
@@ -202,6 +256,7 @@ impl SoftwareRenderer {
                     bg.r(),
                     bg.g(),
                     bg.b(),
+                    cell_alpha,
                 );
 
                 if !cell.flags.contains(CellFlags::HIDDEN)
@@ -222,7 +277,7 @@ impl SoftwareRenderer {
             }
         }
 
-        // Fill bottom margin
+        // Fill bottom margin (always uses background opacity)
         let grid_bottom = oy + grid.rows() as u32 * self.cell_height;
         if grid_bottom < fb.height {
             self.fill_rect(
@@ -234,16 +289,17 @@ impl SoftwareRenderer {
                 self.theme.background.r(),
                 self.theme.background.g(),
                 self.theme.background.b(),
+                bg_alpha,
             );
         }
 
-        if grid.cursor.visible && cursor.is_visible() && !grid.is_viewing_scrollback() {
+        if grid.cursor_visible() && cursor.is_visible() && !grid.is_viewing_scrollback() {
             self.draw_animated_cursor(fb, grid, cursor);
         }
     }
 
-    fn clear(&self, fb: &mut FrameBuffer<'_>, r: u8, g: u8, b: u8) {
-        let pixel = Self::premultiplied_bgra(r, g, b, self.background_alpha);
+    fn clear(&self, fb: &mut FrameBuffer<'_>, r: u8, g: u8, b: u8, alpha: u8) {
+        let pixel = Self::premultiplied_bgra(r, g, b, alpha);
         let row_bytes = fb.width as usize * 4;
         let stride = fb.stride as usize;
         for y in 0..fb.height as usize {
@@ -266,6 +322,7 @@ impl SoftwareRenderer {
         r: u8,
         g: u8,
         b: u8,
+        alpha: u8,
     ) {
         let max_x = (x + w).min(fb.width);
         let max_y = (y + h).min(fb.height);
@@ -273,7 +330,7 @@ impl SoftwareRenderer {
             return;
         }
 
-        let pixel = Self::premultiplied_bgra(r, g, b, self.background_alpha);
+        let pixel = Self::premultiplied_bgra(r, g, b, alpha);
         let start_x = x as usize * 4;
         let row_bytes = (max_x - x) as usize * 4;
         let stride = fb.stride as usize;
@@ -325,7 +382,7 @@ impl SoftwareRenderer {
                     self.theme.cursor.g(),
                     self.theme.cursor.b(),
                 );
-                let cell = grid.cell(grid.cursor.col, grid.cursor.row);
+                let cell = grid.cell(grid.cursor_col(), grid.cursor_row());
                 let (fr, fg, fb_col) = contrasting_cursor_text_color(
                     self.theme.cursor.r(),
                     self.theme.cursor.g(),
@@ -333,8 +390,8 @@ impl SoftwareRenderer {
                 );
                 self.draw_cell_glyph_clipped(
                     fb,
-                    self.offset_x + grid.cursor.col as u32 * self.cell_width,
-                    self.offset_y + grid.cursor.row as u32 * self.cell_height,
+                    self.offset_x + grid.cursor_col() as u32 * self.cell_width,
+                    self.offset_y + grid.cursor_row() as u32 * self.cell_height,
                     cell.character(),
                     fr,
                     fg,
@@ -428,7 +485,7 @@ impl SoftwareRenderer {
         let abx = b.0 - a.0;
         let aby = b.1 - a.1;
         let len2 = abx * abx + aby * aby;
-        if len2 <= 0.0001 {
+        if len2 <= DEGENERATE_EDGE_EPSILON_SQ {
             return;
         }
         for y in min_y.max(0) as u32..(max_y.max(0) as u32).min(fb.height) {
@@ -564,8 +621,10 @@ fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32))
 }
 
 fn contrasting_cursor_text_color(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-    let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0;
-    if luma > 0.5 {
+    let luma =
+        (BT709_LUMA_RED * r as f32 + BT709_LUMA_GREEN * g as f32 + BT709_LUMA_BLUE * b as f32)
+            / MAX_COLOR_CHANNEL;
+    if luma > LUMA_CONTRAST_THRESHOLD {
         (0, 0, 0)
     } else {
         (255, 255, 255)
@@ -573,7 +632,7 @@ fn contrasting_cursor_text_color(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
 }
 
 fn premultiply(channel: u8, alpha: u8) -> u8 {
-    ((channel as u16 * alpha as u16 + 127) / 255) as u8
+    ((channel as u16 * alpha as u16 + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16) as u8
 }
 
 fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
@@ -604,10 +663,16 @@ fn blend_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, b: u8, g: u8, r: u8, a: 
     let dst_r = fb.pixels[idx + 2] as u16;
     let dst_a = fb.pixels[idx + 3] as u16;
     let src_a = src[3] as u16;
-    let inv = 255u16 - src_a;
+    let inv = MAX_COLOR_CHANNEL_U16 - src_a;
 
-    fb.pixels[idx] = (src[0] as u16 + ((dst_b * inv + 127) / 255)).min(255) as u8;
-    fb.pixels[idx + 1] = (src[1] as u16 + ((dst_g * inv + 127) / 255)).min(255) as u8;
-    fb.pixels[idx + 2] = (src[2] as u16 + ((dst_r * inv + 127) / 255)).min(255) as u8;
-    fb.pixels[idx + 3] = (src_a + ((dst_a * inv + 127) / 255)).min(255) as u8;
+    fb.pixels[idx] = (src[0] as u16 + ((dst_b * inv + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16))
+        .min(MAX_COLOR_CHANNEL_U16) as u8;
+    fb.pixels[idx + 1] = (src[1] as u16
+        + ((dst_g * inv + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16))
+        .min(MAX_COLOR_CHANNEL_U16) as u8;
+    fb.pixels[idx + 2] = (src[2] as u16
+        + ((dst_r * inv + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16))
+        .min(MAX_COLOR_CHANNEL_U16) as u8;
+    fb.pixels[idx + 3] = (src_a + ((dst_a * inv + ALPHA_ROUND_BIAS) / MAX_COLOR_CHANNEL_U16))
+        .min(MAX_COLOR_CHANNEL_U16) as u8;
 }

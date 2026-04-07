@@ -6,6 +6,8 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use wayland_client::protocol::{wl_buffer, wl_shm, wl_shm_pool};
 use wayland_client::QueueHandle;
 
+use crate::defaults::APP_NAME;
+
 pub(super) struct ShmBuffer {
     pub width: u32,
     pub height: u32,
@@ -90,7 +92,7 @@ impl Drop for ShmBuffer {
 }
 
 fn create_shm_file(size: usize) -> Result<File, Box<dyn Error>> {
-    let name = CString::new(format!("rudo-{}", std::process::id()))?;
+    let name = CString::new(format!("{APP_NAME}-{}", std::process::id()))?;
     // SAFETY: memfd_create with MFD_CLOEXEC creates an anonymous file.
     // We check fd < 0 for failure.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };

@@ -45,11 +45,11 @@ fn parse_extended_color(params: &[u16], theme: &Theme) -> (PackedColor, ColorSou
 pub struct TerminalParser {
     parser: vte::Parser,
     current_attrs: Cell,
-    pub title: Option<String>,
-    pub responses: Vec<Vec<u8>>,
-    pub theme: Theme,
-    pub mouse_state: MouseState,
-    pub application_cursor_keys: bool,
+    title: Option<String>,
+    responses: Vec<Vec<u8>>,
+    theme: Theme,
+    mouse_state: MouseState,
+    application_cursor_keys: bool,
     origin_mode: bool,
 }
 
@@ -107,6 +107,26 @@ impl TerminalParser {
     /// Drain and return all pending response bytes (e.g. DSR, DA answers).
     pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.responses)
+    }
+
+    /// Get the current window title set by OSC sequences.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Get a reference to the current theme.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Get a reference to the mouse tracking state.
+    pub fn mouse_state(&self) -> &MouseState {
+        &self.mouse_state
+    }
+
+    /// Whether application cursor key mode (DECCKM) is active.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.application_cursor_keys
     }
 }
 
@@ -314,15 +334,15 @@ impl<'a> Performer<'a> {
 
     fn insert_lines(&mut self, count: usize) {
         let blank = self.blank_cell();
-        self.grid
-            .insert_lines_at_with(self.grid.cursor.row, count, blank);
+        let row = self.grid.cursor_row();
+        self.grid.insert_lines_at_with(row, count, blank);
         self.damage.mark_all();
     }
 
     fn delete_lines(&mut self, count: usize) {
         let blank = self.blank_cell();
-        self.grid
-            .delete_lines_at_with(self.grid.cursor.row, count, blank);
+        let row = self.grid.cursor_row();
+        self.grid.delete_lines_at_with(row, count, blank);
         self.damage.mark_all();
     }
 
@@ -333,7 +353,7 @@ impl<'a> Performer<'a> {
     fn erase_chars(&mut self, count: usize) {
         let blank = self.blank_cell();
         self.grid.erase_chars_with(count, blank);
-        self.damage.mark_row(self.grid.cursor.row);
+        self.damage.mark_row(self.grid.cursor_row());
     }
 }
 
@@ -350,8 +370,8 @@ impl<'a> vte::Perform for Performer<'a> {
     // ------ Print a visible character ------------------------------------
     #[inline]
     fn print(&mut self, c: char) {
-        let col = self.grid.cursor.col;
-        let _row = self.grid.cursor.row;
+        let col = self.grid.cursor_col();
+        let _row = self.grid.cursor_row();
         let cols = self.grid.cols();
 
         // Determine character width
@@ -364,8 +384,8 @@ impl<'a> vte::Perform for Performer<'a> {
             self.grid.linefeed_with(blank);
         }
 
-        let col = self.grid.cursor.col;
-        let row = self.grid.cursor.row;
+        let col = self.grid.cursor_col();
+        let row = self.grid.cursor_row();
 
         if col >= cols {
             return; // safety
@@ -389,15 +409,15 @@ impl<'a> vte::Perform for Performer<'a> {
                 *spacer = Cell::default();
                 spacer.flags.insert(CellFlags::WIDE_SPACER);
                 spacer.mark_dirty();
-                self.grid.cursor.col = col + 2;
+                self.grid.set_cursor_col(col + 2);
             } else {
-                self.grid.cursor.col = col + 1;
+                self.grid.set_cursor_col(col + 1);
             }
         } else {
-            self.grid.cursor.col = col + 1;
+            self.grid.set_cursor_col(col + 1);
         }
 
-        self.grid.row_mut(row).dirty = true;
+        let _ = self.grid.row_mut(row);
         self.damage.mark_row(row);
     }
 
@@ -408,18 +428,18 @@ impl<'a> vte::Perform for Performer<'a> {
             0x07 => { /* bell – ignore for now */ }
             // BS – backspace
             0x08 => {
-                if self.grid.cursor.col > 0 {
-                    self.grid.cursor.col -= 1;
+                if self.grid.cursor_col() > 0 {
+                    self.grid.set_cursor_col(self.grid.cursor_col() - 1);
                 }
             }
             // HT – horizontal tab
             0x09 => {
-                let col = self.grid.cursor.col;
+                let col = self.grid.cursor_col();
                 let cols = self.grid.cols();
                 // Advance to next tab stop (every DEFAULT_TAB_WIDTH columns).
-                let next = ((col / crate::core_app::DEFAULT_TAB_WIDTH) + 1)
-                    * crate::core_app::DEFAULT_TAB_WIDTH;
-                self.grid.cursor.col = next.min(cols.saturating_sub(1));
+                let next =
+                    ((col / super::grid::DEFAULT_TAB_WIDTH) + 1) * super::grid::DEFAULT_TAB_WIDTH;
+                self.grid.set_cursor_col(next.min(cols.saturating_sub(1)));
             }
             // LF, VT, FF
             0x0A | 0x0B | 0x0C => {
@@ -451,50 +471,50 @@ impl<'a> vte::Perform for Performer<'a> {
             'A' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let (min_row, _) = self.row_bounds();
-                let row = self.grid.cursor.row;
-                self.grid.cursor.row = row.saturating_sub(n).max(min_row);
+                let row = self.grid.cursor_row();
+                self.grid.set_cursor_row(row.saturating_sub(n).max(min_row));
             }
             // CUD – Cursor Down
             'B' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let (_, max_row) = self.row_bounds();
-                let row = self.grid.cursor.row;
-                self.grid.cursor.row = (row + n).min(max_row);
+                let row = self.grid.cursor_row();
+                self.grid.set_cursor_row((row + n).min(max_row));
             }
             // CUF – Cursor Forward
             'C' => {
                 let n = Self::param(params, 0, 1) as usize;
-                let col = self.grid.cursor.col;
+                let col = self.grid.cursor_col();
                 let max = self.grid.cols().saturating_sub(1);
-                self.grid.cursor.col = (col + n).min(max);
+                self.grid.set_cursor_col((col + n).min(max));
             }
             // CUB – Cursor Back
             'D' => {
                 let n = Self::param(params, 0, 1) as usize;
-                let col = self.grid.cursor.col;
-                self.grid.cursor.col = col.saturating_sub(n);
+                let col = self.grid.cursor_col();
+                self.grid.set_cursor_col(col.saturating_sub(n));
             }
             // CNL – Cursor Next Line
             'E' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let (_, max_row) = self.row_bounds();
-                let row = self.grid.cursor.row;
-                self.grid.cursor.row = (row + n).min(max_row);
-                self.grid.cursor.col = 0;
+                let row = self.grid.cursor_row();
+                self.grid.set_cursor_row((row + n).min(max_row));
+                self.grid.set_cursor_col(0);
             }
             // CPL – Cursor Previous Line
             'F' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let (min_row, _) = self.row_bounds();
-                let row = self.grid.cursor.row;
-                self.grid.cursor.row = row.saturating_sub(n).max(min_row);
-                self.grid.cursor.col = 0;
+                let row = self.grid.cursor_row();
+                self.grid.set_cursor_row(row.saturating_sub(n).max(min_row));
+                self.grid.set_cursor_col(0);
             }
             // CHA – Cursor Horizontal Absolute
             'G' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let max = self.grid.cols().saturating_sub(1);
-                self.grid.cursor.col = (n.saturating_sub(1)).min(max);
+                self.grid.set_cursor_col((n.saturating_sub(1)).min(max));
             }
             // CUP / HVP – Cursor Position
             'H' | 'f' => {
@@ -527,7 +547,7 @@ impl<'a> vte::Perform for Performer<'a> {
                     2 => self.grid.erase_line_with(blank),
                     _ => {}
                 }
-                self.damage.mark_row(self.grid.cursor.row);
+                self.damage.mark_row(self.grid.cursor_row());
             }
             // IL – Insert Lines
             'L' => {
@@ -544,14 +564,14 @@ impl<'a> vte::Perform for Performer<'a> {
                 let n = Self::param(params, 0, 1) as usize;
                 let blank = self.blank_cell();
                 self.grid.delete_chars_with(n, blank);
-                self.damage.mark_row(self.grid.cursor.row);
+                self.damage.mark_row(self.grid.cursor_row());
             }
             // ICH – Insert Characters
             '@' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let blank = self.blank_cell();
                 self.grid.insert_chars_with(n, blank);
-                self.damage.mark_row(self.grid.cursor.row);
+                self.damage.mark_row(self.grid.cursor_row());
             }
             // ECH – Erase Characters
             'X' => {
@@ -575,7 +595,8 @@ impl<'a> vte::Perform for Performer<'a> {
             // VPA – Vertical Position Absolute
             'd' => {
                 let n = Self::param(params, 0, 1) as usize;
-                self.grid.cursor.row = self.absolute_row_param(n.saturating_sub(1));
+                self.grid
+                    .set_cursor_row(self.absolute_row_param(n.saturating_sub(1)));
             }
             // SGR – Select Graphic Rendition
             'm' => {
@@ -589,11 +610,11 @@ impl<'a> vte::Perform for Performer<'a> {
                     // reported relative to the active scroll region.
                     let row = if *self.origin_mode {
                         let (top, _) = self.grid.scroll_region();
-                        self.grid.cursor.row.saturating_sub(top) + 1
+                        self.grid.cursor_row().saturating_sub(top) + 1
                     } else {
-                        self.grid.cursor.row + 1
+                        self.grid.cursor_row() + 1
                     };
-                    let col = self.grid.cursor.col + 1;
+                    let col = self.grid.cursor_col() + 1;
                     let response = format!("\x1b[{};{}R", row, col);
                     self.responses.push(response.into_bytes());
                 }
@@ -660,7 +681,7 @@ impl<'a> vte::Perform for Performer<'a> {
                                     self.grid.set_cursor(0, top);
                                 }
                                 // DECTCEM – show cursor
-                                25 => self.grid.cursor.visible = true,
+                                25 => self.grid.set_cursor_visible(true),
                                 // Alternate screen buffers
                                 47 | 1047 | 1049 => {
                                     self.grid.enter_alternate_screen();
@@ -691,7 +712,7 @@ impl<'a> vte::Perform for Performer<'a> {
                                     *self.origin_mode = false;
                                     self.grid.set_cursor(0, 0);
                                 }
-                                25 => self.grid.cursor.visible = false,
+                                25 => self.grid.set_cursor_visible(false),
                                 47 | 1047 | 1049 => {
                                     self.grid.leave_alternate_screen();
                                     self.damage.mark_all();
@@ -897,35 +918,35 @@ mod tests {
     fn sgr_standard_fg_color() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[31mR");
-        assert_eq!(g.cell(0, 0).fg, p.theme.palette(1));
+        assert_eq!(g.cell(0, 0).fg, p.theme().palette(1));
     }
 
     #[test]
     fn sgr_standard_bg_color() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[42mG");
-        assert_eq!(g.cell(0, 0).bg, p.theme.palette(2));
+        assert_eq!(g.cell(0, 0).bg, p.theme().palette(2));
     }
 
     #[test]
     fn sgr_bright_fg_color() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[91mR");
-        assert_eq!(g.cell(0, 0).fg, p.theme.palette(9));
+        assert_eq!(g.cell(0, 0).fg, p.theme().palette(9));
     }
 
     #[test]
     fn sgr_bright_bg_color() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[104mB");
-        assert_eq!(g.cell(0, 0).bg, p.theme.palette(12));
+        assert_eq!(g.cell(0, 0).bg, p.theme().palette(12));
     }
 
     #[test]
     fn sgr_256_color_fg() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[38;5;196mX");
-        assert_eq!(g.cell(0, 0).fg, p.theme.palette(196));
+        assert_eq!(g.cell(0, 0).fg, p.theme().palette(196));
     }
 
     #[test]
@@ -939,14 +960,14 @@ mod tests {
     fn sgr_default_fg_reset() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[31mA\x1b[39mB");
-        assert_eq!(g.cell(1, 0).fg, p.theme.foreground);
+        assert_eq!(g.cell(1, 0).fg, p.theme().foreground);
     }
 
     #[test]
     fn sgr_default_bg_reset() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[41mA\x1b[49mB");
-        assert_eq!(g.cell(1, 0).bg, p.theme.background);
+        assert_eq!(g.cell(1, 0).bg, p.theme().background);
     }
 
     // === CSI Cursor Movement Tests ===
@@ -955,66 +976,66 @@ mod tests {
     fn csi_cup_cursor_position() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[5;10H");
-        assert_eq!(g.cursor.row, 4);
-        assert_eq!(g.cursor.col, 9);
+        assert_eq!(g.cursor_row(), 4);
+        assert_eq!(g.cursor_col(), 9);
     }
 
     #[test]
     fn csi_cuu_cursor_up() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[6;1H\x1b[3A");
-        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.cursor_row(), 2);
     }
 
     #[test]
     fn csi_cud_cursor_down() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[1;1H\x1b[4B");
-        assert_eq!(g.cursor.row, 4);
+        assert_eq!(g.cursor_row(), 4);
     }
 
     #[test]
     fn csi_cuf_cursor_forward() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[1;1H\x1b[5C");
-        assert_eq!(g.cursor.col, 5);
+        assert_eq!(g.cursor_col(), 5);
     }
 
     #[test]
     fn csi_cub_cursor_back() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[1;10H\x1b[3D");
-        assert_eq!(g.cursor.col, 6);
+        assert_eq!(g.cursor_col(), 6);
     }
 
     #[test]
     fn csi_cha_cursor_horizontal_absolute() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[8G");
-        assert_eq!(g.cursor.col, 7);
+        assert_eq!(g.cursor_col(), 7);
     }
 
     #[test]
     fn csi_vpa_vertical_position() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[6d");
-        assert_eq!(g.cursor.row, 5);
+        assert_eq!(g.cursor_row(), 5);
     }
 
     #[test]
     fn csi_cnl_cursor_next_line() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[1;5H\x1b[2E");
-        assert_eq!(g.cursor.row, 2);
-        assert_eq!(g.cursor.col, 0);
+        assert_eq!(g.cursor_row(), 2);
+        assert_eq!(g.cursor_col(), 0);
     }
 
     #[test]
     fn csi_cpl_cursor_previous_line() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[5;5H\x1b[2F");
-        assert_eq!(g.cursor.row, 2);
-        assert_eq!(g.cursor.col, 0);
+        assert_eq!(g.cursor_row(), 2);
+        assert_eq!(g.cursor_col(), 0);
     }
 
     // === CSI Erase Tests ===
@@ -1119,8 +1140,8 @@ mod tests {
         let (mut p, mut g, mut d) = setup(10, 10);
         p.advance(&mut g, &mut d, b"\x1b[3;7r");
         assert_eq!(g.scroll_region(), (2, 6));
-        assert_eq!(g.cursor.col, 0);
-        assert_eq!(g.cursor.row, 0);
+        assert_eq!(g.cursor_col(), 0);
+        assert_eq!(g.cursor_row(), 0);
     }
 
     // === C0 Controls ===
@@ -1166,8 +1187,8 @@ mod tests {
     fn esc_save_restore_cursor() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[5;8H\x1b7\x1b[1;1H\x1b8");
-        assert_eq!(g.cursor.row, 4);
-        assert_eq!(g.cursor.col, 7);
+        assert_eq!(g.cursor_row(), 4);
+        assert_eq!(g.cursor_col(), 7);
     }
 
     // === OSC ===
@@ -1176,14 +1197,14 @@ mod tests {
     fn osc_set_title() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b]0;MyTitle\x07");
-        assert_eq!(p.title, Some("MyTitle".to_string()));
+        assert_eq!(p.title(), Some("MyTitle"));
     }
 
     #[test]
     fn osc_set_title_osc2() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b]2;AnotherTitle\x07");
-        assert_eq!(p.title, Some("AnotherTitle".to_string()));
+        assert_eq!(p.title(), Some("AnotherTitle"));
     }
 
     // === DECSET / DECRST ===
@@ -1191,31 +1212,31 @@ mod tests {
     #[test]
     fn decset_hide_show_cursor() {
         let (mut p, mut g, mut d) = setup(10, 2);
-        assert!(g.cursor.visible);
+        assert!(g.cursor_visible());
         p.advance(&mut g, &mut d, b"\x1b[?25l");
-        assert!(!g.cursor.visible);
+        assert!(!g.cursor_visible());
         p.advance(&mut g, &mut d, b"\x1b[?25h");
-        assert!(g.cursor.visible);
+        assert!(g.cursor_visible());
     }
 
     #[test]
     fn decset_mouse_click_mode() {
         let (mut p, mut g, mut d) = setup(10, 2);
-        assert_eq!(p.mouse_state.mode, MouseMode::None);
+        assert_eq!(p.mouse_state().mode, MouseMode::None);
         p.advance(&mut g, &mut d, b"\x1b[?1000h");
-        assert_eq!(p.mouse_state.mode, MouseMode::Click);
+        assert_eq!(p.mouse_state().mode, MouseMode::Click);
         p.advance(&mut g, &mut d, b"\x1b[?1000l");
-        assert_eq!(p.mouse_state.mode, MouseMode::None);
+        assert_eq!(p.mouse_state().mode, MouseMode::None);
     }
 
     #[test]
     fn decset_mouse_sgr_mode() {
         let (mut p, mut g, mut d) = setup(10, 2);
-        assert!(!p.mouse_state.sgr);
+        assert!(!p.mouse_state().sgr);
         p.advance(&mut g, &mut d, b"\x1b[?1006h");
-        assert!(p.mouse_state.sgr);
+        assert!(p.mouse_state().sgr);
         p.advance(&mut g, &mut d, b"\x1b[?1006l");
-        assert!(!p.mouse_state.sgr);
+        assert!(!p.mouse_state().sgr);
     }
 
     // === Device Attributes ===
@@ -1254,8 +1275,8 @@ mod tests {
     fn csi_save_restore_cursor() {
         let (mut p, mut g, mut d) = setup(20, 10);
         p.advance(&mut g, &mut d, b"\x1b[4;6H\x1b[s\x1b[1;1H\x1b[u");
-        assert_eq!(g.cursor.row, 3);
-        assert_eq!(g.cursor.col, 5);
+        assert_eq!(g.cursor_row(), 3);
+        assert_eq!(g.cursor_col(), 5);
     }
 
     // === DSR ===
@@ -1309,8 +1330,8 @@ mod tests {
         let (mut p, mut g, mut d) = setup(10, 10);
         p.advance(&mut g, &mut d, b"\x1b[3;7r");
         p.advance(&mut g, &mut d, b"\x1b[?6h");
-        assert_eq!(g.cursor.row, 2);
-        assert_eq!(g.cursor.col, 0);
+        assert_eq!(g.cursor_row(), 2);
+        assert_eq!(g.cursor_col(), 0);
     }
 
     // === ESC D (Index) ===
@@ -1319,7 +1340,7 @@ mod tests {
     fn esc_index_linefeed() {
         let (mut p, mut g, mut d) = setup(5, 3);
         p.advance(&mut g, &mut d, b"\x1b[1;1H\x1bD");
-        assert_eq!(g.cursor.row, 1);
+        assert_eq!(g.cursor_row(), 1);
     }
 
     // === Compound sequences ===
@@ -1341,20 +1362,20 @@ mod tests {
         }
         assert_eq!(g.cell(0, 0).ch, 'H' as u32);
         assert!(g.cell(0, 0).flags.contains(CellFlags::BOLD));
-        assert_eq!(g.cell(0, 0).fg, p.theme.palette(1));
+        assert_eq!(g.cell(0, 0).fg, p.theme().palette(1));
     }
 
     #[test]
     fn mouse_drag_mode() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[?1002h");
-        assert_eq!(p.mouse_state.mode, MouseMode::Drag);
+        assert_eq!(p.mouse_state().mode, MouseMode::Drag);
     }
 
     #[test]
     fn mouse_motion_mode() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[?1003h");
-        assert_eq!(p.mouse_state.mode, MouseMode::Motion);
+        assert_eq!(p.mouse_state().mode, MouseMode::Motion);
     }
 }

@@ -5,14 +5,60 @@
 //! indices 16-231 are the 6×6×6 color cube and 232-255 are a grayscale ramp.
 //!
 //! Themes can be loaded from:
-//! - A `ColorConfig` in `config.toml`
+//! - Color strings passed via `ThemeColorStrings`
 //! - A standalone theme TOML file (wallust / termvide compatible)
 
 use std::path::PathBuf;
 
 use super::cell::PackedColor;
-use crate::config::{parse_hex_color, ColorConfig};
+use crate::defaults::{
+    APP_NAME, DEFAULT_ANSI_HEX, DEFAULT_BACKGROUND_HEX, DEFAULT_CURSOR_HEX, DEFAULT_FOREGROUND_HEX,
+    DEFAULT_SELECTION_HEX, THEME_ENV_VAR, THEME_FILE_NAME,
+};
 use crate::toml_parser::TomlTable;
+
+const COLOR_CUBE_START: usize = 16;
+const COLOR_CUBE_SIDE: usize = 6;
+const COLOR_CUBE_LAYER: usize = COLOR_CUBE_SIDE * COLOR_CUBE_SIDE;
+const COLOR_CUBE_BASE: u8 = 55;
+const COLOR_CUBE_STEP: u8 = 40;
+const GRAYSCALE_RAMP_START: usize = 232;
+const GRAYSCALE_RAMP_LEN: u8 = 24;
+const GRAYSCALE_BASE: u8 = 8;
+const GRAYSCALE_STEP: u8 = 10;
+
+/// Color strings for constructing a theme from configuration.
+///
+/// Each field is a hex color in `"#rrggbb"` or `"rrggbb"` format.
+pub struct ThemeColorStrings<'a> {
+    pub foreground: &'a str,
+    pub background: &'a str,
+    pub cursor: &'a str,
+    pub selection: &'a str,
+    /// ANSI colors 0-15 (normal 0-7, then bright 8-15).
+    pub ansi: [&'a str; 16],
+}
+
+/// Parse a hex color string in "#rrggbb" or "rrggbb" format into (r, g, b).
+/// Returns `None` if the string is not a valid hex color.
+fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+
+    if hex.len() != 6 {
+        return None;
+    }
+
+    // Validate all characters are hex digits
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+
+    Some((r, g, b))
+}
 
 struct ThemeFile {
     background: Option<String>,
@@ -45,19 +91,9 @@ impl ThemeFile {
     fn ansi_color(&self, index: u8) -> &str {
         self.colors[index as usize]
             .as_deref()
-            .unwrap_or(DEFAULT_ANSI[index as usize])
+            .unwrap_or(DEFAULT_ANSI_HEX[index as usize])
     }
 }
-
-const DEFAULT_FG: &str = "#d4d4d4";
-const DEFAULT_BG: &str = "#1e1e1e";
-const DEFAULT_CURSOR: &str = "#ffffff";
-const DEFAULT_SELECTION: &str = "#264f78";
-
-const DEFAULT_ANSI: [&str; 16] = [
-    "#000000", "#cc0000", "#00cc00", "#cccc00", "#0000cc", "#cc00cc", "#00cccc", "#cccccc",
-    "#555555", "#ff5555", "#55ff55", "#ffff55", "#5555ff", "#ff55ff", "#55ffff", "#ffffff",
-];
 
 fn hex_to_packed(hex: &str) -> PackedColor {
     parse_hex_color(hex)
@@ -70,7 +106,7 @@ fn cube_component(v: u8) -> u8 {
     if v == 0 {
         0
     } else {
-        55 + 40 * v
+        COLOR_CUBE_BASE + COLOR_CUBE_STEP * v
     }
 }
 
@@ -78,19 +114,22 @@ fn build_palette(ansi: [PackedColor; 16]) -> [PackedColor; 256] {
     let mut palette = [PackedColor(0); 256];
     palette[..16].copy_from_slice(&ansi);
 
-    for r in 0u8..6 {
-        for g in 0u8..6 {
-            for b in 0u8..6 {
-                let idx = 16 + 36 * r as usize + 6 * g as usize + b as usize;
+    for r in 0u8..COLOR_CUBE_SIDE as u8 {
+        for g in 0u8..COLOR_CUBE_SIDE as u8 {
+            for b in 0u8..COLOR_CUBE_SIDE as u8 {
+                let idx = COLOR_CUBE_START
+                    + COLOR_CUBE_LAYER * r as usize
+                    + COLOR_CUBE_SIDE * g as usize
+                    + b as usize;
                 palette[idx] =
                     PackedColor::new(cube_component(r), cube_component(g), cube_component(b));
             }
         }
     }
 
-    for i in 0u8..24 {
-        let v = 8 + 10 * i;
-        palette[232 + i as usize] = PackedColor::new(v, v, v);
+    for i in 0u8..GRAYSCALE_RAMP_LEN {
+        let v = GRAYSCALE_BASE + GRAYSCALE_STEP * i;
+        palette[GRAYSCALE_RAMP_START + i as usize] = PackedColor::new(v, v, v);
     }
 
     palette
@@ -107,37 +146,29 @@ pub struct Theme {
 
 #[allow(dead_code)]
 impl Theme {
-    pub fn from_config(colors: &ColorConfig) -> Self {
-        let ansi: [PackedColor; 16] = [
-            hex_to_packed(&colors.black),
-            hex_to_packed(&colors.red),
-            hex_to_packed(&colors.green),
-            hex_to_packed(&colors.yellow),
-            hex_to_packed(&colors.blue),
-            hex_to_packed(&colors.magenta),
-            hex_to_packed(&colors.cyan),
-            hex_to_packed(&colors.white),
-            hex_to_packed(&colors.bright_black),
-            hex_to_packed(&colors.bright_red),
-            hex_to_packed(&colors.bright_green),
-            hex_to_packed(&colors.bright_yellow),
-            hex_to_packed(&colors.bright_blue),
-            hex_to_packed(&colors.bright_magenta),
-            hex_to_packed(&colors.bright_cyan),
-            hex_to_packed(&colors.bright_white),
-        ];
+    pub fn from_color_strings(colors: &ThemeColorStrings) -> Self {
+        let mut ansi = [PackedColor(0); 16];
+        for (i, hex) in colors.ansi.iter().enumerate() {
+            ansi[i] = hex_to_packed(hex);
+        }
 
         Self {
-            foreground: hex_to_packed(&colors.foreground),
-            background: hex_to_packed(&colors.background),
-            cursor: hex_to_packed(&colors.cursor),
-            selection: hex_to_packed(&colors.selection),
+            foreground: hex_to_packed(colors.foreground),
+            background: hex_to_packed(colors.background),
+            cursor: hex_to_packed(colors.cursor),
+            selection: hex_to_packed(colors.selection),
             palette: build_palette(ansi),
         }
     }
 
     pub fn default() -> Self {
-        Self::from_config(&ColorConfig::default())
+        Self::from_color_strings(&ThemeColorStrings {
+            foreground: DEFAULT_FOREGROUND_HEX,
+            background: DEFAULT_BACKGROUND_HEX,
+            cursor: DEFAULT_CURSOR_HEX,
+            selection: DEFAULT_SELECTION_HEX,
+            ansi: DEFAULT_ANSI_HEX,
+        })
     }
 
     pub fn load_theme_file() -> Option<Self> {
@@ -196,21 +227,17 @@ impl Theme {
     }
 
     fn theme_search_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(6);
+        let mut paths = Vec::with_capacity(2);
 
-        if let Ok(env_path) = std::env::var("RUDO_THEME") {
+        // Env var override — lets external tools (wallust, pywal, etc.)
+        // point at an arbitrary theme file without touching the config dir.
+        if let Ok(env_path) = std::env::var(THEME_ENV_VAR) {
             paths.push(PathBuf::from(env_path));
         }
-        if let Ok(env_path) = std::env::var("SWIFTTERM_THEME") {
-            paths.push(PathBuf::from(env_path));
-        }
 
-        if let Ok(home) = std::env::var("HOME") {
-            let home = PathBuf::from(home);
-            paths.push(home.join(".cache/wallust/rudo-theme.toml"));
-            paths.push(home.join(".config/rudo/theme.toml"));
-            paths.push(home.join(".cache/wallust/swiftterm-theme.toml"));
-            paths.push(home.join(".config/swiftterm/theme.toml"));
+        // Standard XDG config location.
+        if let Some(dir) = crate::config::config_dir() {
+            paths.push(dir.join(APP_NAME).join(THEME_FILE_NAME));
         }
 
         paths
@@ -223,10 +250,10 @@ impl Theme {
         }
 
         Self {
-            foreground: hex_to_packed(tf.foreground.as_deref().unwrap_or(DEFAULT_FG)),
-            background: hex_to_packed(tf.background.as_deref().unwrap_or(DEFAULT_BG)),
-            cursor: hex_to_packed(tf.cursor.as_deref().unwrap_or(DEFAULT_CURSOR)),
-            selection: hex_to_packed(tf.selection.as_deref().unwrap_or(DEFAULT_SELECTION)),
+            foreground: hex_to_packed(tf.foreground.as_deref().unwrap_or(DEFAULT_FOREGROUND_HEX)),
+            background: hex_to_packed(tf.background.as_deref().unwrap_or(DEFAULT_BACKGROUND_HEX)),
+            cursor: hex_to_packed(tf.cursor.as_deref().unwrap_or(DEFAULT_CURSOR_HEX)),
+            selection: hex_to_packed(tf.selection.as_deref().unwrap_or(DEFAULT_SELECTION_HEX)),
             palette: build_palette(ansi),
         }
     }
@@ -317,13 +344,19 @@ mod tests {
     }
 
     #[test]
-    fn from_config_uses_colors() {
-        let mut colors = ColorConfig::default();
-        colors.foreground = "#aabbcc".to_string();
-        colors.background = "#112233".to_string();
-        colors.red = "#ff0000".to_string();
+    fn from_color_strings_uses_colors() {
+        let mut ansi = DEFAULT_ANSI_HEX;
+        ansi[1] = "#ff0000"; // override red
 
-        let theme = Theme::from_config(&colors);
+        let colors = ThemeColorStrings {
+            foreground: "#aabbcc",
+            background: "#112233",
+            cursor: DEFAULT_CURSOR_HEX,
+            selection: DEFAULT_SELECTION_HEX,
+            ansi,
+        };
+
+        let theme = Theme::from_color_strings(&colors);
         assert_eq!(theme.foreground, PackedColor::new(0xaa, 0xbb, 0xcc));
         assert_eq!(theme.background, PackedColor::new(0x11, 0x22, 0x33));
         assert_eq!(theme.palette(1), PackedColor::new(0xff, 0x00, 0x00));
