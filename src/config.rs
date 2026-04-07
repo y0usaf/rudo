@@ -8,11 +8,12 @@ use crate::defaults::{
     DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_STYLE, DEFAULT_CURSOR_TRAIL_SIZE,
     DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, DEFAULT_FONT_SIZE_ADJUSTMENT, DEFAULT_FOREGROUND_HEX,
     DEFAULT_SCROLLBACK_LINES, DEFAULT_SELECTION_HEX, DEFAULT_SHELL_FALLBACK, DEFAULT_TERM,
-    DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, DEFAULT_WINDOW_ALPHA_MODE,
-    DEFAULT_WINDOW_INITIAL_HEIGHT, DEFAULT_WINDOW_INITIAL_WIDTH, DEFAULT_WINDOW_OPACITY,
-    DEFAULT_WINDOW_PADDING_PX, LEGACY_CONFIG_DIR_NAME,
+    DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, DEFAULT_WINDOW_INITIAL_HEIGHT,
+    DEFAULT_WINDOW_INITIAL_WIDTH, DEFAULT_WINDOW_PADDING_PX, LEGACY_CONFIG_DIR_NAME,
 };
+use crate::info_log;
 use crate::toml_parser::TomlTable;
+use crate::warn_log;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -71,8 +72,6 @@ pub struct CursorConfig {
 
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
-    pub opacity: f32,
-    pub alpha_mode: String,
     pub padding: u32,
     pub title: String,
     pub app_id: String,
@@ -163,8 +162,6 @@ impl Default for CursorConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            opacity: DEFAULT_WINDOW_OPACITY,
-            alpha_mode: DEFAULT_WINDOW_ALPHA_MODE.to_string(),
             padding: DEFAULT_WINDOW_PADDING_PX,
             title: APP_NAME.to_string(),
             app_id: APP_NAME.to_string(),
@@ -201,7 +198,7 @@ impl Config {
     /// Falls back to the legacy SwiftTerm config path, then defaults.
     pub fn load() -> Self {
         let Some(primary_path) = Self::primary_config_path() else {
-            eprintln!("[INFO] No config directory found, using defaults");
+            info_log!("No config directory found, using defaults");
             return Config::default();
         };
 
@@ -211,16 +208,16 @@ impl Config {
             .unwrap_or_else(|| primary_path.clone());
 
         if !path.exists() {
-            eprintln!(
-                "[INFO] Config file not found at {}, using defaults",
+            info_log!(
+                "Config file not found at {}, using defaults",
                 primary_path.display()
             );
             return Config::default();
         }
 
         if path != primary_path {
-            eprintln!(
-                "[INFO] Loaded legacy config from {}, consider moving it to {}",
+            info_log!(
+                "Loaded legacy config from {}, consider moving it to {}",
                 path.display(),
                 primary_path.display()
             );
@@ -229,12 +226,12 @@ impl Config {
         match std::fs::read_to_string(&path) {
             Ok(contents) => match TomlTable::parse(&contents) {
                 Ok(table) => {
-                    eprintln!("[INFO] Loaded config from {}", path.display());
+                    info_log!("Loaded config from {}", path.display());
                     Config::from_toml(&table)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[WARN] Failed to parse config at {}: {}, using defaults",
+                    warn_log!(
+                        "Failed to parse config at {}: {}, using defaults",
                         path.display(),
                         e
                     );
@@ -242,8 +239,8 @@ impl Config {
                 }
             },
             Err(e) => {
-                eprintln!(
-                    "[WARN] Failed to read config at {}: {}, using defaults",
+                warn_log!(
+                    "Failed to read config at {}: {}, using defaults",
                     path.display(),
                     e
                 );
@@ -312,8 +309,6 @@ impl Config {
                     .unwrap_or(def.cursor.blink_interval),
             },
             window: WindowConfig {
-                opacity: t.get_f32("window", "opacity").unwrap_or(def.window.opacity),
-                alpha_mode: str_field!("window", "alpha_mode", &def.window.alpha_mode),
                 padding: t
                     .get_usize("window", "padding")
                     .unwrap_or(def.window.padding as usize) as u32,
@@ -451,8 +446,6 @@ mod tests {
             config.cursor.blink_interval,
             DEFAULT_CURSOR_BLINK_INTERVAL_SECS
         );
-        assert_eq!(config.window.opacity, DEFAULT_WINDOW_OPACITY);
-        assert_eq!(config.window.alpha_mode, DEFAULT_WINDOW_ALPHA_MODE);
         assert_eq!(config.window.title, APP_NAME);
         assert_eq!(config.window.initial_width, DEFAULT_WINDOW_INITIAL_WIDTH);
         assert_eq!(config.window.initial_height, DEFAULT_WINDOW_INITIAL_HEIGHT);
@@ -487,7 +480,6 @@ short_animation_length = 0.05
 blink_interval = 0.7
 
 [window]
-alpha_mode = "all"
 initial_width = 1024
 initial_height = 768
 
@@ -502,7 +494,6 @@ shell_fallback = "/usr/bin/zsh"
         let config = Config::from_toml(&table);
         assert_eq!(config.cursor.short_animation_length, 0.05);
         assert_eq!(config.cursor.blink_interval, 0.7);
-        assert_eq!(config.window.alpha_mode, "all");
         assert_eq!(config.window.initial_width, 1024);
         assert_eq!(config.window.initial_height, 768);
         assert_eq!(config.terminal.cols, 132);

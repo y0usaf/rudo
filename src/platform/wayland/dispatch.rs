@@ -15,9 +15,14 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
+use crate::info_log;
 use crate::input::Key;
+use crate::warn_log;
 
 const FRACTIONAL_SCALE_DIVISOR: f32 = 120.0;
 const WAYLAND_SCROLL_DISCRETE_FACTOR: f64 = 120.0;
@@ -62,6 +67,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.wm_base = Some(wm_base);
                     state.init_window(qh);
                 }
+                "zxdg_decoration_manager_v1" => {
+                    let manager = registry
+                        .bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(
+                            name,
+                            1,
+                            qh,
+                            (),
+                        );
+                    state.decoration_manager = Some(manager);
+                }
                 "wl_output" => {
                     let ver = version.min(4);
                     let output = registry.bind::<wl_output::WlOutput, _, _>(name, ver, qh, name);
@@ -98,6 +113,7 @@ delegate_noop!(WaylandState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WaylandState: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandState: ignore wp_viewport::WpViewport);
 delegate_noop!(WaylandState: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+delegate_noop!(WaylandState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 
 // ─── wl_output: track per-output integer scale ──────────────────────────────────
 
@@ -278,6 +294,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
     }
 }
 
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _decoration: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        event: zxdg_toplevel_decoration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
+            let _ = mode;
+        }
+    }
+}
+
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn event(
         state: &mut Self,
@@ -400,13 +431,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 if file.read_exact(&mut buf).is_ok() {
                     state.xkb = XkbContextData::from_keymap_string(&buf);
                     if let Some(xkb) = &mut state.xkb {
-                        eprintln!("[INFO] Wayland xkb keymap loaded");
+                        info_log!("Wayland xkb keymap loaded");
                         state.app.set_modifiers(xkb.modifiers());
                     } else {
-                        eprintln!("[WARN] Wayland xkb keymap parse failed, using fallback keymap");
+                        warn_log!("Wayland xkb keymap parse failed, using fallback keymap");
                     }
                 } else {
-                    eprintln!("[WARN] Wayland keymap read failed, using fallback keymap");
+                    warn_log!("Wayland keymap read failed, using fallback keymap");
                 }
             }
             wl_keyboard::Event::Modifiers {

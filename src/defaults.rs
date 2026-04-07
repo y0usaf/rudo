@@ -33,9 +33,9 @@ pub const DEFAULT_CURSOR_TRAIL_SIZE: f32 = 1.0;
 pub const DEFAULT_CURSOR_BLINK_ENABLED: bool = false;
 pub const DEFAULT_CURSOR_BLINK_INTERVAL_SECS: f32 = 0.6;
 
-pub const DEFAULT_WINDOW_OPACITY: f32 = 1.0;
-pub const DEFAULT_WINDOW_ALPHA_MODE: &str = "default";
-pub const DEFAULT_WINDOW_PADDING_PX: u32 = 2;
+// Match foot's default padding: 0px. This also avoids exposing compositor
+// focus rings/borders through edge padding on compositors like Niri.
+pub const DEFAULT_WINDOW_PADDING_PX: u32 = 0;
 pub const DEFAULT_WINDOW_INITIAL_WIDTH: u32 = 800;
 pub const DEFAULT_WINDOW_INITIAL_HEIGHT: u32 = 600;
 

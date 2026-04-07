@@ -13,11 +13,15 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::cli::CliArgs;
 use crate::core_app::CoreApp;
 use crate::defaults::{DEFAULT_WINDOW_INITIAL_HEIGHT, DEFAULT_WINDOW_INITIAL_WIDTH};
+use crate::info_log;
 use crate::input::{KeyEvent, Modifiers};
 use crate::software_renderer::{FrameBuffer, SoftwareRenderer};
 
@@ -62,9 +66,11 @@ struct WaylandState {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
+    toplevel_decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     pointer_focus: bool,
@@ -87,22 +93,36 @@ struct WaylandState {
 }
 
 impl WaylandState {
+    fn update_window_geometry(&self) {
+        let Some(xdg_surface) = &self.xdg_surface else {
+            return;
+        };
+
+        // Tell the compositor the logical bounds of the toplevel surface.
+        // This is especially important for compositors like Niri, which use
+        // window geometry when placing focus rings / other scene decorations.
+        //
+        // Without this, some compositors infer geometry from surface extents or
+        // buffer state, which can interact poorly with fractional scale +
+        // viewported buffers and make the compositor's active border appear
+        // visually overlaid into the window.
+        xdg_surface.set_window_geometry(0, 0, self.width as i32, self.height as i32);
+    }
+
     fn update_opaque_region(&self, qh: &QueueHandle<Self>) {
         let Some(surface) = &self.surface else {
             return;
         };
+        let Some(compositor) = &self.compositor else {
+            return;
+        };
 
-        if self.app.config().window.opacity >= 1.0 {
-            let Some(compositor) = &self.compositor else {
-                return;
-            };
-            let region: wl_region::WlRegion = compositor.create_region(qh, ());
-            region.add(0, 0, self.width as i32, self.height as i32);
-            surface.set_opaque_region(Some(&region));
-            region.destroy();
-        } else {
-            surface.set_opaque_region(None);
-        }
+        let region: wl_region::WlRegion = compositor.create_region(qh, ());
+        // Use i32::MAX so the opaque hint covers the surface regardless of
+        // in-flight resizes, matching foot's wl_region_add(0, 0, INT32_MAX, INT32_MAX).
+        region.add(0, 0, i32::MAX, i32::MAX);
+        surface.set_opaque_region(Some(&region));
+        region.destroy();
     }
 
     fn init_window(&mut self, qh: &QueueHandle<Self>) {
@@ -119,6 +139,16 @@ impl WaylandState {
         toplevel.set_title(self.app.title().into());
         toplevel.set_app_id(self.app.app_id().into());
 
+        // Request server-side decorations when the compositor supports the
+        // xdg-decoration protocol. This matches foot's default preference and
+        // can materially affect how compositors like Niri place focus rings /
+        // active borders relative to the client surface.
+        if let Some(manager) = &self.decoration_manager {
+            let decoration = manager.get_toplevel_decoration(&toplevel, qh, ());
+            decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            self.toplevel_decoration = Some(decoration);
+        }
+
         // Create viewport (for fractional scaling)
         if let Some(viewporter) = &self.viewporter {
             self.viewport = Some(viewporter.get_viewport(&surface, qh, ()));
@@ -128,11 +158,12 @@ impl WaylandState {
             self.fractional_scale = Some(manager.get_fractional_scale(&surface, qh, ()));
         }
 
-        surface.commit();
         self.surface = Some(surface);
         self.xdg_surface = Some(xdg_surface);
         self.toplevel = Some(toplevel);
+        self.update_window_geometry();
         self.update_opaque_region(qh);
+        self.surface.as_ref().unwrap().commit();
     }
 
     /// Physical (buffer) dimensions = logical × scale.
@@ -177,6 +208,7 @@ impl WaylandState {
         if self.surface.is_none() || self.shm.is_none() {
             return;
         }
+        self.update_window_geometry();
         self.update_opaque_region(qh);
         self.ensure_buffers(qh);
         let Some(buf) = self.buffers.iter_mut().find(|b| !b.busy) else {
@@ -278,10 +310,7 @@ impl WaylandState {
             return false;
         }
 
-        eprintln!(
-            "[INFO] Scale changed: {:.3} -> {:.3}",
-            self.scale, new_scale
-        );
+        info_log!("Scale changed: {:.3} -> {:.3}", self.scale, new_scale);
         self.scale = new_scale;
         self.renderer.set_scale(new_scale);
         let (cw, ch) = self.renderer.cell_size();
@@ -370,8 +399,6 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         app.config().font.family.clone(),
         app.theme().clone(),
         padding,
-        app.config().window.opacity,
-        &app.config().window.alpha_mode,
     );
     let (cw, ch) = renderer.cell_size();
     let cell_width = cw.ceil() as u32;
@@ -412,9 +439,11 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         compositor: None,
         shm: None,
         wm_base: None,
+        decoration_manager: None,
         surface: None,
         xdg_surface: None,
         toplevel: None,
+        toplevel_decoration: None,
         keyboard: None,
         pointer: None,
         pointer_focus: false,
