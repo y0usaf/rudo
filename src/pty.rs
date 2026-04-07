@@ -21,11 +21,12 @@ impl fmt::Display for PtyError {
 }
 impl std::error::Error for PtyError {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PtySpawnConfig<'a> {
     pub term: &'a str,
     pub colorterm: &'a str,
     pub shell_fallback: &'a str,
+    pub command: &'a [String],
 }
 
 /// A PTY master with the child process.
@@ -118,13 +119,25 @@ impl Pty {
                 let colorterm_key = CString::new(COLORTERM_ENV_VAR).unwrap();
                 libc::setenv(colorterm_key.as_ptr(), colorterm.as_ptr(), 1);
 
-                let shell = std::env::var(SHELL_ENV_VAR)
-                    .unwrap_or_else(|_| config.shell_fallback.to_string());
-                let shell_cstr = CString::new(shell).unwrap();
-                libc::execvp(
-                    shell_cstr.as_ptr(),
-                    [shell_cstr.as_ptr(), std::ptr::null()].as_ptr(),
-                );
+                if config.command.is_empty() {
+                    let shell = std::env::var(SHELL_ENV_VAR)
+                        .unwrap_or_else(|_| config.shell_fallback.to_string());
+                    let shell_cstr = CString::new(shell).unwrap();
+                    libc::execvp(
+                        shell_cstr.as_ptr(),
+                        [shell_cstr.as_ptr(), std::ptr::null()].as_ptr(),
+                    );
+                } else {
+                    let cmd_cstrs: Vec<CString> = config
+                        .command
+                        .iter()
+                        .map(|s| CString::new(s.as_str()).unwrap())
+                        .collect();
+                    let mut argv: Vec<*const libc::c_char> =
+                        cmd_cstrs.iter().map(|c| c.as_ptr()).collect();
+                    argv.push(std::ptr::null());
+                    libc::execvp(cmd_cstrs[0].as_ptr(), argv.as_ptr());
+                }
                 libc::_exit(1);
             }
         }

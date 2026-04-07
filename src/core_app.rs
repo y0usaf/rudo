@@ -49,6 +49,7 @@ pub struct CoreApp {
     scroll_accumulator: f64,
     needs_redraw: bool,
     pty_dead: bool,
+    command: Vec<String>,
 }
 
 impl CoreApp {
@@ -60,6 +61,7 @@ impl CoreApp {
         if let Some(title) = cli.title {
             config.window.title = title;
         }
+        let command = cli.command;
         let theme = Theme::load_theme_file().unwrap_or_else(|| {
             use crate::terminal::theme::ThemeColorStrings;
             let c = &config.colors;
@@ -126,6 +128,7 @@ impl CoreApp {
             scroll_accumulator: 0.0,
             needs_redraw: true,
             pty_dead: false,
+            command,
         }
     }
 
@@ -179,6 +182,7 @@ impl CoreApp {
             term: &self.config.terminal.term,
             colorterm: &self.config.terminal.colorterm,
             shell_fallback: &self.config.terminal.shell_fallback,
+            command: &self.command,
         };
         match Pty::spawn(cols as u16, rows as u16, &spawn_config) {
             Ok(pty) => self.pty = Some(pty),

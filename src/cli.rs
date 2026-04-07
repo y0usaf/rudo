@@ -5,6 +5,7 @@ use crate::defaults::{APP_NAME, VERSION};
 pub struct CliArgs {
     pub app_id: Option<String>,
     pub title: Option<String>,
+    pub command: Vec<String>,
 }
 
 impl CliArgs {
@@ -13,6 +14,7 @@ impl CliArgs {
         let mut cli = CliArgs {
             app_id: None,
             title: None,
+            command: Vec::new(),
         };
 
         while let Some(arg) = args.next() {
@@ -43,10 +45,22 @@ impl CliArgs {
                 _ if arg.starts_with("--title=") => {
                     cli.title = Some(arg["--title=".len()..].to_string());
                 }
-                other => {
+                "-e" => {
+                    // -e is accepted for xterm compatibility; it simply stops
+                    // option parsing. All remaining args become the command.
+                    cli.command = args.collect();
+                    return cli;
+                }
+                other if other.starts_with('-') => {
                     eprintln!("{APP_NAME}: unknown option '{other}'");
                     eprint!("{}", usage());
                     std::process::exit(1);
+                }
+                _ => {
+                    // First positional argument starts the command.
+                    cli.command.push(arg);
+                    cli.command.extend(args);
+                    return cli;
                 }
             }
         }
@@ -57,7 +71,7 @@ impl CliArgs {
 
 fn usage() -> String {
     format!(
-        "Usage: {APP_NAME} [OPTIONS]\n\nOptions:\n  -a, --app-id ID     Set the Wayland app-id (default: from config or \"{APP_NAME}\")\n  -t, --title TITLE   Set the initial window title\n  -h, --help          Print this help message and exit\n  -v, --version       Print version and exit\n"
+        "Usage: {APP_NAME} [OPTIONS] [command [ARGS...]]\n\nOptions:\n  -a, --app-id ID     Set the Wayland app-id (default: from config or \"{APP_NAME}\")\n  -t, --title TITLE   Set the initial window title\n  -e                   Ignored (xterm compat); stops option parsing\n  -h, --help          Print this help message and exit\n  -v, --version       Print version and exit\n"
     )
 }
 
