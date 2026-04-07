@@ -371,6 +371,7 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         app.theme().clone(),
         padding,
         app.config().window.opacity,
+        &app.config().window.alpha_mode,
     );
     let (cw, ch) = renderer.cell_size();
     let cell_width = cw.ceil() as u32;

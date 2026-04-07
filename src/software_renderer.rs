@@ -42,8 +42,26 @@ pub struct SoftwareRenderer {
     baseline: i32,
     padding: u32,
     background_alpha: u8,
+    alpha_mode: AlphaMode,
     offset_x: u32,
     offset_y: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlphaMode {
+    Default,
+    Matching,
+    All,
+}
+
+impl AlphaMode {
+    fn from_config(value: &str) -> Self {
+        match value {
+            "matching" => Self::Matching,
+            "all" => Self::All,
+            _ => Self::Default,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -54,6 +72,7 @@ impl SoftwareRenderer {
         theme: Theme,
         padding: u32,
         background_opacity: f32,
+        alpha_mode: &str,
     ) -> Self {
         let font_size = font_size.max(1.0);
         let mut renderer = Self {
@@ -68,6 +87,7 @@ impl SoftwareRenderer {
             baseline: 0,
             padding,
             background_alpha: Self::opacity_to_alpha(background_opacity),
+            alpha_mode: AlphaMode::from_config(alpha_mode),
             offset_x: 0,
             offset_y: 0,
         };
@@ -97,6 +117,7 @@ impl SoftwareRenderer {
     }
 
     fn cell_uses_background_opacity(
+        alpha_mode: AlphaMode,
         bg_src: ColorSource,
         bg: PackedColor,
         theme_bg: PackedColor,
@@ -107,7 +128,11 @@ impl SoftwareRenderer {
             return false;
         }
 
-        bg_src == ColorSource::Default || bg == theme_bg
+        match alpha_mode {
+            AlphaMode::Default => bg_src == ColorSource::Default,
+            AlphaMode::Matching => bg_src == ColorSource::Default || bg == theme_bg,
+            AlphaMode::All => true,
+        }
     }
 
     fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
@@ -248,11 +273,12 @@ impl SoftwareRenderer {
                     .map(|(start, end)| col >= start && col <= end)
                     .unwrap_or(false);
 
-                // Treat explicit backgrounds that *match* the default theme
-                // background as transparent too. Many TUIs paint the default
-                // background color explicitly, which would otherwise punch
-                // opaque holes through the window.
+                // Foot-style alpha handling: by default only cells using the
+                // terminal's actual default background get window opacity.
+                // Optional modes can extend this to matching explicit colors or
+                // all backgrounds.
                 let cell_uses_bg_opacity = Self::cell_uses_background_opacity(
+                    self.alpha_mode,
                     cell.bg_src,
                     bg,
                     self.theme.background,
@@ -817,6 +843,7 @@ mod tests {
     fn cell_alpha_default_bg_gets_transparency() {
         let bg_alpha: u8 = 180;
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::Default,
             ColorSource::Default,
             PackedColor::new(0x1e, 0x1e, 0x1e),
             PackedColor::new(0x1e, 0x1e, 0x1e),
@@ -828,10 +855,27 @@ mod tests {
     }
 
     #[test]
-    fn cell_alpha_matching_explicit_bg_gets_transparency() {
+    fn cell_alpha_matching_explicit_bg_stays_opaque_in_default_mode() {
         let bg_alpha: u8 = 180;
         let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::Default,
+            ColorSource::Rgb,
+            theme_bg,
+            theme_bg,
+            false,
+            false,
+        );
+        let cell_alpha = if uses_bg_opacity { bg_alpha } else { 255 };
+        assert_eq!(cell_alpha, 255);
+    }
+
+    #[test]
+    fn cell_alpha_matching_explicit_bg_gets_transparency_in_matching_mode() {
+        let bg_alpha: u8 = 180;
+        let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
+        let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::Matching,
             ColorSource::Rgb,
             theme_bg,
             theme_bg,
@@ -846,6 +890,7 @@ mod tests {
     fn cell_alpha_explicit_non_matching_bg_stays_opaque() {
         let bg_alpha: u8 = 180;
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::Matching,
             ColorSource::Rgb,
             PackedColor::new(0x26, 0x4f, 0x78),
             PackedColor::new(0x1e, 0x1e, 0x1e),
@@ -861,6 +906,7 @@ mod tests {
         let bg_alpha: u8 = 180;
         let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::All,
             ColorSource::Default,
             theme_bg,
             theme_bg,
@@ -876,6 +922,7 @@ mod tests {
         let bg_alpha: u8 = 180;
         let theme_bg = PackedColor::new(0x1e, 0x1e, 0x1e);
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::All,
             ColorSource::Default,
             theme_bg,
             theme_bg,
@@ -890,6 +937,7 @@ mod tests {
     fn cell_alpha_opaque_when_no_transparency() {
         let bg_alpha: u8 = 255;
         let uses_bg_opacity = SoftwareRenderer::cell_uses_background_opacity(
+            AlphaMode::Default,
             ColorSource::Default,
             PackedColor::new(0x1e, 0x1e, 0x1e),
             PackedColor::new(0x1e, 0x1e, 0x1e),
