@@ -86,7 +86,8 @@ impl TomlTable {
     }
 
     pub fn get_usize(&self, section: &str, key: &str) -> Option<usize> {
-        self.get_i64(section, key).map(|i| i as usize)
+        self.get_i64(section, key)
+            .and_then(|i| usize::try_from(i).ok())
     }
 
     pub fn get_bool(&self, section: &str, key: &str) -> Option<bool> {
@@ -115,7 +116,12 @@ fn parse_value(raw: &str) -> Result<TomlValue, String> {
     // Quoted string
     if val.starts_with('"') {
         if let Some(end) = val[1..].find('"') {
-            return Ok(TomlValue::String(val[1..1 + end].to_string()));
+            let string_end = 1 + end;
+            let trailing = val[string_end + 1..].trim_start();
+            if !trailing.is_empty() && !trailing.starts_with('#') {
+                return Err(format!("cannot parse value: {}", val));
+            }
+            return Ok(TomlValue::String(val[1..string_end].to_string()));
         }
         return Err(format!("unclosed string: {}", val));
     }
@@ -188,8 +194,29 @@ color0 = "#282828"
     }
 
     #[test]
+    fn negative_integer_does_not_wrap_to_usize() {
+        let input = "[scrollback]\nlines = -1\n";
+        let table = TomlTable::parse(input).unwrap();
+        assert_eq!(table.get_i64("scrollback", "lines"), Some(-1));
+        assert_eq!(table.get_usize("scrollback", "lines"), None);
+    }
+
+    #[test]
     fn parse_comments() {
         let input = "# comment\n[s]\nk = \"v\" # inline comment\n";
+        let table = TomlTable::parse(input).unwrap();
+        assert_eq!(table.get_str("s", "k"), Some("v"));
+    }
+
+    #[test]
+    fn reject_trailing_garbage_after_quoted_string() {
+        let err = TomlTable::parse("[s]\nk = \"v\" garbage\n").unwrap_err();
+        assert!(err.contains("cannot parse value"));
+    }
+
+    #[test]
+    fn allow_whitespace_and_comment_after_quoted_string() {
+        let input = "[s]\nk = \"v\"   # ok\n";
         let table = TomlTable::parse(input).unwrap();
         assert_eq!(table.get_str("s", "k"), Some("v"));
     }

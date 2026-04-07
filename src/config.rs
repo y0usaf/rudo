@@ -546,6 +546,33 @@ shell_fallback = "/usr/bin/zsh"
     }
 
     #[test]
+    fn test_negative_integer_config_values_fall_back_to_defaults() {
+        let toml_str = r##"
+[window]
+padding = -1
+initial_width = -1024
+initial_height = -768
+
+[terminal]
+cols = -132
+rows = -43
+
+[scrollback]
+lines = -10000
+"##;
+        let table = TomlTable::parse(toml_str).unwrap();
+        let config = Config::from_toml(&table);
+        let defaults = Config::default();
+
+        assert_eq!(config.window.padding, defaults.window.padding);
+        assert_eq!(config.window.initial_width, defaults.window.initial_width);
+        assert_eq!(config.window.initial_height, defaults.window.initial_height);
+        assert_eq!(config.terminal.cols, defaults.terminal.cols);
+        assert_eq!(config.terminal.rows, defaults.terminal.rows);
+        assert_eq!(config.scrollback.lines, defaults.scrollback.lines);
+    }
+
+    #[test]
     fn test_default_ansi_colors() {
         let colors = ColorConfig::default();
         assert_eq!(colors.black, DEFAULT_ANSI_HEX[0]);
