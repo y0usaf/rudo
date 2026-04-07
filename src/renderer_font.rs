@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::defaults::DEFAULT_FONT_FAMILY;
 use crate::freetype_ffi as ft;
@@ -35,6 +36,7 @@ const USER_FONT_SUBDIR: &str = ".local/share/fonts";
 const USER_NERD_FONT_SUBDIR: &str = ".nerd-fonts";
 const SHARE_FONTS_SUBDIR: &str = "share/fonts";
 const NIXOS_SYSTEM_FONT_DIR: &str = "/run/current-system/sw/share/fonts";
+const FC_LIST_COMMAND: &str = "fc-list";
 
 #[cfg(target_os = "linux")]
 const SYSTEM_FONT_DIRS: &[&str] = &["/usr/share/fonts"];
@@ -187,7 +189,8 @@ enum FontStyle {
 impl FontAtlas {
     pub fn new(font_size: f32, preferred_family: &str) -> Self {
         let search_roots = build_search_roots();
-        let font_files = collect_font_files(&search_roots);
+        let mut font_files = collect_font_files(&search_roots);
+        extend_with_fontconfig_files(&mut font_files);
         let (font_regular, font_bold, font_italic, font_bold_italic) =
             load_fonts(&font_files, font_size, preferred_family);
         let fallback_fonts = load_fallback_fonts(&font_files, font_size);
@@ -578,23 +581,27 @@ fn load_fonts(
         let Some(regular_candidate) = family.iter().find(|c| c.style == FontStyle::Regular) else {
             continue;
         };
-        if let Some(regular_path) = find_font_file(font_files, regular_candidate.name_fragment) {
+        if let Some(regular_path) = find_font_file_with_style(
+            font_files,
+            regular_candidate.name_fragment,
+            regular_candidate.style,
+        ) {
             if let Ok(regular_font) = load_font_from_path(&regular_path, px) {
                 eprintln!("[INFO] Primary font: {}", regular_path.display());
                 let bold = family
                     .iter()
                     .find(|c| c.style == FontStyle::Bold)
-                    .and_then(|c| find_font_file(font_files, c.name_fragment))
+                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
                     .and_then(|p| load_font_from_path(&p, px).ok());
                 let italic = family
                     .iter()
                     .find(|c| c.style == FontStyle::Italic)
-                    .and_then(|c| find_font_file(font_files, c.name_fragment))
+                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
                     .and_then(|p| load_font_from_path(&p, px).ok());
                 let bold_italic = family
                     .iter()
                     .find(|c| c.style == FontStyle::BoldItalic)
-                    .and_then(|c| find_font_file(font_files, c.name_fragment))
+                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
                     .and_then(|p| load_font_from_path(&p, px).ok());
                 return (regular_font, bold, italic, bold_italic);
             }
@@ -740,6 +747,30 @@ fn collect_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+fn extend_with_fontconfig_files(out: &mut Vec<PathBuf>) {
+    let Ok(output) = Command::new(FC_LIST_COMMAND)
+        .arg("-f")
+        .arg("%{file}\n")
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let path = PathBuf::from(line.trim());
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == &path) {
+            out.push(path);
+        }
+    }
+}
+
 fn collect_font_files_rec(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(meta) = fs::metadata(path) else {
         return;
@@ -773,6 +804,26 @@ fn find_font_file(files: &[PathBuf], name_fragment: &str) -> Option<PathBuf> {
                 .contains(&needle)
         })
         .cloned()
+}
+
+fn find_font_file_with_style(
+    files: &[PathBuf],
+    name_fragment: &str,
+    style: FontStyle,
+) -> Option<PathBuf> {
+    let needle = name_fragment.to_ascii_lowercase();
+    files
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains(&needle)
+                && style_matches(p, style)
+        })
+        .cloned()
+        .or_else(|| find_font_file(files, name_fragment))
 }
 
 fn load_font_from_path(path: &Path, size_px: u32) -> Result<FtFont, String> {

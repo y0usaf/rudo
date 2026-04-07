@@ -21,12 +21,19 @@
         libxkbcommon
         wayland
       ];
+    runtimePackagesFor = system:
+      with pkgsFor.${system}; [
+        fontconfig
+        dejavu_fonts
+        liberation_ttf
+      ];
   in {
     packages = forAllSystems (system: let
       pkgs = pkgsFor.${system};
       lib = pkgs.lib;
       craneLib = crane.mkLib pkgs;
       runtimeLibs = runtimeLibsFor system;
+      runtimePackages = runtimePackagesFor system;
 
       useMold = pkgs.stdenv.isLinux;
 
@@ -41,7 +48,7 @@
           ]
           ++ lib.optionals useMold [ clang mold ];
 
-        buildInputs = runtimeLibs;
+        buildInputs = runtimeLibs ++ runtimePackages;
 
         LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
       } // lib.optionalAttrs useMold {
@@ -56,7 +63,9 @@
 
         postFixup = ''
           wrapProgram $out/bin/rudo \
-            --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs}
+            --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
+            --prefix PATH : ${lib.makeBinPath runtimePackages} \
+            --prefix XDG_DATA_DIRS : ${lib.concatStringsSep ":" (map (pkg: "${pkg}/share") runtimePackages)}
         '';
       });
     in {
@@ -89,6 +98,7 @@
       pkgs = pkgsFor.${system};
       lib = pkgs.lib;
       runtimeLibs = runtimeLibsFor system;
+      runtimePackages = runtimePackagesFor system;
 
       useMold = pkgs.stdenv.isLinux;
     in {
@@ -96,10 +106,13 @@
           packages = with pkgs;
             [ cargo rustc rustfmt clippy pkg-config ]
             ++ lib.optionals useMold [ clang mold ]
-            ++ runtimeLibs;
+            ++ runtimeLibs
+            ++ runtimePackages;
 
           shellHook = ''
             export LD_LIBRARY_PATH="${lib.makeLibraryPath runtimeLibs}:''${LD_LIBRARY_PATH:-}"
+            export PATH="${lib.makeBinPath runtimePackages}:''${PATH:-}"
+            export XDG_DATA_DIRS="${lib.concatStringsSep ":" (map (pkg: "${pkg}/share") runtimePackages)}:''${XDG_DATA_DIRS:-}"
             echo "rudo dev shell"
           '';
         }
