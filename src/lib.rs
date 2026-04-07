@@ -4,6 +4,7 @@ pub(crate) mod core_app;
 pub(crate) mod cursor;
 pub(crate) mod defaults;
 pub(crate) mod font;
+pub(crate) mod fontconfig_ffi;
 pub(crate) mod freetype_ffi;
 pub(crate) mod input;
 pub(crate) mod logging;

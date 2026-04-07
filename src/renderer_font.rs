@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
-use crate::defaults::DEFAULT_FONT_FAMILY;
+use crate::defaults::{APP_NAME, DEFAULT_FONT_FAMILY};
+use crate::fontconfig_ffi as fc;
 use crate::freetype_ffi as ft;
+use crate::{error_log, info_log, warn_log};
 
 /// Information about a rasterized glyph's position in the atlas and its metrics.
 #[allow(dead_code)]
@@ -27,25 +31,13 @@ const ASCII_STYLES: usize = 4;
 const ASCII_CACHE_LEN: usize = ASCII_RANGE * ASCII_STYLES;
 const FREETYPE_FIXED_POINT_SCALE: f32 = 64.0;
 const FALLBACK_BASELINE_RATIO: f32 = 0.8;
-const FONT_EXTENSIONS: [&str; 3] = ["ttf", "otf", "ttc"];
 const HOME_ENV_VAR: &str = "HOME";
-const XDG_DATA_HOME_ENV_VAR: &str = "XDG_DATA_HOME";
-const XDG_DATA_DIRS_ENV_VAR: &str = "XDG_DATA_DIRS";
-const NIX_PROFILES_ENV_VAR: &str = "NIX_PROFILES";
-const USER_FONT_SUBDIR: &str = ".local/share/fonts";
-const USER_NERD_FONT_SUBDIR: &str = ".nerd-fonts";
-const SHARE_FONTS_SUBDIR: &str = "share/fonts";
-const NIXOS_SYSTEM_FONT_DIR: &str = "/run/current-system/sw/share/fonts";
-const FC_LIST_COMMAND: &str = "fc-list";
-
-#[cfg(target_os = "linux")]
-const SYSTEM_FONT_DIRS: &[&str] = &["/usr/share/fonts"];
-
-#[cfg(target_os = "freebsd")]
-const SYSTEM_FONT_DIRS: &[&str] = &["/usr/local/share/fonts", "/usr/share/fonts"];
-
-#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-const SYSTEM_FONT_DIRS: &[&str] = &[];
+const XDG_CACHE_HOME_ENV_VAR: &str = "XDG_CACHE_HOME";
+const FONT_PLAN_CACHE_DIR: &str = "font-plans-v1";
+const FONT_PLAN_STYLE_REGULAR: &str = "regular";
+const FONT_PLAN_STYLE_BOLD: &str = "bold";
+const FONT_PLAN_STYLE_ITALIC: &str = "italic";
+const FONT_PLAN_STYLE_BOLD_ITALIC: &str = "bold-italic";
 
 #[inline]
 fn ascii_cache_idx(ch: u8, bold: bool, italic: bool) -> usize {
@@ -139,7 +131,6 @@ impl Drop for FtFont {
 // ── FreeType library (global) ────────────────────────────────────────────────
 
 fn ft_library() -> ft::FT_Library {
-    use std::sync::OnceLock;
     static LIB: OnceLock<usize> = OnceLock::new();
     let ptr = *LIB.get_or_init(|| {
         let fth = ft::ft();
@@ -151,14 +142,30 @@ fn ft_library() -> ft::FT_Library {
     ptr as ft::FT_Library
 }
 
+static FONT_PLAN_CACHE: OnceLock<Mutex<HashMap<String, FontPlan>>> = OnceLock::new();
+
 // ── FontAtlas ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct FontPlan {
+    regular: PathBuf,
+    bold: Option<PathBuf>,
+    italic: Option<PathBuf>,
+    bold_italic: Option<PathBuf>,
+    fallbacks: Vec<PathBuf>,
+}
 
 pub struct FontAtlas {
     font_regular: FtFont,
     font_bold: Option<FtFont>,
     font_italic: Option<FtFont>,
     font_bold_italic: Option<FtFont>,
+    font_bold_path: Option<PathBuf>,
+    font_italic_path: Option<PathBuf>,
+    font_bold_italic_path: Option<PathBuf>,
     fallback_fonts: Vec<FtFont>,
+    fallback_font_paths: Vec<PathBuf>,
+    next_fallback_font: usize,
     #[allow(dead_code)]
     font_size: f32,
     cell_width: f32,
@@ -173,43 +180,27 @@ pub struct FontAtlas {
     ascii_populated: [bool; ASCII_CACHE_LEN],
 }
 
-struct FontCandidate {
-    name_fragment: &'static str,
-    style: FontStyle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FontStyle {
-    Regular,
-    Bold,
-    Italic,
-    BoldItalic,
-}
-
 impl FontAtlas {
     pub fn new(font_size: f32, preferred_family: &str) -> Self {
-        let search_roots = build_search_roots();
-        let mut font_files = collect_font_files(&search_roots);
-        extend_with_fontconfig_files(&mut font_files);
-        let (font_regular, font_bold, font_italic, font_bold_italic) =
-            load_fonts(&font_files, font_size, preferred_family);
-        let fallback_fonts = load_fallback_fonts(&font_files, font_size);
-        if !fallback_fonts.is_empty() {
-            eprintln!(
-                "[INFO] Loaded {} fallback/symbol font(s)",
-                fallback_fonts.len()
-            );
-        }
+        let font_plan = load_or_build_font_plan(preferred_family);
+        let font_regular = load_primary_font(&font_plan, font_size);
         let cell_width = compute_cell_width(&font_regular, font_size);
         let cell_height = compute_cell_height(&font_regular);
         let atlas_data = vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT * 4) as usize];
 
         FontAtlas {
             font_regular,
-            font_bold,
-            font_italic,
-            font_bold_italic,
-            fallback_fonts,
+            font_bold: None,
+            font_italic: None,
+            font_bold_italic: None,
+            font_bold_path: font_plan.bold.filter(|path| path != &font_plan.regular),
+            font_italic_path: font_plan.italic.filter(|path| path != &font_plan.regular),
+            font_bold_italic_path: font_plan
+                .bold_italic
+                .filter(|path| path != &font_plan.regular),
+            fallback_fonts: Vec::new(),
+            fallback_font_paths: font_plan.fallbacks.clone(),
+            next_fallback_font: 0,
             font_size,
             cell_width,
             cell_height,
@@ -362,468 +353,495 @@ impl FontAtlas {
         self.dirty = false;
     }
 
-    fn pick_font_with_fallback(&self, ch: char, bold: bool, italic: bool) -> &FtFont {
-        let primary = self.pick_styled_font(bold, italic);
+    fn pick_font_with_fallback(&mut self, ch: char, bold: bool, italic: bool) -> &FtFont {
         if (ch as u32) < 128 {
-            return primary;
+            return self.pick_styled_font(bold, italic);
         }
-        if primary.has_glyph(ch) {
-            return primary;
+
+        if self.pick_styled_font(bold, italic).has_glyph(ch) {
+            return self.pick_styled_font(bold, italic);
         }
         if self.font_regular.has_glyph(ch) {
             return &self.font_regular;
         }
-        for fb in &self.fallback_fonts {
-            if fb.has_glyph(ch) {
-                return fb;
+
+        for idx in 0..self.fallback_fonts.len() {
+            if self.fallback_fonts[idx].has_glyph(ch) {
+                return &self.fallback_fonts[idx];
             }
         }
-        primary
+
+        while self.next_fallback_font < self.fallback_font_paths.len() {
+            let path = self.fallback_font_paths[self.next_fallback_font].clone();
+            self.next_fallback_font += 1;
+
+            match load_font_from_path(&path, self.font_size.round() as u32) {
+                Ok(font) => {
+                    info_log!("Fallback font: {}", path.display());
+                    let has_glyph = font.has_glyph(ch);
+                    self.fallback_fonts.push(font);
+                    if has_glyph {
+                        let idx = self.fallback_fonts.len() - 1;
+                        return &self.fallback_fonts[idx];
+                    }
+                }
+                Err(e) => {
+                    warn_log!("Failed to load fallback {}: {}", path.display(), e);
+                }
+            }
+        }
+
+        self.pick_styled_font(bold, italic)
     }
 
-    fn pick_styled_font(&self, bold: bool, italic: bool) -> &FtFont {
+    fn pick_styled_font(&mut self, bold: bool, italic: bool) -> &FtFont {
         match (bold, italic) {
-            (true, true) => self
-                .font_bold_italic
-                .as_ref()
-                .or(self.font_bold.as_ref())
-                .or(self.font_italic.as_ref())
-                .unwrap_or(&self.font_regular),
-            (true, false) => self.font_bold.as_ref().unwrap_or(&self.font_regular),
-            (false, true) => self.font_italic.as_ref().unwrap_or(&self.font_regular),
+            (true, true) => {
+                self.ensure_bold_italic_font();
+                self.font_bold_italic
+                    .as_ref()
+                    .or(self.font_bold.as_ref())
+                    .or(self.font_italic.as_ref())
+                    .unwrap_or(&self.font_regular)
+            }
+            (true, false) => {
+                self.ensure_bold_font();
+                self.font_bold.as_ref().unwrap_or(&self.font_regular)
+            }
+            (false, true) => {
+                self.ensure_italic_font();
+                self.font_italic.as_ref().unwrap_or(&self.font_regular)
+            }
             (false, false) => &self.font_regular,
+        }
+    }
+
+    fn ensure_bold_font(&mut self) {
+        if self.font_bold.is_none() {
+            if let Some(path) = self.font_bold_path.clone() {
+                self.font_bold = load_optional_style_font(&path, self.font_size.round() as u32);
+            }
+        }
+    }
+
+    fn ensure_italic_font(&mut self) {
+        if self.font_italic.is_none() {
+            if let Some(path) = self.font_italic_path.clone() {
+                self.font_italic = load_optional_style_font(&path, self.font_size.round() as u32);
+            }
+        }
+    }
+
+    fn ensure_bold_italic_font(&mut self) {
+        if self.font_bold_italic.is_none() {
+            if let Some(path) = self.font_bold_italic_path.clone() {
+                self.font_bold_italic =
+                    load_optional_style_font(&path, self.font_size.round() as u32);
+            }
         }
     }
 }
 
 // ── Font loading helpers ─────────────────────────────────────────────────────
 
-fn build_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
+fn load_or_build_font_plan(preferred_family: &str) -> FontPlan {
+    let request = normalize_font_request(preferred_family);
+    let cache = FONT_PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    for dir in SYSTEM_FONT_DIRS {
-        push_unique_path(&mut roots, PathBuf::from(dir));
+    if let Some(plan) = cache
+        .lock()
+        .expect("font plan cache poisoned")
+        .get(&request)
+    {
+        return plan.clone();
     }
 
-    if let Some(home) = std::env::var_os(HOME_ENV_VAR) {
-        let mut local = PathBuf::from(&home);
-        local.push(USER_FONT_SUBDIR);
-        push_unique_path(&mut roots, local);
+    let plan = read_font_plan_cache(&request)
+        .or_else(|| resolve_font_plan_via_fontconfig(&request))
+        .unwrap_or_else(|| {
+            error_log!("No usable system monospace font found.");
+            eprintln!(
+                "        Install a monospace font or set [font].family in the config (eg. JetBrains Mono, Fira Code, DejaVu Sans Mono, Liberation Mono)."
+            );
+            std::process::exit(1);
+        });
 
-        let mut nerd = PathBuf::from(&home);
-        nerd.push(USER_NERD_FONT_SUBDIR);
-        push_unique_path(&mut roots, nerd);
-    }
-
-    if let Ok(xdg) = std::env::var(XDG_DATA_HOME_ENV_VAR) {
-        if !xdg.is_empty() {
-            push_unique_path(&mut roots, PathBuf::from(&xdg).join("fonts"));
-        }
-    }
-
-    if let Ok(xdg_dirs) = std::env::var(XDG_DATA_DIRS_ENV_VAR) {
-        for dir in xdg_dirs.split(':').filter(|dir| !dir.is_empty()) {
-            push_unique_path(&mut roots, PathBuf::from(dir).join("fonts"));
-        }
-    }
-
-    if let Ok(nix_profiles) = std::env::var(NIX_PROFILES_ENV_VAR) {
-        for profile in nix_profiles.split_whitespace() {
-            push_unique_path(&mut roots, PathBuf::from(profile).join(SHARE_FONTS_SUBDIR));
-        }
-    }
-
-    push_unique_path(&mut roots, PathBuf::from(NIXOS_SYSTEM_FONT_DIR));
-    roots
+    write_font_plan_cache(&request, &plan);
+    cache
+        .lock()
+        .expect("font plan cache poisoned")
+        .insert(request, plan.clone());
+    plan
 }
 
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
-fn load_fonts(
-    font_files: &[PathBuf],
-    font_size: f32,
-    preferred_family: &str,
-) -> (FtFont, Option<FtFont>, Option<FtFont>, Option<FtFont>) {
-    let px = font_size.round() as u32;
-
-    if let Some(fonts) = load_preferred_family(font_files, px, preferred_family) {
-        return fonts;
-    }
-
-    let families: &[&[FontCandidate]] = &[
-        &[
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFont-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFont-Bold",
-                style: FontStyle::Bold,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFont-Italic",
-                style: FontStyle::Italic,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFont-BoldItalic",
-                style: FontStyle::BoldItalic,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFontMono-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFontMono-Bold",
-                style: FontStyle::Bold,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFontMono-Italic",
-                style: FontStyle::Italic,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMonoNerdFontMono-BoldItalic",
-                style: FontStyle::BoldItalic,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "FiraCodeNerdFont-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "FiraCodeNerdFont-Bold",
-                style: FontStyle::Bold,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "FiraCodeNerdFontMono-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "FiraCodeNerdFontMono-Bold",
-                style: FontStyle::Bold,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "JetBrainsMono-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMono-Bold",
-                style: FontStyle::Bold,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMono-Italic",
-                style: FontStyle::Italic,
-            },
-            FontCandidate {
-                name_fragment: "JetBrainsMono-BoldItalic",
-                style: FontStyle::BoldItalic,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "FiraCode-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "FiraCode-Bold",
-                style: FontStyle::Bold,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "DejaVuSansMono",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "DejaVuSansMono-Bold",
-                style: FontStyle::Bold,
-            },
-            FontCandidate {
-                name_fragment: "DejaVuSansMono-Oblique",
-                style: FontStyle::Italic,
-            },
-            FontCandidate {
-                name_fragment: "DejaVuSansMono-BoldOblique",
-                style: FontStyle::BoldItalic,
-            },
-        ],
-        &[
-            FontCandidate {
-                name_fragment: "LiberationMono-Regular",
-                style: FontStyle::Regular,
-            },
-            FontCandidate {
-                name_fragment: "LiberationMono-Bold",
-                style: FontStyle::Bold,
-            },
-            FontCandidate {
-                name_fragment: "LiberationMono-Italic",
-                style: FontStyle::Italic,
-            },
-            FontCandidate {
-                name_fragment: "LiberationMono-BoldItalic",
-                style: FontStyle::BoldItalic,
-            },
-        ],
-    ];
-
-    for family in families {
-        let Some(regular_candidate) = family.iter().find(|c| c.style == FontStyle::Regular) else {
-            continue;
-        };
-        if let Some(regular_path) = find_font_file_with_style(
-            font_files,
-            regular_candidate.name_fragment,
-            regular_candidate.style,
-        ) {
-            if let Ok(regular_font) = load_font_from_path(&regular_path, px) {
-                eprintln!("[INFO] Primary font: {}", regular_path.display());
-                let bold = family
-                    .iter()
-                    .find(|c| c.style == FontStyle::Bold)
-                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
-                    .and_then(|p| load_font_from_path(&p, px).ok());
-                let italic = family
-                    .iter()
-                    .find(|c| c.style == FontStyle::Italic)
-                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
-                    .and_then(|p| load_font_from_path(&p, px).ok());
-                let bold_italic = family
-                    .iter()
-                    .find(|c| c.style == FontStyle::BoldItalic)
-                    .and_then(|c| find_font_file_with_style(font_files, c.name_fragment, c.style))
-                    .and_then(|p| load_font_from_path(&p, px).ok());
-                return (regular_font, bold, italic, bold_italic);
-            }
-        }
-    }
-
-    eprintln!("[FATAL] No usable system monospace font found.");
-    eprintln!(
-        "        Install a monospace font or set [font].family in the config (eg. JetBrains Mono, Fira Code, DejaVu Sans Mono, Liberation Mono)."
-    );
-    std::process::exit(1);
-}
-
-fn load_preferred_family(
-    font_files: &[PathBuf],
-    size_px: u32,
-    preferred_family: &str,
-) -> Option<(FtFont, Option<FtFont>, Option<FtFont>, Option<FtFont>)> {
+fn normalize_font_request(preferred_family: &str) -> String {
     let family = preferred_family.trim();
-    if family.is_empty() || family.eq_ignore_ascii_case(DEFAULT_FONT_FAMILY) {
+    if family.is_empty() {
+        DEFAULT_FONT_FAMILY.to_string()
+    } else {
+        family.to_string()
+    }
+}
+
+fn read_font_plan_cache(request: &str) -> Option<FontPlan> {
+    let cache_path = font_plan_cache_path(request)?;
+    let contents = fs::read_to_string(cache_path).ok()?;
+
+    let mut regular = None;
+    let mut bold = None;
+    let mut italic = None;
+    let mut bold_italic = None;
+    let mut fallbacks = Vec::new();
+
+    for line in contents.lines() {
+        let (key, value) = line.split_once('=')?;
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        match key {
+            FONT_PLAN_STYLE_REGULAR => regular = Some(PathBuf::from(value)),
+            FONT_PLAN_STYLE_BOLD => bold = Some(PathBuf::from(value)),
+            FONT_PLAN_STYLE_ITALIC => italic = Some(PathBuf::from(value)),
+            FONT_PLAN_STYLE_BOLD_ITALIC => bold_italic = Some(PathBuf::from(value)),
+            "fallback" => fallbacks.push(PathBuf::from(value)),
+            _ => {}
+        }
+    }
+
+    let regular = regular.filter(|path| path.exists())?;
+    let bold = bold.filter(|path| path.exists());
+    let italic = italic.filter(|path| path.exists());
+    let bold_italic = bold_italic.filter(|path| path.exists());
+    fallbacks.retain(|path| path.exists());
+    dedup_paths(&mut fallbacks);
+
+    Some(FontPlan {
+        regular,
+        bold,
+        italic,
+        bold_italic,
+        fallbacks,
+    })
+}
+
+fn write_font_plan_cache(request: &str, plan: &FontPlan) {
+    let Some(cache_path) = font_plan_cache_path(request) else {
+        return;
+    };
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let mut out = String::new();
+    out.push_str(FONT_PLAN_STYLE_REGULAR);
+    out.push('=');
+    out.push_str(&plan.regular.to_string_lossy());
+    out.push('\n');
+
+    if let Some(path) = &plan.bold {
+        out.push_str(FONT_PLAN_STYLE_BOLD);
+        out.push('=');
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    if let Some(path) = &plan.italic {
+        out.push_str(FONT_PLAN_STYLE_ITALIC);
+        out.push('=');
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    if let Some(path) = &plan.bold_italic {
+        out.push_str(FONT_PLAN_STYLE_BOLD_ITALIC);
+        out.push('=');
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+    for path in &plan.fallbacks {
+        out.push_str("fallback=");
+        out.push_str(&path.to_string_lossy());
+        out.push('\n');
+    }
+
+    let _ = fs::write(cache_path, out);
+}
+
+fn font_plan_cache_path(request: &str) -> Option<PathBuf> {
+    let mut base = if let Ok(path) = std::env::var(XDG_CACHE_HOME_ENV_VAR) {
+        if path.is_empty() {
+            return None;
+        }
+        PathBuf::from(path)
+    } else {
+        let home = std::env::var_os(HOME_ENV_VAR)?;
+        PathBuf::from(home).join(".cache")
+    };
+
+    base.push(APP_NAME);
+    base.push(FONT_PLAN_CACHE_DIR);
+    base.push(format!("{}.txt", sanitize_cache_key(request)));
+    Some(base)
+}
+
+fn sanitize_cache_key(request: &str) -> String {
+    let mut out = String::with_capacity(request.len());
+    let mut last_was_sep = false;
+
+    for ch in request.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+
+    let out = out.trim_matches('_').chars().take(80).collect::<String>();
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
+}
+
+fn resolve_font_plan_via_fontconfig(request: &str) -> Option<FontPlan> {
+    let regular = fontconfig_match_file(request)?;
+    let bold = fontconfig_match_first_existing(request, &["style=Bold"]);
+    let italic = fontconfig_match_first_existing(request, &["style=Italic", "style=Oblique"]);
+    let bold_italic = fontconfig_match_first_existing(
+        request,
+        &[
+            "style=Bold Italic",
+            "style=Bold Oblique",
+            "style=Italic Bold",
+        ],
+    );
+
+    let mut fallbacks = fontconfig_sort_files(request)?;
+    let mut exclude = vec![regular.clone()];
+    if let Some(path) = &bold {
+        exclude.push(path.clone());
+    }
+    if let Some(path) = &italic {
+        exclude.push(path.clone());
+    }
+    if let Some(path) = &bold_italic {
+        exclude.push(path.clone());
+    }
+    fallbacks.retain(|path| !exclude.iter().any(|existing| existing == path));
+    dedup_paths(&mut fallbacks);
+
+    info_log!("Primary font: {}", regular.display());
+    Some(FontPlan {
+        regular,
+        bold,
+        italic,
+        bold_italic,
+        fallbacks,
+    })
+}
+
+fn fontconfig_match_first_existing(request: &str, attrs: &[&str]) -> Option<PathBuf> {
+    for attr in attrs {
+        let pattern = format!("{request}:{attr}");
+        if let Some(path) = fontconfig_match_file(&pattern) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn fontconfig_match_file(pattern_str: &str) -> Option<PathBuf> {
+    if let Some(fch) = fc::try_fontconfig() {
+        unsafe {
+            let config = (fch.FcInitLoadConfigAndFonts)();
+            if config.is_null() {
+                return fontconfig_match_file_command(pattern_str);
+            }
+
+            let pattern = match build_fontconfig_pattern(fch, config, pattern_str) {
+                Some(pattern) => pattern,
+                None => {
+                    (fch.FcConfigDestroy)(config);
+                    return fontconfig_match_file_command(pattern_str);
+                }
+            };
+            let mut result = fc::FcResultNoMatch;
+            let matched = (fch.FcFontMatch)(config, pattern, &mut result);
+            let path = if matched.is_null() {
+                None
+            } else {
+                fontconfig_pattern_file(fch, matched)
+            };
+
+            if !matched.is_null() {
+                (fch.FcPatternDestroy)(matched);
+            }
+            (fch.FcPatternDestroy)(pattern);
+            (fch.FcConfigDestroy)(config);
+            return path.or_else(|| fontconfig_match_file_command(pattern_str));
+        }
+    }
+
+    fontconfig_match_file_command(pattern_str)
+}
+
+fn fontconfig_sort_files(pattern_str: &str) -> Option<Vec<PathBuf>> {
+    if let Some(fch) = fc::try_fontconfig() {
+        unsafe {
+            let config = (fch.FcInitLoadConfigAndFonts)();
+            if config.is_null() {
+                return fontconfig_sort_files_command(pattern_str);
+            }
+
+            let pattern = match build_fontconfig_pattern(fch, config, pattern_str) {
+                Some(pattern) => pattern,
+                None => {
+                    (fch.FcConfigDestroy)(config);
+                    return fontconfig_sort_files_command(pattern_str);
+                }
+            };
+            let mut result = fc::FcResultNoMatch;
+            let set = (fch.FcFontSort)(
+                config,
+                pattern,
+                fc::FcTrue,
+                std::ptr::null_mut(),
+                &mut result,
+            );
+            let mut paths = Vec::new();
+
+            if !set.is_null() {
+                let font_set = &*set;
+                for i in 0..font_set.nfont {
+                    let pat = *font_set.fonts.add(i as usize);
+                    if let Some(path) = fontconfig_pattern_file(fch, pat) {
+                        paths.push(path);
+                    }
+                }
+                (fch.FcFontSetDestroy)(set);
+            }
+
+            (fch.FcPatternDestroy)(pattern);
+            (fch.FcConfigDestroy)(config);
+            dedup_paths(&mut paths);
+            return Some(paths);
+        }
+    }
+
+    fontconfig_sort_files_command(pattern_str)
+}
+
+fn fontconfig_match_file_command(pattern: &str) -> Option<PathBuf> {
+    let output = Command::new("fc-match")
+        .arg("-f")
+        .arg("%{file}\n")
+        .arg(pattern)
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
 
-    let regular_path = find_font_file_by_style(font_files, family, FontStyle::Regular)?;
-    let regular_font = load_font_from_path(&regular_path, size_px).ok()?;
-    eprintln!(
-        "[INFO] Primary font (configured): {}",
-        regular_path.display()
-    );
-
-    let bold = find_font_file_by_style(font_files, family, FontStyle::Bold)
-        .and_then(|path| load_font_from_path(&path, size_px).ok());
-    let italic = find_font_file_by_style(font_files, family, FontStyle::Italic)
-        .and_then(|path| load_font_from_path(&path, size_px).ok());
-    let bold_italic = find_font_file_by_style(font_files, family, FontStyle::BoldItalic)
-        .and_then(|path| load_font_from_path(&path, size_px).ok());
-
-    Some((regular_font, bold, italic, bold_italic))
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
 }
 
-fn find_font_file_by_style(files: &[PathBuf], family: &str, style: FontStyle) -> Option<PathBuf> {
-    let family = normalize_font_name(family);
-    files
-        .iter()
-        .find(|path| {
-            let name = normalize_path_file_name(path);
-            name.contains(&family) && style_matches(path, style)
-        })
-        .cloned()
-}
-
-fn normalize_font_name(name: &str) -> String {
-    name.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
-}
-
-fn normalize_path_file_name(path: &Path) -> String {
-    normalize_font_name(&path.file_name().unwrap_or_default().to_string_lossy())
-}
-
-fn style_matches(path: &Path, style: FontStyle) -> bool {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    let has_bold = name.contains("bold");
-    let has_italic = name.contains("italic") || name.contains("oblique");
-
-    match style {
-        FontStyle::Regular => !has_bold && !has_italic,
-        FontStyle::Bold => has_bold && !has_italic,
-        FontStyle::Italic => !has_bold && has_italic,
-        FontStyle::BoldItalic => has_bold && has_italic,
-    }
-}
-
-fn load_fallback_fonts(font_files: &[PathBuf], font_size: f32) -> Vec<FtFont> {
-    let fallback_fragments: &[&str] = &[
-        "SymbolsNerdFontMono-Regular",
-        "SymbolsNerdFont-Regular",
-        "NerdFontsSymbols",
-        "PowerlineSymbols",
-        "FontAwesome",
-        "fa-solid",
-        "fa-brands",
-        "fa-regular",
-        "NotoColorEmoji",
-        "NotoEmoji",
-        "NotoSansSymbols2",
-        "NotoSansSymbols-",
-        "NotoSansMono",
-        "MaterialDesignIcons",
-        "MaterialIcons",
-        "codicon",
-        "DejaVuSans.",
-        "Unifont",
-    ];
-
-    let px = font_size.round() as u32;
-    let mut loaded: Vec<FtFont> = Vec::new();
-    let mut loaded_paths: Vec<String> = Vec::new();
-
-    for fragment in fallback_fragments {
-        let needle = fragment.to_ascii_lowercase();
-        for path in font_files {
-            let fname = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            if !fname.contains(&needle) {
-                continue;
-            }
-            let display = path.display().to_string();
-            if loaded_paths.contains(&display) {
-                continue;
-            }
-            match load_font_from_path(path, px) {
-                Ok(font) => {
-                    eprintln!("[INFO] Fallback font: {}", display);
-                    loaded_paths.push(display);
-                    loaded.push(font);
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("[WARN] Failed to load fallback {}: {}", display, e);
-                }
-            }
-        }
-    }
-
-    loaded
-}
-
-fn collect_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for root in roots {
-        collect_font_files_rec(root, &mut out);
-    }
-    out
-}
-
-fn extend_with_fontconfig_files(out: &mut Vec<PathBuf>) {
-    let Ok(output) = Command::new(FC_LIST_COMMAND)
+fn fontconfig_sort_files_command(pattern: &str) -> Option<Vec<PathBuf>> {
+    let output = Command::new("fc-match")
+        .arg("-s")
         .arg("-f")
         .arg("%{file}\n")
+        .arg(pattern)
         .output()
-    else {
-        return;
-    };
-
+        .ok()?;
     if !output.status.success() {
-        return;
+        return None;
     }
 
+    let mut paths = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let path = PathBuf::from(line.trim());
-        if path.as_os_str().is_empty() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        if !out.iter().any(|existing| existing == &path) {
-            out.push(path);
+        let path = PathBuf::from(line);
+        if path.exists() {
+            paths.push(path);
         }
     }
+    dedup_paths(&mut paths);
+    Some(paths)
 }
 
-fn collect_font_files_rec(path: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(meta) = fs::metadata(path) else {
-        return;
-    };
-    if meta.is_file() {
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext = ext.to_ascii_lowercase();
-            if FONT_EXTENSIONS.contains(&ext.as_str()) {
-                out.push(path.to_path_buf());
-            }
-        }
-        return;
+unsafe fn build_fontconfig_pattern(
+    fch: &fc::FontconfigHandle,
+    config: *mut fc::FcConfig,
+    pattern: &str,
+) -> Option<*mut fc::FcPattern> {
+    let pattern = CString::new(pattern).ok()?;
+    let pattern = (fch.FcNameParse)(pattern.as_ptr().cast());
+    if pattern.is_null() {
+        return None;
     }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        collect_font_files_rec(&entry.path(), out);
-    }
+    let _ = (fch.FcConfigSubstitute)(config, pattern, fc::FcMatchPattern);
+    (fch.FcDefaultSubstitute)(pattern);
+    Some(pattern)
 }
 
-fn find_font_file(files: &[PathBuf], name_fragment: &str) -> Option<PathBuf> {
-    let needle = name_fragment.to_ascii_lowercase();
-    files
-        .iter()
-        .find(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&needle)
-        })
-        .cloned()
-}
-
-fn find_font_file_with_style(
-    files: &[PathBuf],
-    name_fragment: &str,
-    style: FontStyle,
+unsafe fn fontconfig_pattern_file(
+    fch: &fc::FontconfigHandle,
+    pattern: *const fc::FcPattern,
 ) -> Option<PathBuf> {
-    let needle = name_fragment.to_ascii_lowercase();
-    files
-        .iter()
-        .find(|p| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains(&needle)
-                && style_matches(p, style)
-        })
-        .cloned()
-        .or_else(|| find_font_file(files, name_fragment))
+    let mut raw = std::ptr::null_mut();
+    let result = (fch.FcPatternGetString)(pattern, fc::FC_FILE.as_ptr().cast(), 0, &mut raw);
+    if result != fc::FcResultMatch || raw.is_null() {
+        return None;
+    }
+    let path = CStr::from_ptr(raw.cast()).to_string_lossy().into_owned();
+    let path = PathBuf::from(path);
+    path.exists().then_some(path)
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut deduped = Vec::with_capacity(paths.len());
+    for path in paths.drain(..) {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    *paths = deduped;
+}
+
+fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
+    let px = font_size.round() as u32;
+    load_font_from_path(&font_plan.regular, px).unwrap_or_else(|e| {
+        error_log!(
+            "Failed to load primary font {}: {}",
+            font_plan.regular.display(),
+            e
+        );
+        std::process::exit(1);
+    })
+}
+
+fn load_optional_style_font(path: &Path, size_px: u32) -> Option<FtFont> {
+    match load_font_from_path(path, size_px) {
+        Ok(font) => Some(font),
+        Err(e) => {
+            warn_log!("Failed to load style font {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 fn load_font_from_path(path: &Path, size_px: u32) -> Result<FtFont, String> {
