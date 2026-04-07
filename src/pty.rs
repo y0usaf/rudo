@@ -157,39 +157,49 @@ impl Pty {
 
     /// Try to read from the PTY (non-blocking).
     pub fn try_read(&self, buf: &mut [u8]) -> Result<usize> {
-        // SAFETY: buf is a valid mutable slice; read writes at most buf.len() bytes.
-        // The fd is the PTY master owned by self.
-        let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
+        loop {
+            // SAFETY: buf is a valid mutable slice; read writes at most buf.len() bytes.
+            // The fd is the PTY master owned by self.
+            let n =
+                unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+
             // SAFETY: __errno_location returns a valid pointer to the thread-local errno.
             let errno = unsafe { *libc::__errno_location() };
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-                Ok(0)
-            } else {
-                Err(Box::new(PtyError(format!(
-                    "read failed: {}",
-                    std::io::Error::from_raw_os_error(errno)
-                ))))
+            if errno == libc::EINTR {
+                continue;
             }
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                return Ok(0);
+            }
+            return Err(Box::new(PtyError(format!(
+                "read failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ))));
         }
     }
 
     /// Write to the PTY.
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
-        // SAFETY: buf is a valid slice; write reads at most buf.len() bytes.
-        // The fd is the PTY master owned by self.
-        let n = unsafe { libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
+        loop {
+            // SAFETY: buf is a valid slice; write reads at most buf.len() bytes.
+            // The fd is the PTY master owned by self.
+            let n = unsafe { libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+
             // SAFETY: __errno_location returns a valid pointer to the thread-local errno.
             let errno = unsafe { *libc::__errno_location() };
-            Err(Box::new(PtyError(format!(
+            if errno == libc::EINTR {
+                continue;
+            }
+            return Err(Box::new(PtyError(format!(
                 "write failed: {}",
                 std::io::Error::from_raw_os_error(errno)
-            ))))
+            ))));
         }
     }
 

@@ -458,7 +458,8 @@ impl CoreApp {
                     self.parser
                         .advance(&mut self.grid, &mut self.damage, &buf[..n]);
                 }
-                Err(_) => {
+                Err(err) => {
+                    crate::warn_log!("PTY read error: {err}");
                     self.pty_dead = true;
                     break;
                 }

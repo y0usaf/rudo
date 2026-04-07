@@ -549,6 +549,13 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             // nfds correctly reflects how many entries are valid (1 or 2).
             // timeout_ms is a valid poll timeout (-1 = infinite, 0 = immediate, >0 = ms).
             let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout_ms) };
+            if rc < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(Box::new(std::io::Error::from_raw_os_error(errno)));
+            }
             if rc > 0 {
                 if (pfds[0].revents & libc::POLLIN) != 0 {
                     let _ = guard.read()?;
