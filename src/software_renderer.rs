@@ -20,6 +20,8 @@ const MAX_COLOR_CHANNEL: f32 = 255.0;
 const MAX_COLOR_CHANNEL_U8: u16 = 255;
 const ALPHA_ROUND_BIAS_U8: u16 = 127;
 const DEGENERATE_EDGE_EPSILON_SQ: f32 = 0.0001;
+const DEFAULT_FONT_DPI: f32 = 96.0;
+const POINTS_PER_INCH: f32 = 72.0;
 
 #[allow(dead_code)]
 pub struct FrameBuffer<'a> {
@@ -49,7 +51,7 @@ pub struct SoftwareRenderer {
 impl SoftwareRenderer {
     pub fn new(font_size: f32, font_family: String, theme: Theme, padding: u32) -> Self {
         let font_size = font_size.max(1.0);
-        let font = FontAtlas::new(font_size, &font_family);
+        let font = FontAtlas::new(Self::font_size_in_pixels(font_size, 1.0), &font_family);
         let cell_width = font.cell_width().max(1.0);
         let cell_height = font.cell_height().max(1.0);
         let baseline = font.baseline();
@@ -194,8 +196,14 @@ impl SoftwareRenderer {
         (self.offset_x, self.offset_y)
     }
 
+    fn font_size_in_pixels(font_size: f32, scale: f32) -> f32 {
+        // Match foot/fontconfig semantics: configured sizes are point sizes,
+        // which at the default 96 DPI become pt * 96 / 72 device pixels.
+        (font_size.max(1.0) * scale.max(1.0) * DEFAULT_FONT_DPI / POINTS_PER_INCH).max(1.0)
+    }
+
     fn rebuild_font(&mut self) {
-        let physical_size = (self.font_size * self.scale).max(1.0);
+        let physical_size = Self::font_size_in_pixels(self.font_size, self.scale);
         let font = FontAtlas::new(physical_size, &self.font_family);
         self.cell_width = font.cell_width().max(1.0);
         self.cell_height = font.cell_height().max(1.0);
@@ -763,6 +771,12 @@ mod tests {
     }
 
     #[test]
+    fn font_sizes_are_interpreted_as_points() {
+        assert!((SoftwareRenderer::font_size_in_pixels(16.0, 1.0) - 21.333334).abs() < 0.001);
+        assert!((SoftwareRenderer::font_size_in_pixels(16.0, 1.5) - 32.0).abs() < 0.001);
+    }
+
+    #[test]
     fn blend_full_coverage_replaces_dst() {
         let (mut px, stride) = make_fb(1, 1);
         px[0..4].copy_from_slice(&premultiplied_bgra_8(255, 255, 255, 128));
@@ -830,7 +844,8 @@ mod tests {
         let theme = Theme::default();
         let mut renderer = SoftwareRenderer::new(14.0, "monospace".to_string(), theme, 0);
         let (cols, rows) = renderer.grid_size_for_window(90, 36);
-        let mut grid = Grid::new(cols, rows.max(2));
+        let rows = rows.max(2);
+        let mut grid = Grid::new(cols, rows);
         grid.cell_mut(0, 0).ch = 'A' as u32;
         grid.cell_mut(0, 1).ch = 'B' as u32;
 
@@ -838,11 +853,12 @@ mod tests {
         damage.clear();
         damage.mark_row(0);
 
-        let (mut px, stride) = make_fb(90, 36);
+        let (fb_width, fb_height) = renderer.window_size_for_grid(cols, rows);
+        let (mut px, stride) = make_fb(fb_width, fb_height);
         px.fill(0x7b);
         let mut fb = FrameBuffer {
-            width: 90,
-            height: 36,
+            width: fb_width,
+            height: fb_height,
             stride,
             pixels: &mut px,
         };
