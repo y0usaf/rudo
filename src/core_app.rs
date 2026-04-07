@@ -15,7 +15,7 @@ use crate::{
         grid::Grid,
         mouse,
         parser::TerminalParser,
-        selection::{self, Selection},
+        selection::{self, GridPoint, Selection, SelectionState},
         theme::Theme,
     },
 };
@@ -160,6 +160,11 @@ impl CoreApp {
     pub fn clear_damage(&mut self) {
         self.damage.clear();
     }
+
+    pub fn damage_mut(&mut self) -> &mut DamageTracker {
+        &mut self.damage
+    }
+
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
     }
@@ -329,6 +334,7 @@ impl CoreApp {
                 self.mouse_button = None;
             }
         } else if button == MouseButton::Left {
+            let before = self.selection.snapshot();
             if pressed {
                 self.mouse_pressed = true;
                 self.mouse_button = Some(button);
@@ -338,6 +344,8 @@ impl CoreApp {
                 self.mouse_button = None;
                 self.selection.finish_selection();
             }
+            let after = self.selection.snapshot();
+            self.mark_selection_change(before, after);
             self.needs_redraw = true;
         }
     }
@@ -372,11 +380,14 @@ impl CoreApp {
                 let _ = pty.write(&seq);
             }
         } else if self.mouse_pressed {
+            let before = self.selection.snapshot();
             if self.selection.state() == selection::SelectionState::None {
                 self.selection.start_selection(col, row);
             } else {
                 self.selection.update_selection(col, row);
             }
+            let after = self.selection.snapshot();
+            self.mark_selection_change(before, after);
             self.needs_redraw = true;
         }
     }
@@ -413,9 +424,11 @@ impl CoreApp {
             let scroll_lines = count * SCROLL_MULTIPLIER;
             if total > 0.0 {
                 self.grid.scroll_view_up(scroll_lines);
+                self.damage.mark_all();
                 self.needs_redraw = true;
             } else if total < 0.0 {
                 self.grid.scroll_view_down(scroll_lines);
+                self.damage.mark_all();
                 self.needs_redraw = true;
             }
         }
@@ -467,6 +480,7 @@ impl CoreApp {
         }
         if got_output && self.grid.is_viewing_scrollback() {
             self.grid.reset_view();
+            self.damage.mark_all();
         }
         let responses = self.parser.take_responses();
         if let Some(pty) = &self.pty {
@@ -477,6 +491,7 @@ impl CoreApp {
         if self.parser.take_theme_changed() {
             self.theme = self.parser.theme().clone();
             self.theme_changed = true;
+            self.damage.mark_all();
             self.needs_redraw = true;
         }
         if self.parser.title() != self.last_title.as_deref() {
@@ -495,6 +510,34 @@ impl CoreApp {
             col.min(self.grid.cols().saturating_sub(1)),
             row.min(self.grid.rows().saturating_sub(1)),
         )
+    }
+
+    fn mark_selection_change(
+        &mut self,
+        before: (SelectionState, GridPoint, GridPoint),
+        after: (SelectionState, GridPoint, GridPoint),
+    ) {
+        self.mark_selection_snapshot(before);
+        self.mark_selection_snapshot(after);
+    }
+
+    fn mark_selection_snapshot(&mut self, snapshot: (SelectionState, GridPoint, GridPoint)) {
+        let (state, start, end) = snapshot;
+        if state == SelectionState::None || self.grid.rows() == 0 {
+            return;
+        }
+
+        let (start, end) = if start.row < end.row || (start.row == end.row && start.col <= end.col)
+        {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let last_row = self.grid.rows().saturating_sub(1);
+        for row in start.row.min(last_row)..=end.row.min(last_row) {
+            self.damage.mark_row(row);
+        }
     }
 }
 

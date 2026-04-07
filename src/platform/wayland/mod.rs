@@ -83,6 +83,12 @@ struct WaylandState {
     buffers: Vec<ShmBuffer>,
     /// Old buffers kept alive until the compositor releases them.
     retired_buffers: Vec<ShmBuffer>,
+    /// Most recently attached live buffer, used as the copy source for damage-only redraws.
+    last_presented_buffer: Option<usize>,
+    /// Cursor rows redrawn in the previous frame, so the old cursor image can be erased.
+    last_cursor_rows: Option<(usize, usize)>,
+    /// Previous cursor quad, used to detect same-row movement where row ranges do not change.
+    last_cursor_corners: Option<[(f32, f32); 4]>,
     xkb: Option<XkbContextData>,
     fallback_mods: Modifiers,
     repeat: RepeatState,
@@ -201,6 +207,9 @@ impl WaylandState {
 
     fn retire_active_buffers(&mut self) {
         let old_buffers = std::mem::take(&mut self.buffers);
+        self.last_presented_buffer = None;
+        self.last_cursor_rows = None;
+        self.last_cursor_corners = None;
         for buf in old_buffers {
             if buf.busy {
                 self.retired_buffers.push(buf);
@@ -262,6 +271,91 @@ impl WaylandState {
         self.prune_retired_buffers();
     }
 
+    fn prepare_target_buffer(&mut self, target_idx: usize) -> bool {
+        let Some(source_idx) = self.last_presented_buffer else {
+            return false;
+        };
+        if source_idx >= self.buffers.len() || target_idx >= self.buffers.len() {
+            return false;
+        }
+        if self.buffers[source_idx].width != self.buffers[target_idx].width
+            || self.buffers[source_idx].height != self.buffers[target_idx].height
+        {
+            return false;
+        }
+        if source_idx == target_idx {
+            return true;
+        }
+
+        if source_idx < target_idx {
+            let (left, right) = self.buffers.split_at_mut(target_idx);
+            let src = left[source_idx].pixels();
+            right[0].pixels_mut().copy_from_slice(src);
+        } else {
+            let (left, right) = self.buffers.split_at_mut(source_idx);
+            let dst = left[target_idx].pixels_mut();
+            dst.copy_from_slice(right[0].pixels());
+        }
+        true
+    }
+
+    fn current_cursor_geometry(&self) -> Option<([(f32, f32); 4], (usize, usize))> {
+        let grid = self.app.grid();
+        let cursor = self.app.cursor_renderer();
+        if !grid.cursor_visible() || !cursor.is_visible() || grid.is_viewing_scrollback() {
+            return None;
+        }
+
+        let corners = cursor.corner_positions();
+        let min_row = corners
+            .iter()
+            .map(|corner| corner.1)
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+            .max(0.0) as usize;
+        let max_row_exclusive = corners
+            .iter()
+            .map(|corner| corner.1)
+            .fold(f32::NEG_INFINITY, f32::max)
+            .ceil()
+            .max(0.0) as usize;
+        let last_row = grid.rows().saturating_sub(1);
+        let start = min_row.min(last_row);
+        let end = max_row_exclusive.saturating_sub(1).min(last_row);
+        Some((corners, (start.min(end), end)))
+    }
+
+    fn mark_row_range_damage(&mut self, range: Option<(usize, usize)>) {
+        let Some((start, end)) = range else {
+            return;
+        };
+        let damage = self.app.damage_mut();
+        for row in start..=end {
+            damage.mark_row(row);
+        }
+    }
+
+    fn mark_cursor_damage(
+        &mut self,
+        current_cursor_rows: Option<(usize, usize)>,
+        current_cursor_corners: Option<[(f32, f32); 4]>,
+        keep_animating: bool,
+    ) {
+        let geometry_changed = match (self.last_cursor_corners, current_cursor_corners) {
+            (Some(prev), Some(curr)) => prev
+                .iter()
+                .zip(curr.iter())
+                .any(|(a, b)| (a.0 - b.0).abs() > 0.001 || (a.1 - b.1).abs() > 0.001),
+            (None, None) => false,
+            _ => true,
+        };
+
+        if keep_animating || geometry_changed || current_cursor_rows != self.last_cursor_rows {
+            self.mark_row_range_damage(self.last_cursor_rows);
+            self.mark_row_range_damage(current_cursor_rows);
+        }
+    }
+
     fn render_frame(&mut self, qh: &QueueHandle<Self>) {
         self.frame_ready = false;
         if self.surface.is_none() || self.shm.is_none() {
@@ -270,7 +364,8 @@ impl WaylandState {
         self.update_window_geometry();
         self.update_opaque_region(qh);
         self.ensure_buffers(qh);
-        let Some(buf) = self.buffers.iter_mut().find(|b| !b.busy) else {
+
+        let Some(target_idx) = self.buffers.iter().position(|b| !b.busy) else {
             return;
         };
 
@@ -284,27 +379,63 @@ impl WaylandState {
             self.renderer.set_theme(self.app.theme().clone());
         }
 
-        let mut fb = FrameBuffer {
-            width: buf.width,
-            height: buf.height,
-            stride: buf.stride,
-            pixels: buf.pixels_mut(),
-        };
-        self.renderer.render(
-            &mut fb,
-            self.app.grid(),
-            self.app.cursor_renderer(),
-            self.app.selection(),
-            self.app.damage(),
-        );
-        self.app.clear_damage();
+        let current_cursor_geometry = self.current_cursor_geometry();
+        let current_cursor_corners = current_cursor_geometry.map(|(corners, _)| corners);
+        let current_cursor_rows = current_cursor_geometry.map(|(_, rows)| rows);
+        self.mark_cursor_damage(current_cursor_rows, current_cursor_corners, keep_animating);
 
+        let copied_previous = self.prepare_target_buffer(target_idx);
+        let full_redraw = !copied_previous || self.app.damage().is_full_damage();
+        let draw_cursor = full_redraw
+            || current_cursor_rows
+                .map(|(start, end)| (start..=end).any(|row| self.app.damage().is_dirty(row)))
+                .unwrap_or(false);
+
+        {
+            let buf = &mut self.buffers[target_idx];
+            let mut fb = FrameBuffer {
+                width: buf.width,
+                height: buf.height,
+                stride: buf.stride,
+                pixels: buf.pixels_mut(),
+            };
+            self.renderer.render(
+                &mut fb,
+                self.app.grid(),
+                self.app.cursor_renderer(),
+                self.app.selection(),
+                self.app.damage(),
+                full_redraw,
+                draw_cursor,
+            );
+        }
+
+        let damage_ranges = if full_redraw {
+            vec![(0, self.app.grid().rows().saturating_sub(1))]
+        } else {
+            self.app.damage().dirty_row_ranges()
+        };
+        self.app.clear_damage();
+        self.last_cursor_rows = current_cursor_rows;
+        self.last_cursor_corners = current_cursor_corners;
+
+        let buf = &mut self.buffers[target_idx];
         let buf_w = buf.width as i32;
         let buf_h = buf.height as i32;
 
         let surface = self.surface.as_ref().unwrap();
-        // damage_buffer uses buffer (physical) coordinates
-        surface.damage_buffer(0, 0, buf_w, buf_h);
+        if full_redraw {
+            // damage_buffer uses buffer (physical) coordinates
+            surface.damage_buffer(0, 0, buf_w, buf_h);
+        } else {
+            for (start_row, end_row) in damage_ranges {
+                let (y0, y1) = self.renderer.pixel_bounds_for_row_range(start_row, end_row);
+                let y1 = y1.min(buf.height);
+                if y1 > y0 {
+                    surface.damage_buffer(0, y0 as i32, buf_w, (y1 - y0) as i32);
+                }
+            }
+        }
         surface.attach(Some(&buf.buffer), 0, 0);
         buf.busy = true;
 
@@ -324,6 +455,7 @@ impl WaylandState {
             surface.frame(qh, ());
         }
         surface.commit();
+        self.last_presented_buffer = Some(target_idx);
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
@@ -505,6 +637,9 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         pointer_focus: false,
         buffers: Vec::new(),
         retired_buffers: Vec::new(),
+        last_presented_buffer: None,
+        last_cursor_rows: None,
+        last_cursor_corners: None,
         xkb: None,
         fallback_mods: Modifiers::empty(),
         repeat: RepeatState::default(),

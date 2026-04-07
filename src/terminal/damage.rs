@@ -2,6 +2,7 @@
 //! Inspired by foot's per-row dirty tracking with bitset.
 
 /// Tracks which rows need re-rendering.
+#[derive(Clone, Debug)]
 pub struct DamageTracker {
     dirty: Vec<u64>,
     num_rows: usize,
@@ -38,6 +39,39 @@ impl DamageTracker {
 
     pub fn has_damage(&self) -> bool {
         self.full_damage || self.dirty.iter().any(|&w| w != 0)
+    }
+
+    #[inline]
+    pub fn is_full_damage(&self) -> bool {
+        self.full_damage
+    }
+
+    pub fn dirty_row_ranges(&self) -> Vec<(usize, usize)> {
+        if self.num_rows == 0 {
+            return Vec::new();
+        }
+        if self.full_damage {
+            return vec![(0, self.num_rows - 1)];
+        }
+
+        let mut ranges = Vec::new();
+        let mut start = None;
+
+        for row in 0..self.num_rows {
+            if self.is_dirty(row) {
+                if start.is_none() {
+                    start = Some(row);
+                }
+            } else if let Some(range_start) = start.take() {
+                ranges.push((range_start, row - 1));
+            }
+        }
+
+        if let Some(range_start) = start {
+            ranges.push((range_start, self.num_rows - 1));
+        }
+
+        ranges
     }
 
     pub fn clear(&mut self) {

@@ -154,6 +154,16 @@ impl SoftwareRenderer {
         Self::pixel_boundary(self.offset_y, self.cell_height, row)
     }
 
+    pub fn pixel_bounds_for_row_range(
+        &self,
+        start_row: usize,
+        end_row_inclusive: usize,
+    ) -> (u32, u32) {
+        let y0 = self.row_boundary(start_row);
+        let y1 = self.row_boundary(end_row_inclusive.saturating_add(1));
+        (y0, y1.max(y0))
+    }
+
     pub fn window_size_for_grid(&self, cols: usize, rows: usize) -> (u32, u32) {
         let phys_pad = self.padding as f32 * self.scale;
         let width = Self::pixel_boundary(phys_pad, self.cell_width, cols)
@@ -199,14 +209,13 @@ impl SoftwareRenderer {
         grid: &Grid,
         cursor: &CursorRenderer,
         selection: &Selection,
-        _damage: &DamageTracker,
+        damage: &DamageTracker,
+        full_redraw: bool,
+        draw_cursor: bool,
     ) {
-        // NOTE: We always redraw every row because we use triple-buffered shm.
-        // Each frame may target a different buffer, so we cannot assume non-dirty
-        // rows already contain correct pixels from the previous frame.
         let top_pad = self.offset_y.round().max(0.0) as u32;
 
-        if top_pad > 0 {
+        if full_redraw && top_pad > 0 {
             self.fill_rect(
                 fb,
                 0,
@@ -220,6 +229,10 @@ impl SoftwareRenderer {
         }
 
         for row in 0..grid.rows() {
+            if !full_redraw && !damage.is_dirty(row) {
+                continue;
+            }
+
             let selected_range = selection.row_range(row);
             let y0 = self.row_boundary(row);
             let y1 = self.row_boundary(row + 1).min(fb.height);
@@ -285,7 +298,7 @@ impl SoftwareRenderer {
         }
 
         let grid_bottom = self.row_boundary(grid.rows()).min(fb.height);
-        if grid_bottom < fb.height {
+        if full_redraw && grid_bottom < fb.height {
             self.fill_rect(
                 fb,
                 0,
@@ -298,7 +311,11 @@ impl SoftwareRenderer {
             );
         }
 
-        if grid.cursor_visible() && cursor.is_visible() && !grid.is_viewing_scrollback() {
+        if draw_cursor
+            && grid.cursor_visible()
+            && cursor.is_visible()
+            && !grid.is_viewing_scrollback()
+        {
             self.draw_animated_cursor(fb, grid, cursor);
         }
     }
@@ -804,5 +821,50 @@ mod tests {
         for chunk in fb.pixels.chunks_exact(4) {
             assert_eq!(chunk, &[0x56, 0x34, 0x12, 0xFF]);
         }
+    }
+
+    #[test]
+    fn partial_render_preserves_undamaged_rows() {
+        let theme = Theme::default();
+        let mut renderer = SoftwareRenderer::new(14.0, "monospace".to_string(), theme, 0);
+        let (cols, rows) = renderer.grid_size_for_window(90, 36);
+        let mut grid = Grid::new(cols, rows.max(2));
+        grid.cell_mut(0, 0).ch = 'A' as u32;
+        grid.cell_mut(0, 1).ch = 'B' as u32;
+
+        let mut damage = DamageTracker::new(grid.rows());
+        damage.clear();
+        damage.mark_row(0);
+
+        let (mut px, stride) = make_fb(90, 36);
+        px.fill(0x7b);
+        let mut fb = FrameBuffer {
+            width: 90,
+            height: 36,
+            stride,
+            pixels: &mut px,
+        };
+
+        renderer.render(
+            &mut fb,
+            &grid,
+            &CursorRenderer::new(),
+            &Selection::new(),
+            &damage,
+            false,
+            false,
+        );
+
+        let (dirty_y0, dirty_y1) = renderer.pixel_bounds_for_row_range(0, 0);
+        let (_, clean_y1) = renderer.pixel_bounds_for_row_range(1, 1);
+
+        assert!(fb.pixels
+            [(dirty_y0 as usize * stride as usize)..(dirty_y1 as usize * stride as usize)]
+            .iter()
+            .any(|&byte| byte != 0x7b));
+        assert!(fb.pixels
+            [(dirty_y1 as usize * stride as usize)..(clean_y1 as usize * stride as usize)]
+            .iter()
+            .all(|&byte| byte == 0x7b));
     }
 }

@@ -70,6 +70,12 @@ impl ShmBuffer {
         })
     }
 
+    pub fn pixels(&self) -> &[u8] {
+        // SAFETY: self.map is a valid pointer from mmap with length self.len.
+        // The backing file (_file) is kept alive for the lifetime of ShmBuffer.
+        unsafe { std::slice::from_raw_parts(self.map, self.len) }
+    }
+
     pub fn pixels_mut(&mut self) -> &mut [u8] {
         // SAFETY: self.map is a valid pointer from mmap with length self.len.
         // The backing file (_file) is kept alive for the lifetime of ShmBuffer.
