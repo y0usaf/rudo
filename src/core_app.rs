@@ -339,6 +339,7 @@ impl CoreApp {
                 self.mouse_pressed = true;
                 self.mouse_button = Some(button);
                 self.selection.clear();
+                self.selection.start_selection(col, row);
             } else {
                 self.mouse_pressed = false;
                 self.mouse_button = None;
@@ -567,4 +568,57 @@ fn clipboard_get() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::MouseButton;
+
+    fn test_app() -> CoreApp {
+        let mut app = CoreApp::new(CliArgs {
+            app_id: None,
+            title: None,
+            command: Vec::new(),
+        });
+        app.set_cell_size(10.0, 20.0);
+        app.set_grid_offset(0.0, 0.0);
+        app
+    }
+
+    #[test]
+    fn local_selection_starts_on_left_press_at_current_cell() {
+        let mut app = test_app();
+        app.handle_mouse_move(25.0, 45.0);
+
+        app.handle_mouse_button(true, MouseButton::Left);
+
+        assert_eq!(app.selection().state(), SelectionState::Selecting);
+        assert_eq!(
+            app.selection().snapshot(),
+            (
+                SelectionState::Selecting,
+                GridPoint::new(2, 2),
+                GridPoint::new(2, 2),
+            )
+        );
+    }
+
+    #[test]
+    fn local_selection_drag_keeps_press_cell_as_anchor() {
+        let mut app = test_app();
+        app.handle_mouse_move(25.0, 45.0);
+        app.handle_mouse_button(true, MouseButton::Left);
+
+        app.handle_mouse_move(65.0, 85.0);
+
+        assert_eq!(
+            app.selection().snapshot(),
+            (
+                SelectionState::Selecting,
+                GridPoint::new(2, 2),
+                GridPoint::new(6, 4),
+            )
+        );
+    }
 }

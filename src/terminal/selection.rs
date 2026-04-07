@@ -154,8 +154,9 @@ impl Selection {
     }
 
     /// Extract the selected text from the terminal grid.
-    /// Iterates rows from start to end, extracting cell characters.
-    /// Trailing spaces on each row are trimmed, and rows are joined with newlines.
+    /// Iterates rows from start to end in the visible viewport, extracting cell
+    /// characters. Trailing spaces on each row are trimmed, and rows are joined
+    /// with newlines.
     pub fn selected_text(&self, grid: &Grid) -> String {
         if !self.has_selection() {
             return String::new();
@@ -165,6 +166,7 @@ impl Selection {
         let grid_rows = grid.rows();
         let grid_cols = grid.cols();
         let mut result = String::new();
+        let mut wrote_row = false;
 
         for row in start.row..=end.row {
             if row >= grid_rows {
@@ -178,9 +180,9 @@ impl Selection {
                 grid_cols.saturating_sub(1)
             };
 
-            let row_cells = grid.row(row).cells();
-            let line_start = result.len();
-            let mut last_non_space_len = line_start;
+            let row_cells = grid.view_row(row).cells();
+            let mut line = String::new();
+            let mut last_non_space_len = 0;
 
             for cell in row_cells
                 .iter()
@@ -189,19 +191,20 @@ impl Selection {
             {
                 // Skip wide character spacers to avoid duplicating wide chars
                 if !cell.flags.contains(super::cell::CellFlags::WIDE_SPACER) {
-                    result.push(cell.character());
+                    line.push(cell.character());
                     if cell.character() != ' ' {
-                        last_non_space_len = result.len();
+                        last_non_space_len = line.len();
                     }
                 }
             }
 
-            result.truncate(last_non_space_len);
+            line.truncate(last_non_space_len);
 
-            // Add newline between rows, but not after the last row
-            if row < end.row {
+            if wrote_row {
                 result.push('\n');
             }
+            result.push_str(&line);
+            wrote_row = true;
         }
 
         result
@@ -390,5 +393,39 @@ mod tests {
         sel.update_selection(5, 5);
         // Should remain at default since state is None
         assert_eq!(sel.end, GridPoint::new(0, 0));
+    }
+
+    #[test]
+    fn test_selected_text_uses_visible_viewport_rows() {
+        let mut grid = Grid::new(5, 3);
+
+        for (col, ch) in "one".chars().enumerate() {
+            grid.cell_mut(col, 0).ch = ch as u32;
+        }
+
+        grid.set_cursor(0, 2);
+        grid.linefeed();
+        for (col, ch) in "two".chars().enumerate() {
+            grid.cell_mut(col, 2).ch = ch as u32;
+        }
+
+        grid.set_cursor(0, 2);
+        grid.linefeed();
+        for (col, ch) in "tri".chars().enumerate() {
+            grid.cell_mut(col, 2).ch = ch as u32;
+        }
+
+        grid.set_cursor(0, 2);
+        grid.linefeed();
+        for (col, ch) in "for".chars().enumerate() {
+            grid.cell_mut(col, 2).ch = ch as u32;
+        }
+
+        let mut sel = Selection::new();
+        sel.start_selection(0, 0);
+        sel.update_selection(2, 2);
+
+        let result = sel.selected_text(&grid);
+        assert_eq!(result, "two\ntri\nfor");
     }
 }
