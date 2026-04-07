@@ -68,15 +68,12 @@ fn encode_sgr(code: u8, col: u16, row: u16, press: bool) -> Vec<u8> {
     format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes()
 }
 
-fn encode_normal(code: u8, col: u16, row: u16) -> Vec<u8> {
-    vec![
-        b'\x1b',
-        b'[',
-        b'M',
-        code.wrapping_add(MOUSE_COORD_OFFSET),
-        (col + 1 + MOUSE_COORD_OFFSET as u16) as u8,
-        (row + 1 + MOUSE_COORD_OFFSET as u16) as u8,
-    ]
+fn encode_normal(code: u8, col: u16, row: u16) -> Option<Vec<u8>> {
+    let code = code.checked_add(MOUSE_COORD_OFFSET)?;
+    let col = u8::try_from(col).ok()?.checked_add(MOUSE_COORD_OFFSET + 1)?;
+    let row = u8::try_from(row).ok()?.checked_add(MOUSE_COORD_OFFSET + 1)?;
+
+    Some(vec![b'\x1b', b'[', b'M', code, col, row])
 }
 
 pub fn encode_mouse_press(
@@ -93,7 +90,7 @@ pub fn encode_mouse_press(
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
-        Some(encode_normal(code, col, row))
+        encode_normal(code, col, row)
     }
 }
 
@@ -111,7 +108,7 @@ pub fn encode_mouse_release(
         let code = button_code | modifiers_bits;
         Some(encode_sgr(code, col, row, false))
     } else {
-        Some(encode_normal(MOUSE_RELEASE_CODE, col, row))
+        encode_normal(MOUSE_RELEASE_CODE | modifiers_bits, col, row)
     }
 }
 
@@ -130,7 +127,7 @@ pub fn encode_mouse_drag(
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
-        Some(encode_normal(code, col, row))
+        encode_normal(code, col, row)
     }
 }
 
@@ -147,7 +144,7 @@ pub fn encode_mouse_move(
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
-        Some(encode_normal(code, col, row))
+        encode_normal(code, col, row)
     }
 }
 
@@ -170,6 +167,36 @@ pub fn encode_mouse_scroll(
     if state.sgr {
         Some(encode_sgr(code, col, row, true))
     } else {
-        Some(encode_normal(code, col, row))
+        encode_normal(code, col, row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_state() -> MouseState {
+        MouseState {
+            mode: MouseMode::Click,
+            sgr: false,
+        }
+    }
+
+    #[test]
+    fn legacy_release_preserves_modifier_bits() {
+        let encoded = encode_mouse_release(&legacy_state(), MOUSE_BUTTON_LEFT, MOUSE_MOD_SHIFT, 0, 0)
+            .expect("legacy release should encode");
+
+        assert_eq!(encoded, vec![b'\x1b', b'[', b'M', 39, 33, 33]);
+    }
+
+    #[test]
+    fn legacy_press_rejects_overflowing_column() {
+        assert_eq!(encode_mouse_press(&legacy_state(), MOUSE_BUTTON_LEFT, 0, 223, 0), None);
+    }
+
+    #[test]
+    fn legacy_press_rejects_overflowing_row() {
+        assert_eq!(encode_mouse_press(&legacy_state(), MOUSE_BUTTON_LEFT, 0, 0, 223), None);
     }
 }

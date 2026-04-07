@@ -527,8 +527,9 @@ impl<'a> vte::Perform for Performer<'a> {
         // Determine character width
         let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
 
-        // Handle autowrap: if we're past the last column, wrap.
-        if col >= cols {
+        // Handle autowrap: if we're past the last column, or if a wide character
+        // would start in the final column, wrap before printing.
+        if col >= cols || (width == 2 && col + 1 >= cols) {
             self.grid.carriage_return();
             let blank = self.blank_cell();
             self.grid.linefeed_with(blank);
@@ -833,7 +834,13 @@ impl<'a> vte::Perform for Performer<'a> {
                                 // DECTCEM – show cursor
                                 25 => self.grid.set_cursor_visible(true),
                                 // Alternate screen buffers
-                                47 | 1047 | 1049 => {
+                                47 | 1047 => {
+                                    self.grid.enter_alternate_screen();
+                                    self.damage.mark_all();
+                                }
+                                // Save cursor + alternate screen
+                                1049 => {
+                                    self.grid.save_cursor();
                                     self.grid.enter_alternate_screen();
                                     self.damage.mark_all();
                                 }
@@ -863,8 +870,13 @@ impl<'a> vte::Perform for Performer<'a> {
                                     self.grid.set_cursor(0, 0);
                                 }
                                 25 => self.grid.set_cursor_visible(false),
-                                47 | 1047 | 1049 => {
+                                47 | 1047 => {
                                     self.grid.leave_alternate_screen();
+                                    self.damage.mark_all();
+                                }
+                                1049 => {
+                                    self.grid.leave_alternate_screen();
+                                    self.grid.restore_cursor();
                                     self.damage.mark_all();
                                 }
                                 1048 => self.grid.restore_cursor(),
@@ -1041,6 +1053,29 @@ mod tests {
         assert_eq!(g.cell(0, 0).ch, ' ' as u32);
         p.advance(&mut g, &mut d, b"\x1b[?1049l");
         assert_eq!(g.cell(0, 0).ch, 'M' as u32);
+    }
+
+    #[test]
+    fn decset_1049_saves_cursor_on_enter_and_restores_on_leave() {
+        let (mut p, mut g, mut d) = setup(6, 4);
+        g.set_cursor(3, 2);
+        p.advance(&mut g, &mut d, b"\x1b[?1049h");
+        assert_eq!((g.cursor_col(), g.cursor_row()), (0, 0));
+
+        g.set_cursor(1, 1);
+        p.advance(&mut g, &mut d, b"\x1b[?1049l");
+        assert_eq!((g.cursor_col(), g.cursor_row()), (3, 2));
+    }
+
+    #[test]
+    fn decset_1049_does_not_restore_cursor_modified_only_in_alt_screen() {
+        let (mut p, mut g, mut d) = setup(6, 4);
+        g.set_cursor(4, 1);
+        p.advance(&mut g, &mut d, b"\x1b[?1049h\x1b[?1048h");
+        g.set_cursor(0, 3);
+
+        p.advance(&mut g, &mut d, b"\x1b[?1049l");
+        assert_eq!((g.cursor_col(), g.cursor_row()), (4, 1));
     }
 
     #[test]
@@ -1382,6 +1417,23 @@ mod tests {
         p.advance(&mut g, &mut d, b"AB\x08C");
         assert_eq!(g.cell(0, 0).ch, 'A' as u32);
         assert_eq!(g.cell(1, 0).ch, 'C' as u32);
+    }
+
+    #[test]
+    fn wide_char_in_last_column_wraps_before_printing() {
+        let (mut p, mut g, mut d) = setup(4, 3);
+        p.advance(&mut g, &mut d, b"abc");
+        p.advance(&mut g, &mut d, "好".as_bytes());
+
+        assert_eq!(g.cell(0, 0).ch, 'a' as u32);
+        assert_eq!(g.cell(1, 0).ch, 'b' as u32);
+        assert_eq!(g.cell(2, 0).ch, 'c' as u32);
+        assert_eq!(g.cell(3, 0).ch, ' ' as u32);
+
+        assert_eq!(g.cell(0, 1).ch, '好' as u32);
+        assert!(g.cell(0, 1).flags.contains(CellFlags::WIDE));
+        assert!(g.cell(1, 1).flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!((g.cursor_col(), g.cursor_row()), (2, 1));
     }
 
     #[test]

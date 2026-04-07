@@ -389,7 +389,9 @@ impl SoftwareRenderer {
                     self.theme.cursor.g(),
                     self.theme.cursor.b(),
                 );
-                let cell = grid.cell(grid.cursor_col(), grid.cursor_row());
+                let cursor_col = grid.cursor_col().min(grid.cols().saturating_sub(1));
+                let cursor_row = grid.cursor_row().min(grid.rows().saturating_sub(1));
+                let cell = grid.cell(cursor_col, cursor_row);
                 let (fr, fg, fb_col) = contrasting_cursor_text_color(
                     self.theme.cursor.r(),
                     self.theme.cursor.g(),
@@ -397,8 +399,8 @@ impl SoftwareRenderer {
                 );
                 self.draw_cell_glyph_clipped(
                     fb,
-                    self.col_boundary(grid.cursor_col()),
-                    self.row_boundary(grid.cursor_row()),
+                    self.col_boundary(cursor_col),
+                    self.row_boundary(cursor_row),
                     cell.character(),
                     fr,
                     fg,

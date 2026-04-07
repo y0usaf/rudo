@@ -363,8 +363,16 @@ impl Grid {
     }
 
     /// Returns cursor position as `(col_f32, row_f32)` suitable for rendering.
+    ///
+    /// The terminal parser may temporarily place the cursor one cell past the
+    /// right edge to represent a wrap-pending state after printing in the last
+    /// column. Rendering must clamp that back onto the visible grid, otherwise
+    /// cursor drawing can index past the end of the row and panic.
     pub fn cursor_position(&self) -> (f32, f32) {
-        (self.cursor.col as f32, self.cursor.row as f32)
+        (
+            self.clamp_col(self.cursor.col) as f32,
+            self.clamp_row(self.cursor.row) as f32,
+        )
     }
 
     /// DECSC — save cursor position.
@@ -1235,6 +1243,17 @@ mod tests {
         let (cx, cy) = g.cursor_position();
         assert!((cx - 10.0).abs() < 0.001);
         assert!((cy - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cursor_position_clamps_wrap_pending_column_for_rendering() {
+        let mut g = Grid::new(4, 2);
+        g.set_cursor_col(4);
+        g.set_cursor_row(1);
+
+        let (cx, cy) = g.cursor_position();
+        assert!((cx - 3.0).abs() < 0.001);
+        assert!((cy - 1.0).abs() < 0.001);
     }
 
     #[test]
