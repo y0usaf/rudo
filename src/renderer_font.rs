@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,20 @@ const FONT_PLAN_STYLE_BOLD_ITALIC: &str = "bold-italic";
 fn ascii_cache_idx(ch: u8, bold: bool, italic: bool) -> usize {
     let style = (bold as usize) * 2 + (italic as usize);
     style * ASCII_RANGE + (ch as usize - 32)
+}
+
+#[inline]
+fn empty_glyph_info() -> GlyphInfo {
+    GlyphInfo {
+        u0: 0.0,
+        v0: 0.0,
+        u1: 0.0,
+        v1: 0.0,
+        width: 0.0,
+        height: 0.0,
+        offset_x: 0.0,
+        offset_y: 0.0,
+    }
 }
 
 // ── FreeType font wrapper ────────────────────────────────────────────────────
@@ -182,9 +196,9 @@ impl FontAtlas {
     pub fn new(font_size: f32, preferred_family: &str) -> Self {
         let font_plan = load_or_build_font_plan(preferred_family);
         let font_regular = load_primary_font(&font_plan, font_size);
-        let cell_width = compute_cell_width(&font_regular, font_size);
+        let cell_width = compute_cell_width(&font_regular);
         let cell_height = compute_cell_height(&font_regular);
-        let atlas_data = vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT * 4) as usize];
+        let atlas_data = vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT) as usize];
 
         FontAtlas {
             font_regular,
@@ -208,18 +222,7 @@ impl FontAtlas {
             current_y: 0,
             row_height: 0,
             dirty: false,
-            ascii_cache: Box::new(
-                [GlyphInfo {
-                    u0: 0.0,
-                    v0: 0.0,
-                    u1: 0.0,
-                    v1: 0.0,
-                    width: 0.0,
-                    height: 0.0,
-                    offset_x: 0.0,
-                    offset_y: 0.0,
-                }; ASCII_CACHE_LEN],
-            ),
+            ascii_cache: Box::new([empty_glyph_info(); ASCII_CACHE_LEN]),
             ascii_populated: [false; ASCII_CACHE_LEN],
         }
     }
@@ -240,31 +243,35 @@ impl FontAtlas {
         }
     }
 
-    pub fn get_glyph(&mut self, ch: char, bold: bool, italic: bool) -> &GlyphInfo {
+    pub fn get_glyph(&mut self, ch: char, bold: bool, italic: bool) -> GlyphInfo {
         let code = ch as u32;
         if (32..=126).contains(&code) {
             let idx = ascii_cache_idx(code as u8, bold, italic);
-            if self.ascii_populated[idx] {
-                return &self.ascii_cache[idx];
+            if !self.ascii_populated[idx] {
+                self.ascii_cache[idx] = self.rasterize_glyph(ch, bold, italic);
+                self.ascii_populated[idx] = true;
             }
-            let info = self.rasterize_glyph(ch, bold, italic);
-            self.ascii_cache[idx] = info;
-            self.ascii_populated[idx] = true;
-            return &self.ascii_cache[idx];
+            return self.ascii_cache[idx];
         }
 
         let key = (ch, bold, italic);
-        if self.cache.contains_key(&key) {
-            return self
-                .cache
-                .get(&key)
-                .expect("glyph present in cache must exist");
+        if let Some(&info) = self.cache.get(&key) {
+            return info;
         }
+
         let info = self.rasterize_glyph(ch, bold, italic);
         self.cache.insert(key, info);
-        self.cache
-            .get(&key)
-            .expect("glyph inserted into cache must exist")
+        info
+    }
+
+    fn reset_atlas(&mut self) {
+        self.atlas_data.fill(0);
+        self.cache.clear();
+        self.ascii_populated.fill(false);
+        self.current_x = 0;
+        self.current_y = 0;
+        self.row_height = 0;
+        self.dirty = true;
     }
 
     fn rasterize_glyph(&mut self, ch: char, bold: bool, italic: bool) -> GlyphInfo {
@@ -283,31 +290,19 @@ impl FontAtlas {
                 self.row_height = 0;
             }
             if self.current_y + gh > ATLAS_HEIGHT {
-                self.current_x = 0;
-                self.current_y = 0;
-                self.row_height = 0;
+                self.reset_atlas();
             }
 
             let ax = self.current_x;
             let ay = self.current_y;
-            for row in 0..gh {
-                for col in 0..gw {
-                    let src_idx = (row * gw + col) as usize;
-                    let alpha = if src_idx < bitmap.len() {
-                        bitmap[src_idx]
-                    } else {
-                        0
-                    };
-                    let dst_x = ax + col;
-                    let dst_y = ay + row;
-                    let dst_idx = ((dst_y * ATLAS_WIDTH + dst_x) * 4) as usize;
-                    if dst_idx + 3 < self.atlas_data.len() {
-                        self.atlas_data[dst_idx] = 255;
-                        self.atlas_data[dst_idx + 1] = 255;
-                        self.atlas_data[dst_idx + 2] = 255;
-                        self.atlas_data[dst_idx + 3] = alpha;
-                    }
-                }
+            let atlas_stride = ATLAS_WIDTH as usize;
+            let glyph_row_width = gw as usize;
+            for row in 0..gh as usize {
+                let src_start = row * glyph_row_width;
+                let src_end = src_start + glyph_row_width;
+                let dst_start = (ay as usize + row) * atlas_stride + ax as usize;
+                let dst_end = dst_start + glyph_row_width;
+                self.atlas_data[dst_start..dst_end].copy_from_slice(&bitmap[src_start..src_end]);
             }
 
             self.current_x += gw + 1;
@@ -342,21 +337,17 @@ impl FontAtlas {
     pub fn atlas_size(&self) -> (u32, u32) {
         (ATLAS_WIDTH, ATLAS_HEIGHT)
     }
-    #[allow(dead_code)]
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-    #[allow(dead_code)]
-    pub fn clear_dirty(&mut self) {
-        self.dirty = false;
-    }
 
     fn pick_font_with_fallback(&mut self, ch: char, bold: bool, italic: bool) -> &FtFont {
         if (ch as u32) < 128 {
             return self.pick_styled_font(bold, italic);
         }
 
-        if self.pick_styled_font(bold, italic).has_glyph(ch) {
+        let styled_has_glyph = {
+            let styled = self.pick_styled_font(bold, italic);
+            styled.has_glyph(ch)
+        };
+        if styled_has_glyph {
             return self.pick_styled_font(bold, italic);
         }
         if self.font_regular.has_glyph(ch) {
@@ -370,10 +361,10 @@ impl FontAtlas {
         }
 
         while self.next_fallback_font < self.fallback_font_paths.len() {
-            let path = self.fallback_font_paths[self.next_fallback_font].clone();
+            let path = self.fallback_font_paths[self.next_fallback_font].as_path();
             self.next_fallback_font += 1;
 
-            match load_font_from_path(&path, self.font_size) {
+            match load_font_from_path(path, self.font_size) {
                 Ok(font) => {
                     info_log!("Fallback font: {}", path.display());
                     let has_glyph = font.has_glyph(ch);
@@ -416,24 +407,24 @@ impl FontAtlas {
 
     fn ensure_bold_font(&mut self) {
         if self.font_bold.is_none() {
-            if let Some(path) = self.font_bold_path.clone() {
-                self.font_bold = load_optional_style_font(&path, self.font_size);
+            if let Some(path) = self.font_bold_path.as_deref() {
+                self.font_bold = load_optional_style_font(path, self.font_size);
             }
         }
     }
 
     fn ensure_italic_font(&mut self) {
         if self.font_italic.is_none() {
-            if let Some(path) = self.font_italic_path.clone() {
-                self.font_italic = load_optional_style_font(&path, self.font_size);
+            if let Some(path) = self.font_italic_path.as_deref() {
+                self.font_italic = load_optional_style_font(path, self.font_size);
             }
         }
     }
 
     fn ensure_bold_italic_font(&mut self) {
         if self.font_bold_italic.is_none() {
-            if let Some(path) = self.font_bold_italic_path.clone() {
-                self.font_bold_italic = load_optional_style_font(&path, self.font_size);
+            if let Some(path) = self.font_bold_italic_path.as_deref() {
+                self.font_bold_italic = load_optional_style_font(path, self.font_size);
             }
         }
     }
@@ -810,13 +801,8 @@ unsafe fn fontconfig_pattern_file(
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
-    let mut deduped = Vec::with_capacity(paths.len());
-    for path in paths.drain(..) {
-        if !deduped.iter().any(|existing| existing == &path) {
-            deduped.push(path);
-        }
-    }
-    *paths = deduped;
+    let mut seen = HashSet::with_capacity(paths.len());
+    paths.retain(|path| seen.insert(path.clone()));
 }
 
 fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
@@ -849,7 +835,7 @@ fn load_font_from_path(path: &Path, size_px: f32) -> Result<FtFont, String> {
     Ok(font)
 }
 
-fn compute_cell_width(font: &FtFont, _font_size: f32) -> f32 {
+fn compute_cell_width(font: &FtFont) -> f32 {
     let samples = ['M', 'W', '@', '0'];
     let mut width = 0.0f32;
     for ch in samples {
@@ -871,27 +857,35 @@ fn compute_cell_height(font: &FtFont) -> f32 {
 }
 
 fn read_bitmap_rows(buffer: *const u8, width: u32, rows: u32, pitch: i32) -> Vec<u8> {
-    let mut pixels = Vec::with_capacity((width * rows) as usize);
+    let mut pixels = vec![0u8; (width * rows) as usize];
     if buffer.is_null() || width == 0 || rows == 0 {
+        pixels.clear();
         return pixels;
     }
 
     let abs_pitch = pitch.unsigned_abs() as usize;
-    if abs_pitch < width as usize {
+    let row_width = width as usize;
+    if abs_pitch < row_width {
+        pixels.clear();
         return pixels;
     }
 
     unsafe {
         if pitch < 0 {
-            for row in 0..rows {
+            for row in 0..rows as usize {
                 let src = buffer.offset(row as isize * pitch as isize);
-                pixels.extend_from_slice(std::slice::from_raw_parts(src, width as usize));
+                let dst_start = row * row_width;
+                let dst_end = dst_start + row_width;
+                pixels[dst_start..dst_end]
+                    .copy_from_slice(std::slice::from_raw_parts(src, row_width));
             }
         } else {
-            let row_stride = abs_pitch as isize;
-            for row in 0..rows {
-                let src = buffer.offset(row as isize * row_stride);
-                pixels.extend_from_slice(std::slice::from_raw_parts(src, width as usize));
+            for row in 0..rows as usize {
+                let src = buffer.add(row * abs_pitch);
+                let dst_start = row * row_width;
+                let dst_end = dst_start + row_width;
+                pixels[dst_start..dst_end]
+                    .copy_from_slice(std::slice::from_raw_parts(src, row_width));
             }
         }
     }

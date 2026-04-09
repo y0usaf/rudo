@@ -1,11 +1,10 @@
 //! Minimal FreeType FFI via dlopen — zero compile-time dependency.
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
+use crate::dlopen::{DlLibrary, Symbol};
 use std::ffi::c_void;
-use std::os::raw::{c_char, c_int, c_long, c_uchar, c_uint, c_ushort};
+use std::os::raw::{c_char, c_int, c_long, c_short, c_uchar, c_uint, c_ushort};
 use std::sync::OnceLock;
-
-// ── FreeType types ───────────────────────────────────────────────────────────
 
 pub type FT_Error = c_int;
 pub type FT_Library = *mut c_void;
@@ -43,10 +42,7 @@ pub struct FT_FaceRec {
     pub underline_thickness: c_short,
     pub glyph: *mut FT_GlyphSlotRec,
     pub size: *mut FT_SizeRec,
-    // ... more fields follow but we don't need them
 }
-
-use std::os::raw::c_short;
 
 #[repr(C)]
 pub struct FT_Generic {
@@ -73,11 +69,10 @@ pub struct FT_GlyphSlotRec {
     pub linearHoriAdvance: FT_Fixed,
     pub linearVertAdvance: FT_Fixed,
     pub advance: FT_Vector,
-    pub format: u32, // FT_Glyph_Format
+    pub format: u32,
     pub bitmap: FT_Bitmap,
     pub bitmap_left: c_int,
     pub bitmap_top: c_int,
-    // ... more fields follow
 }
 
 #[repr(C)]
@@ -115,7 +110,6 @@ pub struct FT_SizeRec {
     pub face: FT_Face,
     pub generic: FT_Generic,
     pub metrics: FT_Size_Metrics,
-    // ...
 }
 
 #[repr(C)]
@@ -130,15 +124,10 @@ pub struct FT_Size_Metrics {
     pub max_advance: FT_Pos,
 }
 
-// ── Load flags ───────────────────────────────────────────────────────────────
-
 pub const FT_LOAD_RENDER: FT_Int32 = 1 << 2;
-pub const FT_LOAD_NO_HINTING: FT_Int32 = 1 << 1;
-
-// ── Function table ───────────────────────────────────────────────────────────
 
 pub struct FtHandle {
-    _lib: *mut c_void, // dlopen handle
+    _lib: *mut c_void,
     pub init_freetype: unsafe extern "C" fn(*mut FT_Library) -> FT_Error,
     pub done_freetype: unsafe extern "C" fn(FT_Library) -> FT_Error,
     pub new_memory_face: unsafe extern "C" fn(
@@ -161,40 +150,57 @@ unsafe impl Sync for FtHandle {}
 
 impl FtHandle {
     fn load() -> Option<Self> {
-        unsafe {
-            let names: &[&[u8]] = &[b"libfreetype.so.6\0", b"libfreetype.so\0"];
-            let mut handle = std::ptr::null_mut();
-            for name in names {
-                handle = libc::dlopen(name.as_ptr().cast(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
-                if !handle.is_null() {
-                    break;
-                }
-            }
-            if handle.is_null() {
-                return None;
-            }
+        const LIBFREETYPE_SO_6: &[u8] = b"libfreetype.so.6\0";
+        const LIBFREETYPE_SO: &[u8] = b"libfreetype.so\0";
 
-            macro_rules! sym {
-                ($name:literal) => {{
-                    let p = libc::dlsym(handle, concat!($name, "\0").as_ptr().cast());
-                    if p.is_null() {
-                        libc::dlclose(handle);
-                        return None;
-                    }
-                    std::mem::transmute(p)
-                }};
-            }
+        const FT_INIT_FREETYPE: Symbol<unsafe extern "C" fn(*mut FT_Library) -> FT_Error> =
+            Symbol::new(b"FT_Init_FreeType\0");
+        const FT_DONE_FREETYPE: Symbol<unsafe extern "C" fn(FT_Library) -> FT_Error> =
+            Symbol::new(b"FT_Done_FreeType\0");
+        const FT_NEW_MEMORY_FACE: Symbol<
+            unsafe extern "C" fn(
+                FT_Library,
+                *const c_uchar,
+                FT_Long,
+                FT_Long,
+                *mut FT_Face,
+            ) -> FT_Error,
+        > = Symbol::new(b"FT_New_Memory_Face\0");
+        const FT_DONE_FACE: Symbol<unsafe extern "C" fn(FT_Face) -> FT_Error> =
+            Symbol::new(b"FT_Done_Face\0");
+        const FT_SET_PIXEL_SIZES: Symbol<
+            unsafe extern "C" fn(FT_Face, FT_UInt, FT_UInt) -> FT_Error,
+        > = Symbol::new(b"FT_Set_Pixel_Sizes\0");
+        const FT_SET_CHAR_SIZE: Symbol<
+            unsafe extern "C" fn(FT_Face, FT_F26Dot6, FT_F26Dot6, FT_UInt, FT_UInt) -> FT_Error,
+        > = Symbol::new(b"FT_Set_Char_Size\0");
+        const FT_LOAD_CHAR: Symbol<unsafe extern "C" fn(FT_Face, FT_ULong, FT_Int32) -> FT_Error> =
+            Symbol::new(b"FT_Load_Char\0");
+        const FT_GET_CHAR_INDEX: Symbol<unsafe extern "C" fn(FT_Face, FT_ULong) -> FT_UInt> =
+            Symbol::new(b"FT_Get_Char_Index\0");
+
+        unsafe {
+            let library = DlLibrary::open_any(&[LIBFREETYPE_SO_6, LIBFREETYPE_SO])?;
+            let init_freetype = FT_INIT_FREETYPE.get(&library)?;
+            let done_freetype = FT_DONE_FREETYPE.get(&library)?;
+            let new_memory_face = FT_NEW_MEMORY_FACE.get(&library)?;
+            let done_face = FT_DONE_FACE.get(&library)?;
+            let set_pixel_sizes = FT_SET_PIXEL_SIZES.get(&library)?;
+            let set_char_size = FT_SET_CHAR_SIZE.get(&library)?;
+            let load_char = FT_LOAD_CHAR.get(&library)?;
+            let get_char_index = FT_GET_CHAR_INDEX.get(&library)?;
+            let _lib = library.into_raw();
 
             Some(Self {
-                _lib: handle,
-                init_freetype: sym!("FT_Init_FreeType"),
-                done_freetype: sym!("FT_Done_FreeType"),
-                new_memory_face: sym!("FT_New_Memory_Face"),
-                done_face: sym!("FT_Done_Face"),
-                set_pixel_sizes: sym!("FT_Set_Pixel_Sizes"),
-                set_char_size: sym!("FT_Set_Char_Size"),
-                load_char: sym!("FT_Load_Char"),
-                get_char_index: sym!("FT_Get_Char_Index"),
+                _lib,
+                init_freetype,
+                done_freetype,
+                new_memory_face,
+                done_face,
+                set_pixel_sizes,
+                set_char_size,
+                load_char,
+                get_char_index,
             })
         }
     }

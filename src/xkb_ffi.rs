@@ -1,11 +1,10 @@
 //! Minimal xkbcommon FFI via dlopen — zero compile-time dependency.
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 
+use crate::dlopen::{DlLibrary, Symbol};
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::OnceLock;
-
-// ── Opaque types ─────────────────────────────────────────────────────────────
 
 pub type xkb_context = c_void;
 pub type xkb_keymap = c_void;
@@ -15,8 +14,6 @@ pub type xkb_keysym_t = u32;
 pub type xkb_mod_mask_t = u32;
 pub type xkb_layout_index_t = u32;
 
-// ── Enums as constants ───────────────────────────────────────────────────────
-
 pub const XKB_CONTEXT_NO_FLAGS: c_int = 0;
 pub const XKB_KEYMAP_FORMAT_TEXT_V1: c_int = 1;
 pub const XKB_KEYMAP_COMPILE_NO_FLAGS: c_int = 0;
@@ -24,13 +21,9 @@ pub const XKB_KEY_DOWN: c_int = 1;
 pub const XKB_KEY_UP: c_int = 0;
 pub const XKB_STATE_MODS_EFFECTIVE: c_uint = 1 << 3;
 
-// ── Modifier name constants ──────────────────────────────────────────────────
-
 pub const XKB_MOD_NAME_SHIFT: &[u8] = b"Shift\0";
 pub const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
 pub const XKB_MOD_NAME_ALT: &[u8] = b"Mod1\0";
-
-// ── Keysym constants ─────────────────────────────────────────────────────────
 
 pub const XKB_KEY_Return: xkb_keysym_t = 0xff0d;
 pub const XKB_KEY_BackSpace: xkb_keysym_t = 0xff08;
@@ -42,8 +35,8 @@ pub const XKB_KEY_Up: xkb_keysym_t = 0xff52;
 pub const XKB_KEY_Down: xkb_keysym_t = 0xff54;
 pub const XKB_KEY_Home: xkb_keysym_t = 0xff50;
 pub const XKB_KEY_End: xkb_keysym_t = 0xff57;
-pub const XKB_KEY_Prior: xkb_keysym_t = 0xff55; // Page Up
-pub const XKB_KEY_Next: xkb_keysym_t = 0xff56; // Page Down
+pub const XKB_KEY_Prior: xkb_keysym_t = 0xff55;
+pub const XKB_KEY_Next: xkb_keysym_t = 0xff56;
 pub const XKB_KEY_Delete: xkb_keysym_t = 0xffff;
 pub const XKB_KEY_Insert: xkb_keysym_t = 0xff63;
 pub const XKB_KEY_F1: xkb_keysym_t = 0xffbe;
@@ -58,8 +51,6 @@ pub const XKB_KEY_F9: xkb_keysym_t = 0xffc6;
 pub const XKB_KEY_F10: xkb_keysym_t = 0xffc7;
 pub const XKB_KEY_F11: xkb_keysym_t = 0xffc8;
 pub const XKB_KEY_F12: xkb_keysym_t = 0xffc9;
-
-// ── Function table ───────────────────────────────────────────────────────────
 
 pub struct XkbHandle {
     _lib: *mut c_void,
@@ -99,44 +90,85 @@ unsafe impl Sync for XkbHandle {}
 
 impl XkbHandle {
     fn load() -> Option<Self> {
-        unsafe {
-            let names: &[&[u8]] = &[b"libxkbcommon.so.0\0", b"libxkbcommon.so\0"];
-            let mut handle = std::ptr::null_mut();
-            for name in names {
-                handle = libc::dlopen(name.as_ptr().cast(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
-                if !handle.is_null() {
-                    break;
-                }
-            }
-            if handle.is_null() {
-                return None;
-            }
+        const LIBXKBCOMMON_SO_0: &[u8] = b"libxkbcommon.so.0\0";
+        const LIBXKBCOMMON_SO: &[u8] = b"libxkbcommon.so\0";
 
-            macro_rules! sym {
-                ($name:literal) => {{
-                    let p = libc::dlsym(handle, concat!($name, "\0").as_ptr().cast());
-                    if p.is_null() {
-                        libc::dlclose(handle);
-                        return None;
-                    }
-                    std::mem::transmute(p)
-                }};
-            }
+        const XKB_CONTEXT_NEW: Symbol<unsafe extern "C" fn(c_int) -> *mut xkb_context> =
+            Symbol::new(b"xkb_context_new\0");
+        const XKB_CONTEXT_UNREF: Symbol<unsafe extern "C" fn(*mut xkb_context)> =
+            Symbol::new(b"xkb_context_unref\0");
+        const XKB_KEYMAP_NEW_FROM_BUFFER: Symbol<
+            unsafe extern "C" fn(
+                *mut xkb_context,
+                *const c_char,
+                usize,
+                c_int,
+                c_int,
+            ) -> *mut xkb_keymap,
+        > = Symbol::new(b"xkb_keymap_new_from_buffer\0");
+        const XKB_KEYMAP_UNREF: Symbol<unsafe extern "C" fn(*mut xkb_keymap)> =
+            Symbol::new(b"xkb_keymap_unref\0");
+        const XKB_KEYMAP_KEY_REPEATS: Symbol<
+            unsafe extern "C" fn(*mut xkb_keymap, xkb_keycode_t) -> c_int,
+        > = Symbol::new(b"xkb_keymap_key_repeats\0");
+        const XKB_STATE_NEW: Symbol<unsafe extern "C" fn(*mut xkb_keymap) -> *mut xkb_state> =
+            Symbol::new(b"xkb_state_new\0");
+        const XKB_STATE_UNREF: Symbol<unsafe extern "C" fn(*mut xkb_state)> =
+            Symbol::new(b"xkb_state_unref\0");
+        const XKB_STATE_UPDATE_KEY: Symbol<
+            unsafe extern "C" fn(*mut xkb_state, xkb_keycode_t, c_int) -> c_uint,
+        > = Symbol::new(b"xkb_state_update_key\0");
+        const XKB_STATE_UPDATE_MASK: Symbol<
+            unsafe extern "C" fn(
+                *mut xkb_state,
+                xkb_mod_mask_t,
+                xkb_mod_mask_t,
+                xkb_mod_mask_t,
+                xkb_layout_index_t,
+                xkb_layout_index_t,
+                xkb_layout_index_t,
+            ) -> c_uint,
+        > = Symbol::new(b"xkb_state_update_mask\0");
+        const XKB_STATE_KEY_GET_ONE_SYM: Symbol<
+            unsafe extern "C" fn(*mut xkb_state, xkb_keycode_t) -> xkb_keysym_t,
+        > = Symbol::new(b"xkb_state_key_get_one_sym\0");
+        const XKB_STATE_KEY_GET_UTF8: Symbol<
+            unsafe extern "C" fn(*mut xkb_state, xkb_keycode_t, *mut c_char, usize) -> c_int,
+        > = Symbol::new(b"xkb_state_key_get_utf8\0");
+        const XKB_STATE_MOD_NAME_IS_ACTIVE: Symbol<
+            unsafe extern "C" fn(*mut xkb_state, *const c_char, c_uint) -> c_int,
+        > = Symbol::new(b"xkb_state_mod_name_is_active\0");
+
+        unsafe {
+            let library = DlLibrary::open_any(&[LIBXKBCOMMON_SO_0, LIBXKBCOMMON_SO])?;
+            let xkb_context_new = XKB_CONTEXT_NEW.get(&library)?;
+            let xkb_context_unref = XKB_CONTEXT_UNREF.get(&library)?;
+            let xkb_keymap_new_from_buffer = XKB_KEYMAP_NEW_FROM_BUFFER.get(&library)?;
+            let xkb_keymap_unref = XKB_KEYMAP_UNREF.get(&library)?;
+            let xkb_keymap_key_repeats = XKB_KEYMAP_KEY_REPEATS.get(&library)?;
+            let xkb_state_new = XKB_STATE_NEW.get(&library)?;
+            let xkb_state_unref = XKB_STATE_UNREF.get(&library)?;
+            let xkb_state_update_key = XKB_STATE_UPDATE_KEY.get(&library)?;
+            let xkb_state_update_mask = XKB_STATE_UPDATE_MASK.get(&library)?;
+            let xkb_state_key_get_one_sym = XKB_STATE_KEY_GET_ONE_SYM.get(&library)?;
+            let xkb_state_key_get_utf8 = XKB_STATE_KEY_GET_UTF8.get(&library)?;
+            let xkb_state_mod_name_is_active = XKB_STATE_MOD_NAME_IS_ACTIVE.get(&library)?;
+            let _lib = library.into_raw();
 
             Some(Self {
-                _lib: handle,
-                xkb_context_new: sym!("xkb_context_new"),
-                xkb_context_unref: sym!("xkb_context_unref"),
-                xkb_keymap_new_from_buffer: sym!("xkb_keymap_new_from_buffer"),
-                xkb_keymap_unref: sym!("xkb_keymap_unref"),
-                xkb_keymap_key_repeats: sym!("xkb_keymap_key_repeats"),
-                xkb_state_new: sym!("xkb_state_new"),
-                xkb_state_unref: sym!("xkb_state_unref"),
-                xkb_state_update_key: sym!("xkb_state_update_key"),
-                xkb_state_update_mask: sym!("xkb_state_update_mask"),
-                xkb_state_key_get_one_sym: sym!("xkb_state_key_get_one_sym"),
-                xkb_state_key_get_utf8: sym!("xkb_state_key_get_utf8"),
-                xkb_state_mod_name_is_active: sym!("xkb_state_mod_name_is_active"),
+                _lib,
+                xkb_context_new,
+                xkb_context_unref,
+                xkb_keymap_new_from_buffer,
+                xkb_keymap_unref,
+                xkb_keymap_key_repeats,
+                xkb_state_new,
+                xkb_state_unref,
+                xkb_state_update_key,
+                xkb_state_update_mask,
+                xkb_state_key_get_one_sym,
+                xkb_state_key_get_utf8,
+                xkb_state_mod_name_is_active,
             })
         }
     }
