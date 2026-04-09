@@ -8,8 +8,6 @@ description = "A Wayland-native terminal emulator with animated cursor rendering
 keywords = ["terminal", "wayland", "vt100", "xterm"]
 categories = ["command-line-utilities", "gui"]
 
-[workspace]
-
 [dependencies]
 # Wayland-only software frontend
 wayland-client = "0.31"
@@ -32,12 +30,10 @@ debug = 1            # line tables only (faster builds + linking)
 opt-level = 0        # don't optimize deps - faster compile
 
 [profile.release]
-lto = "thin"
-codegen-units = 4
+lto = true
+codegen-units = 1
 panic = "abort"
 strip = true
 
 [profile.maxperf]
 inherits = "release"
-lto = true
-codegen-units = 1

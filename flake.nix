@@ -13,7 +13,7 @@
   }: let
     systems = ["x86_64-linux" "aarch64-linux"];
     forAllSystems = nixpkgs.lib.genAttrs systems;
-    pkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
+    pkgsFor = forAllSystems (system: import nixpkgs {inherit system;});
     runtimeLibsFor = system:
       with pkgsFor.${system}; [
         freetype
@@ -27,6 +27,12 @@
         dejavu_fonts
         liberation_ttf
       ];
+    mkApp = program: {
+      type = "app";
+      inherit program;
+    };
+    nixosModule = import ./nix/modules/nixos.nix {inherit self;};
+    homeManagerModule = import ./nix/modules/home-manager.nix {inherit self;};
   in {
     packages = forAllSystems (system: let
       pkgs = pkgsFor.${system};
@@ -46,12 +52,13 @@
             pkg-config
             makeWrapper
           ]
-          ++ lib.optionals useMold [ clang mold ];
+          ++ lib.optionals useMold [clang mold];
 
         buildInputs = runtimeLibs ++ runtimePackages;
 
         LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
-      } // lib.optionalAttrs useMold {
+      }
+      // lib.optionalAttrs useMold {
         CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
       };
 
@@ -73,30 +80,27 @@
             --prefix XDG_DATA_DIRS : ${lib.concatStringsSep ":" (map (pkg: "${pkg}/share") runtimePackages)}
         '';
       });
-    in {
+    in rec {
       default = rudo;
-      rudo = rudo;
+      inherit rudo;
     });
 
-    apps = forAllSystems (system: {
-      default = {
-        type = "app";
-        program = "${self.packages.${system}.default}/bin/rudo";
-      };
-      rudo = {
-        type = "app";
-        program = "${self.packages.${system}.rudo}/bin/rudo";
-      };
+    apps = forAllSystems (system: let
+      program = "${self.packages.${system}.rudo}/bin/rudo";
+      app = mkApp program;
+    in {
+      default = app;
+      rudo = app;
     });
 
     nixosModules = {
-      default = import ./nix/modules/nixos.nix { inherit self; };
-      rudo = import ./nix/modules/nixos.nix { inherit self; };
+      default = nixosModule;
+      rudo = nixosModule;
     };
 
     homeManagerModules = {
-      default = import ./nix/modules/home-manager.nix { inherit self; };
-      rudo = import ./nix/modules/home-manager.nix { inherit self; };
+      default = homeManagerModule;
+      rudo = homeManagerModule;
     };
 
     devShells = forAllSystems (system: let
@@ -109,8 +113,8 @@
     in {
       default = pkgs.mkShell ({
           packages = with pkgs;
-            [ cargo rustc rustfmt clippy pkg-config ]
-            ++ lib.optionals useMold [ clang mold ]
+            [cargo rustc rustfmt clippy pkg-config]
+            ++ lib.optionals useMold [clang mold]
             ++ runtimeLibs
             ++ runtimePackages;
 
