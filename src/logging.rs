@@ -1,6 +1,20 @@
 #[cfg(not(debug_assertions))]
 const INFO_ENV_VARS: [&str; 2] = ["RUDO_LOG_INFO", "TERMVIDE_LOG_INFO"];
 
+#[cfg(not(debug_assertions))]
+fn env_var_enabled(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => {
+            let normalized = value.trim();
+            matches!(
+                normalized,
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        }
+        Err(_) => false,
+    }
+}
+
 #[inline]
 pub(crate) fn info_enabled() -> bool {
     #[cfg(debug_assertions)]
@@ -11,15 +25,7 @@ pub(crate) fn info_enabled() -> bool {
     #[cfg(not(debug_assertions))]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            INFO_ENV_VARS.iter().any(|key| match std::env::var(key) {
-                Ok(value) => matches!(
-                    value.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                ),
-                Err(_) => false,
-            })
-        })
+        *ENABLED.get_or_init(|| INFO_ENV_VARS.iter().any(|key| env_var_enabled(key)))
     }
 }
 

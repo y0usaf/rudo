@@ -1,5 +1,5 @@
 //! TOML-based configuration system for rudo.
-//! Loads from ~/.config/rudo/config.toml, with legacy SwiftTerm fallback.
+//! Loads from ~/.config/rudo/config.toml, with legacy config-path fallback.
 
 use crate::defaults::{
     APP_NAME, CONFIG_FILE_NAME, DEFAULT_ANSI_HEX, DEFAULT_BACKGROUND_HEX, DEFAULT_BOLD_IS_BRIGHT,
@@ -17,7 +17,7 @@ use crate::toml_parser::TomlTable;
 use crate::warn_log;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
     pub font: FontConfig,
     pub colors: ColorConfig,
@@ -28,7 +28,7 @@ pub struct Config {
     pub keybindings: KeybindingsConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FontConfig {
     pub family: String,
     pub size: f32,
@@ -36,7 +36,7 @@ pub struct FontConfig {
     pub bold_is_bright: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColorConfig {
     pub foreground: String,
     pub background: String,
@@ -62,7 +62,7 @@ pub struct ColorConfig {
     pub bright_white: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CursorConfig {
     pub style: String,
     pub animation_length: f32,
@@ -72,7 +72,7 @@ pub struct CursorConfig {
     pub blink_interval: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowConfig {
     pub padding: u32,
     pub title: String,
@@ -81,7 +81,7 @@ pub struct WindowConfig {
     pub initial_height: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
     pub cols: usize,
     pub rows: usize,
@@ -90,26 +90,12 @@ pub struct TerminalConfig {
     pub shell_fallback: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollbackConfig {
     pub lines: usize,
 }
 
 // --- Default implementations ---
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            font: FontConfig::default(),
-            colors: ColorConfig::default(),
-            cursor: CursorConfig::default(),
-            window: WindowConfig::default(),
-            terminal: TerminalConfig::default(),
-            scrollback: ScrollbackConfig::default(),
-            keybindings: KeybindingsConfig::default(),
-        }
-    }
-}
 
 impl Default for FontConfig {
     fn default() -> Self {
@@ -198,25 +184,24 @@ impl Default for ScrollbackConfig {
 
 impl Config {
     /// Try to load configuration from ~/.config/rudo/config.toml.
-    /// Falls back to the legacy SwiftTerm config path, then defaults.
+    /// Falls back to the legacy config path, then defaults.
     pub fn load() -> Self {
-        let Some(primary_path) = Self::primary_config_path() else {
+        let Some((primary_path, legacy_path)) = Self::config_paths() else {
             info_log!("No config directory found, using defaults");
             return Config::default();
         };
 
-        let path = Self::config_paths()
-            .into_iter()
-            .find(|candidate| candidate.exists())
-            .unwrap_or_else(|| primary_path.clone());
-
-        if !path.exists() {
+        let path = if primary_path.exists() {
+            primary_path.clone()
+        } else if legacy_path.exists() {
+            legacy_path
+        } else {
             info_log!(
                 "Config file not found at {}, using defaults",
                 primary_path.display()
             );
             return Config::default();
-        }
+        };
 
         if path != primary_path {
             info_log!(
@@ -281,16 +266,19 @@ impl Config {
             }
         }
 
-        /// Helper macro to extract a string config value with fallback to default
-        macro_rules! str_field {
-            ($section:expr, $key:expr, $default:expr) => {
-                t.get_str($section, $key).unwrap_or($default).to_string()
-            };
+        fn string_field(t: &TomlTable, section: &str, key: &str, default: &str) -> String {
+            t.get_str(section, key).unwrap_or(default).to_string()
         }
 
-        Config {
+        fn u32_field(t: &TomlTable, section: &str, key: &str, default: u32) -> u32 {
+            t.get_usize(section, key)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(default)
+        }
+
+        let mut config = Config {
             font: FontConfig {
-                family: str_field!("font", "family", &def.font.family),
+                family: string_field(t, "font", "family", &def.font.family),
                 size: t.get_f32("font", "size").unwrap_or(def.font.size),
                 size_adjustment: t
                     .get_f32("font", "size_adjustment")
@@ -300,29 +288,39 @@ impl Config {
                     .unwrap_or(def.font.bold_is_bright),
             },
             colors: ColorConfig {
-                foreground: str_field!("colors", "foreground", &def.colors.foreground),
-                background: str_field!("colors", "background", &def.colors.background),
-                cursor: str_field!("colors", "cursor", &def.colors.cursor),
-                selection: str_field!("colors", "selection", &def.colors.selection),
-                black: str_field!("colors", "black", &def.colors.black),
-                red: str_field!("colors", "red", &def.colors.red),
-                green: str_field!("colors", "green", &def.colors.green),
-                yellow: str_field!("colors", "yellow", &def.colors.yellow),
-                blue: str_field!("colors", "blue", &def.colors.blue),
-                magenta: str_field!("colors", "magenta", &def.colors.magenta),
-                cyan: str_field!("colors", "cyan", &def.colors.cyan),
-                white: str_field!("colors", "white", &def.colors.white),
-                bright_black: str_field!("colors", "bright_black", &def.colors.bright_black),
-                bright_red: str_field!("colors", "bright_red", &def.colors.bright_red),
-                bright_green: str_field!("colors", "bright_green", &def.colors.bright_green),
-                bright_yellow: str_field!("colors", "bright_yellow", &def.colors.bright_yellow),
-                bright_blue: str_field!("colors", "bright_blue", &def.colors.bright_blue),
-                bright_magenta: str_field!("colors", "bright_magenta", &def.colors.bright_magenta),
-                bright_cyan: str_field!("colors", "bright_cyan", &def.colors.bright_cyan),
-                bright_white: str_field!("colors", "bright_white", &def.colors.bright_white),
+                foreground: string_field(t, "colors", "foreground", &def.colors.foreground),
+                background: string_field(t, "colors", "background", &def.colors.background),
+                cursor: string_field(t, "colors", "cursor", &def.colors.cursor),
+                selection: string_field(t, "colors", "selection", &def.colors.selection),
+                black: string_field(t, "colors", "black", &def.colors.black),
+                red: string_field(t, "colors", "red", &def.colors.red),
+                green: string_field(t, "colors", "green", &def.colors.green),
+                yellow: string_field(t, "colors", "yellow", &def.colors.yellow),
+                blue: string_field(t, "colors", "blue", &def.colors.blue),
+                magenta: string_field(t, "colors", "magenta", &def.colors.magenta),
+                cyan: string_field(t, "colors", "cyan", &def.colors.cyan),
+                white: string_field(t, "colors", "white", &def.colors.white),
+                bright_black: string_field(t, "colors", "bright_black", &def.colors.bright_black),
+                bright_red: string_field(t, "colors", "bright_red", &def.colors.bright_red),
+                bright_green: string_field(t, "colors", "bright_green", &def.colors.bright_green),
+                bright_yellow: string_field(
+                    t,
+                    "colors",
+                    "bright_yellow",
+                    &def.colors.bright_yellow,
+                ),
+                bright_blue: string_field(t, "colors", "bright_blue", &def.colors.bright_blue),
+                bright_magenta: string_field(
+                    t,
+                    "colors",
+                    "bright_magenta",
+                    &def.colors.bright_magenta,
+                ),
+                bright_cyan: string_field(t, "colors", "bright_cyan", &def.colors.bright_cyan),
+                bright_white: string_field(t, "colors", "bright_white", &def.colors.bright_white),
             },
             cursor: CursorConfig {
-                style: str_field!("cursor", "style", &def.cursor.style),
+                style: string_field(t, "cursor", "style", &def.cursor.style),
                 animation_length: t
                     .get_f32("cursor", "animation_length")
                     .unwrap_or(def.cursor.animation_length),
@@ -338,29 +336,22 @@ impl Config {
                     .unwrap_or(def.cursor.blink_interval),
             },
             window: WindowConfig {
-                padding: t
-                    .get_usize("window", "padding")
-                    .unwrap_or(def.window.padding as usize) as u32,
-                title: str_field!("window", "title", &def.window.title),
-                app_id: str_field!("window", "app_id", &def.window.app_id),
-                initial_width: t
-                    .get_usize("window", "initial_width")
-                    .unwrap_or(def.window.initial_width as usize)
-                    as u32,
-                initial_height: t
-                    .get_usize("window", "initial_height")
-                    .unwrap_or(def.window.initial_height as usize)
-                    as u32,
+                padding: u32_field(t, "window", "padding", def.window.padding),
+                title: string_field(t, "window", "title", &def.window.title),
+                app_id: string_field(t, "window", "app_id", &def.window.app_id),
+                initial_width: u32_field(t, "window", "initial_width", def.window.initial_width),
+                initial_height: u32_field(t, "window", "initial_height", def.window.initial_height),
             },
             terminal: TerminalConfig {
                 cols: t.get_usize("terminal", "cols").unwrap_or(def.terminal.cols),
                 rows: t.get_usize("terminal", "rows").unwrap_or(def.terminal.rows),
-                term: str_field!("terminal", "term", &def.terminal.term),
-                colorterm: str_field!("terminal", "colorterm", &def.terminal.colorterm),
-                shell_fallback: str_field!(
+                term: string_field(t, "terminal", "term", &def.terminal.term),
+                colorterm: string_field(t, "terminal", "colorterm", &def.terminal.colorterm),
+                shell_fallback: string_field(
+                    t,
                     "terminal",
                     "shell_fallback",
-                    &def.terminal.shell_fallback
+                    &def.terminal.shell_fallback,
                 ),
             },
             scrollback: ScrollbackConfig {
@@ -375,37 +366,67 @@ impl Config {
                 zoom_out: keybinding_field(t, "zoom_out", &def.keybindings.zoom_out),
                 zoom_reset: keybinding_field(t, "zoom_reset", &def.keybindings.zoom_reset),
             },
+        };
+        config.normalize();
+        config
+    }
+
+    fn sanitize_f32(value: f32, minimum: f32, default: f32) -> f32 {
+        if value.is_finite() {
+            value.max(minimum)
+        } else {
+            default
         }
     }
 
-    /// Returns the path to the config file, or None if the config directory
-    /// cannot be determined.
-    fn primary_config_path() -> Option<PathBuf> {
-        config_dir().map(|dir| dir.join(APP_NAME).join(CONFIG_FILE_NAME))
+    fn normalize(&mut self) {
+        self.font.size = Self::sanitize_f32(self.font.size, 1.0, DEFAULT_FONT_SIZE);
+        self.font.size_adjustment =
+            Self::sanitize_f32(self.font.size_adjustment, 0.1, DEFAULT_FONT_SIZE_ADJUSTMENT);
+        self.cursor.animation_length = Self::sanitize_f32(
+            self.cursor.animation_length,
+            0.0,
+            DEFAULT_CURSOR_ANIMATION_LENGTH_SECS,
+        );
+        self.cursor.short_animation_length = Self::sanitize_f32(
+            self.cursor.short_animation_length,
+            0.0,
+            DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS,
+        );
+        self.cursor.trail_size =
+            Self::sanitize_f32(self.cursor.trail_size, 0.0, DEFAULT_CURSOR_TRAIL_SIZE);
+        self.cursor.blink_interval = Self::sanitize_f32(
+            self.cursor.blink_interval,
+            f32::EPSILON,
+            DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
+        );
+        self.window.initial_width = self.window.initial_width.max(1);
+        self.window.initial_height = self.window.initial_height.max(1);
+        self.terminal.cols = self.terminal.cols.max(2);
+        self.terminal.rows = self.terminal.rows.max(2);
     }
 
-    fn config_paths() -> Vec<PathBuf> {
-        config_dir()
-            .map(|dir| {
-                vec![
-                    dir.join(APP_NAME).join(CONFIG_FILE_NAME),
-                    dir.join(LEGACY_CONFIG_DIR_NAME).join(CONFIG_FILE_NAME),
-                ]
-            })
-            .unwrap_or_default()
+    /// Returns the primary and legacy config paths, or None if the config
+    /// directory cannot be determined.
+    fn config_paths() -> Option<(PathBuf, PathBuf)> {
+        let dir = config_dir()?;
+        Some((
+            dir.join(APP_NAME).join(CONFIG_FILE_NAME),
+            dir.join(LEGACY_CONFIG_DIR_NAME).join(CONFIG_FILE_NAME),
+        ))
     }
 }
 
 /// XDG config directory: $XDG_CONFIG_HOME or $HOME/.config
 pub fn config_dir() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(xdg);
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config"))
+
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
 }
 
 /// Parse a hex color string in "#rrggbb" or "rrggbb" format into (r, g, b).
@@ -415,11 +436,6 @@ fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
 
     if hex.len() != 6 {
-        return None;
-    }
-
-    // Validate all characters are hex digits
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
 
@@ -516,7 +532,7 @@ foreground = "#e0e0e0"
 
     #[test]
     fn test_extended_toml_parse() {
-        let toml_str = r##"
+        let toml_str = r#"
 [cursor]
 short_animation_length = 0.05
 blink_interval = 0.7
@@ -531,7 +547,7 @@ rows = 43
 term = "foot"
 colorterm = "24bit"
 shell_fallback = "/usr/bin/zsh"
-"##;
+"#;
         let table = TomlTable::parse(toml_str).unwrap();
         let config = Config::from_toml(&table);
         assert_eq!(config.cursor.short_animation_length, 0.05);
@@ -547,7 +563,7 @@ shell_fallback = "/usr/bin/zsh"
 
     #[test]
     fn test_negative_integer_config_values_fall_back_to_defaults() {
-        let toml_str = r##"
+        let toml_str = r"
 [window]
 padding = -1
 initial_width = -1024
@@ -559,7 +575,7 @@ rows = -43
 
 [scrollback]
 lines = -10000
-"##;
+";
         let table = TomlTable::parse(toml_str).unwrap();
         let config = Config::from_toml(&table);
         let defaults = Config::default();
@@ -570,6 +586,46 @@ lines = -10000
         assert_eq!(config.terminal.cols, defaults.terminal.cols);
         assert_eq!(config.terminal.rows, defaults.terminal.rows);
         assert_eq!(config.scrollback.lines, defaults.scrollback.lines);
+    }
+
+    #[test]
+    fn test_semantically_invalid_numeric_values_are_normalized() {
+        let toml_str = r"
+[font]
+size = 0.0
+size_adjustment = 0.0
+
+[cursor]
+animation_length = -1.0
+short_animation_length = -2.0
+trail_size = -3.0
+blink_interval = 0.0
+
+[window]
+initial_width = 0
+initial_height = 0
+
+[terminal]
+cols = 1
+rows = 1
+
+[scrollback]
+lines = 0
+";
+        let table = TomlTable::parse(toml_str).unwrap();
+        let config = Config::from_toml(&table);
+
+        assert_eq!(config.font.size, 1.0);
+        assert_eq!(config.font.size_adjustment, 0.1);
+        assert_eq!(config.cursor.animation_length, 0.0);
+        assert_eq!(config.cursor.short_animation_length, 0.0);
+        assert_eq!(config.cursor.trail_size, 0.0);
+        assert!(config.cursor.blink_interval > 0.0);
+        assert_eq!(config.window.initial_width, 1);
+        assert_eq!(config.window.initial_height, 1);
+        assert_eq!(config.terminal.cols, 2);
+        assert_eq!(config.terminal.rows, 2);
+        assert_eq!(config.scrollback.lines, 0);
     }
 
     #[test]
@@ -595,14 +651,14 @@ lines = -10000
 
     #[test]
     fn test_custom_keybindings_parse() {
-        let toml_str = r##"
+        let toml_str = r#"
 [keybindings]
 copy = "alt+c"
 paste = "alt+v"
 zoom_in = "alt+equal, alt+plus"
 zoom_out = "alt+minus"
 zoom_reset = "alt+0"
-"##;
+"#;
         let table = TomlTable::parse(toml_str).unwrap();
         let config = Config::from_toml(&table);
 
@@ -634,10 +690,10 @@ zoom_reset = "alt+0"
 
     #[test]
     fn test_keybindings_can_be_disabled() {
-        let toml_str = r##"
+        let toml_str = r"
 [keybindings]
 paste = false
-"##;
+";
         let table = TomlTable::parse(toml_str).unwrap();
         let config = Config::from_toml(&table);
 
@@ -649,5 +705,64 @@ paste = false
             },
             mods(true, true, false)
         ));
+    }
+
+    #[test]
+    fn test_config_dir_prefers_xdg_config_home() {
+        let _lock = env_test_lock();
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", Some("/tmp/rudo-xdg"));
+        let _home_guard = EnvGuard::set("HOME", Some("/tmp/rudo-home"));
+
+        assert_eq!(config_dir(), Some(PathBuf::from("/tmp/rudo-xdg")));
+    }
+
+    #[test]
+    fn test_config_dir_falls_back_to_home_config() {
+        let _lock = env_test_lock();
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", None);
+        let _home_guard = EnvGuard::set("HOME", Some("/tmp/rudo-home"));
+
+        assert_eq!(config_dir(), Some(PathBuf::from("/tmp/rudo-home/.config")));
+    }
+
+    #[test]
+    fn test_config_dir_returns_none_without_home_or_xdg() {
+        let _lock = env_test_lock();
+        let _xdg_guard = EnvGuard::set("XDG_CONFIG_HOME", None);
+        let _home_guard = EnvGuard::set("HOME", None);
+
+        assert_eq!(config_dir(), None);
+    }
+
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }

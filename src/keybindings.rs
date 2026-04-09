@@ -11,7 +11,7 @@ pub enum LocalAction {
     ZoomReset,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeybindingsConfig {
     pub copy: Vec<KeyBinding>,
     pub paste: Vec<KeyBinding>,
@@ -22,15 +22,23 @@ pub struct KeybindingsConfig {
 
 impl Default for KeybindingsConfig {
     fn default() -> Self {
+        let ctrl = BindingModifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+        };
+        let ctrl_shift = BindingModifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+        };
+
         Self {
-            copy: parse_binding_list("ctrl+shift+c").expect("default copy binding must parse"),
-            paste: parse_binding_list("ctrl+shift+v").expect("default paste binding must parse"),
-            zoom_in: parse_binding_list("ctrl+=, ctrl+plus")
-                .expect("default zoom_in binding must parse"),
-            zoom_out: parse_binding_list("ctrl+-, ctrl+minus")
-                .expect("default zoom_out binding must parse"),
-            zoom_reset: parse_binding_list("ctrl+0")
-                .expect("default zoom_reset binding must parse"),
+            copy: vec![KeyBinding::text(ctrl_shift, "c")],
+            paste: vec![KeyBinding::text(ctrl_shift, "v")],
+            zoom_in: vec![KeyBinding::text(ctrl, "="), KeyBinding::text(ctrl, "+")],
+            zoom_out: vec![KeyBinding::text(ctrl, "-")],
+            zoom_reset: vec![KeyBinding::text(ctrl, "0")],
         }
     }
 }
@@ -58,18 +66,21 @@ pub struct KeyBinding {
 }
 
 impl KeyBinding {
+    fn text(modifiers: BindingModifiers, token: &str) -> Self {
+        Self {
+            modifiers,
+            key: BindingKey::parse(token).expect("default key token must parse"),
+        }
+    }
+
     pub fn parse(spec: &str) -> Result<Self, String> {
         let spec = spec.trim();
         if spec.is_empty() {
             return Err("empty keybinding".to_string());
         }
 
-        let parts: Vec<_> = spec.split('+').map(str::trim).collect();
-        if parts.is_empty() {
-            return Err("empty keybinding".to_string());
-        }
-
-        let key_part = parts.last().copied().unwrap_or_default();
+        let mut parts = spec.split('+').map(str::trim);
+        let key_part = parts.next_back().unwrap_or_default();
         if key_part.is_empty() {
             return Err(format!(
                 "missing key in binding '{spec}' (use names like 'plus' for '+')"
@@ -77,7 +88,7 @@ impl KeyBinding {
         }
 
         let mut modifiers = BindingModifiers::default();
-        for modifier in &parts[..parts.len().saturating_sub(1)] {
+        for modifier in parts {
             if modifier.is_empty() {
                 return Err(format!(
                     "invalid modifier in binding '{spec}' (use names like 'plus' for '+')"
@@ -110,11 +121,14 @@ struct BindingModifiers {
 
 impl BindingModifiers {
     fn apply(&mut self, modifier: &str) -> Result<(), String> {
-        match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => self.ctrl = true,
-            "shift" => self.shift = true,
-            "alt" => self.alt = true,
-            other => return Err(format!("unknown modifier '{other}'")),
+        if modifier.eq_ignore_ascii_case("ctrl") || modifier.eq_ignore_ascii_case("control") {
+            self.ctrl = true;
+        } else if modifier.eq_ignore_ascii_case("shift") {
+            self.shift = true;
+        } else if modifier.eq_ignore_ascii_case("alt") {
+            self.alt = true;
+        } else {
+            return Err(format!("unknown modifier '{modifier}'"));
         }
         Ok(())
     }

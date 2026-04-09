@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+type Section = HashMap<String, TomlValue>;
+type Sections = HashMap<String, Section>;
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TomlValue {
     String(String),
     Integer(i64),
@@ -13,61 +16,81 @@ pub enum TomlValue {
 
 /// Parsed TOML table: section → (key → value).
 /// Keys with no section header go under the empty string "".
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct TomlTable {
-    sections: HashMap<String, HashMap<String, TomlValue>>,
+    sections: Sections,
 }
 
 impl TomlTable {
     pub fn parse(input: &str) -> Result<Self, String> {
-        let mut sections: HashMap<String, HashMap<String, TomlValue>> = HashMap::new();
+        let mut sections = Sections::new();
         let mut current_section = String::new();
 
-        for (line_num, raw_line) in input.lines().enumerate() {
+        for (line_idx, raw_line) in input.lines().enumerate() {
+            let line_num = line_idx + 1;
             let line = raw_line.trim();
 
-            // Skip empty lines and comments
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
-            // Section header
-            if line.starts_with('[') {
-                if let Some(end) = line.find(']') {
-                    current_section = line[1..end].trim().to_string();
-                    sections.entry(current_section.clone()).or_default();
-                    continue;
-                } else {
-                    return Err(format!("line {}: unclosed section bracket", line_num + 1));
+            if let Some(section_body) = line.strip_prefix('[') {
+                let Some(end) = section_body.find(']') else {
+                    return Err(format!("line {}: unclosed section bracket", line_num));
+                };
+
+                let section = section_body[..end].trim();
+                if section.is_empty() {
+                    return Err(format!("line {}: empty section name", line_num));
                 }
+
+                let trailing = section_body[end + 1..].trim_start();
+                if !trailing.is_empty() && !trailing.starts_with('#') {
+                    return Err(format!(
+                        "line {}: trailing content after section header",
+                        line_num
+                    ));
+                }
+
+                current_section.clear();
+                current_section.push_str(section);
+                sections.entry(current_section.clone()).or_default();
+                continue;
             }
 
-            // Key = value
-            if let Some(eq_pos) = line.find('=') {
-                let key = line[..eq_pos].trim().to_string();
-                let val_part = line[eq_pos + 1..].trim();
+            let Some((key_part, value_part)) = line.split_once('=') else {
+                return Err(format!("line {}: expected key = value", line_num));
+            };
 
-                let value = parse_value(val_part)?;
-                sections
-                    .entry(current_section.clone())
-                    .or_default()
-                    .insert(key, value);
+            let key = key_part.trim();
+            if key.is_empty() {
+                return Err(format!("line {}: empty key", line_num));
             }
-            // Ignore lines that don't match
+
+            let value = parse_value(value_part.trim())
+                .map_err(|err| format!("line {}: {}", line_num, err))?;
+            sections
+                .entry(current_section.clone())
+                .or_default()
+                .insert(key.to_string(), value);
         }
 
-        Ok(TomlTable { sections })
+        Ok(Self { sections })
+    }
+
+    fn get(&self, section: &str, key: &str) -> Option<&TomlValue> {
+        self.sections.get(section)?.get(key)
     }
 
     pub fn get_str(&self, section: &str, key: &str) -> Option<&str> {
-        match self.sections.get(section)?.get(key)? {
+        match self.get(section, key)? {
             TomlValue::String(s) => Some(s.as_str()),
             _ => None,
         }
     }
 
     pub fn get_f64(&self, section: &str, key: &str) -> Option<f64> {
-        match self.sections.get(section)?.get(key)? {
+        match self.get(section, key)? {
             TomlValue::Float(f) => Some(*f),
             TomlValue::Integer(i) => Some(*i as f64),
             _ => None,
@@ -79,7 +102,7 @@ impl TomlTable {
     }
 
     pub fn get_i64(&self, section: &str, key: &str) -> Option<i64> {
-        match self.sections.get(section)?.get(key)? {
+        match self.get(section, key)? {
             TomlValue::Integer(i) => Some(*i),
             _ => None,
         }
@@ -91,7 +114,7 @@ impl TomlTable {
     }
 
     pub fn get_bool(&self, section: &str, key: &str) -> Option<bool> {
-        match self.sections.get(section)?.get(key)? {
+        match self.get(section, key)? {
             TomlValue::Boolean(b) => Some(*b),
             _ => None,
         }
@@ -104,49 +127,41 @@ impl TomlTable {
 }
 
 fn parse_value(raw: &str) -> Result<TomlValue, String> {
-    // Strip inline comment (but not inside strings)
-    let val = if raw.starts_with('"') {
-        raw // handle below
+    let value = if let Some(string_body) = raw.strip_prefix('"') {
+        let Some(end) = string_body.find('"') else {
+            return Err(format!("unclosed string: {}", raw));
+        };
+
+        let trailing = string_body[end + 1..].trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(format!("cannot parse value: {}", raw));
+        }
+
+        return Ok(TomlValue::String(string_body[..end].to_string()));
     } else if let Some(hash_pos) = raw.find('#') {
         raw[..hash_pos].trim()
     } else {
         raw
     };
 
-    // Quoted string
-    if val.starts_with('"') {
-        if let Some(end) = val[1..].find('"') {
-            let string_end = 1 + end;
-            let trailing = val[string_end + 1..].trim_start();
-            if !trailing.is_empty() && !trailing.starts_with('#') {
-                return Err(format!("cannot parse value: {}", val));
-            }
-            return Ok(TomlValue::String(val[1..string_end].to_string()));
-        }
-        return Err(format!("unclosed string: {}", val));
-    }
-
-    // Boolean
-    if val == "true" {
+    if value == "true" {
         return Ok(TomlValue::Boolean(true));
     }
-    if val == "false" {
+    if value == "false" {
         return Ok(TomlValue::Boolean(false));
     }
 
-    // Float (contains a dot)
-    if val.contains('.') {
-        if let Ok(f) = val.parse::<f64>() {
-            return Ok(TomlValue::Float(f));
+    if value.contains('.') {
+        if let Ok(float) = value.parse::<f64>() {
+            return Ok(TomlValue::Float(float));
         }
     }
 
-    // Integer
-    if let Ok(i) = val.parse::<i64>() {
-        return Ok(TomlValue::Integer(i));
+    if let Ok(integer) = value.parse::<i64>() {
+        return Ok(TomlValue::Integer(integer));
     }
 
-    Err(format!("cannot parse value: {}", val))
+    Err(format!("cannot parse value: {}", value))
 }
 
 #[cfg(test)]
@@ -219,5 +234,23 @@ color0 = "#282828"
         let input = "[s]\nk = \"v\"   # ok\n";
         let table = TomlTable::parse(input).unwrap();
         assert_eq!(table.get_str("s", "k"), Some("v"));
+    }
+
+    #[test]
+    fn reject_trailing_garbage_after_section_header() {
+        let err = TomlTable::parse("[s] nope\nk = 1\n").unwrap_err();
+        assert!(err.contains("trailing content after section header"));
+    }
+
+    #[test]
+    fn reject_empty_key() {
+        let err = TomlTable::parse("[s]\n= 1\n").unwrap_err();
+        assert!(err.contains("empty key"));
+    }
+
+    #[test]
+    fn reject_unrecognized_non_assignment_line() {
+        let err = TomlTable::parse("[s]\nthis is not valid\n").unwrap_err();
+        assert!(err.contains("expected key = value"));
     }
 }

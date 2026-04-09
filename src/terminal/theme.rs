@@ -50,11 +50,6 @@ fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
         return None;
     }
 
-    // Validate all characters are hex digits
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-
     let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
@@ -76,9 +71,9 @@ impl ThemeFile {
         let table = TomlTable::parse(input).ok()?;
 
         let mut colors: [Option<String>; 16] = Default::default();
-        for i in 0..16 {
-            let key = format!("color{}", i);
-            colors[i] = table.get_str_flat(&key).map(ToString::to_string);
+        for (index, color) in colors.iter_mut().enumerate() {
+            let key = format!("color{index}");
+            *color = table.get_str_flat(&key).map(ToString::to_string);
         }
 
         Some(Self {
@@ -91,9 +86,8 @@ impl ThemeFile {
     }
 
     fn ansi_color(&self, index: u8) -> &str {
-        self.colors[index as usize]
-            .as_deref()
-            .unwrap_or(DEFAULT_ANSI_HEX[index as usize])
+        let idx = usize::from(index);
+        self.colors[idx].as_deref().unwrap_or(DEFAULT_ANSI_HEX[idx])
     }
 }
 
@@ -146,12 +140,24 @@ pub struct Theme {
     palette: [PackedColor; 256],
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self::from_color_strings(&ThemeColorStrings {
+            foreground: DEFAULT_FOREGROUND_HEX,
+            background: DEFAULT_BACKGROUND_HEX,
+            cursor: DEFAULT_CURSOR_HEX,
+            selection: DEFAULT_SELECTION_HEX,
+            ansi: DEFAULT_ANSI_HEX,
+        })
+    }
+}
+
 #[allow(dead_code)]
 impl Theme {
     pub fn from_color_strings(colors: &ThemeColorStrings) -> Self {
         let mut ansi = [PackedColor(0); 16];
-        for (i, hex) in colors.ansi.iter().enumerate() {
-            ansi[i] = hex_to_packed(hex);
+        for (index, hex) in colors.ansi.iter().enumerate() {
+            ansi[index] = hex_to_packed(hex);
         }
 
         Self {
@@ -163,22 +169,8 @@ impl Theme {
         }
     }
 
-    pub fn default() -> Self {
-        Self::from_color_strings(&ThemeColorStrings {
-            foreground: DEFAULT_FOREGROUND_HEX,
-            background: DEFAULT_BACKGROUND_HEX,
-            cursor: DEFAULT_CURSOR_HEX,
-            selection: DEFAULT_SELECTION_HEX,
-            ansi: DEFAULT_ANSI_HEX,
-        })
-    }
-
     pub fn load_theme_file() -> Option<Self> {
         for path in Self::theme_search_paths() {
-            if !path.exists() {
-                continue;
-            }
-
             match std::fs::read_to_string(&path) {
                 Ok(contents) => match ThemeFile::parse(&contents) {
                     Some(tf) => {
@@ -189,6 +181,7 @@ impl Theme {
                         warn_log!("Failed to parse theme file {}", path.display());
                     }
                 },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     warn_log!("Failed to read theme file {}: {}", path.display(), e);
                 }
@@ -206,26 +199,6 @@ impl Theme {
     #[inline]
     pub fn set_palette(&mut self, index: u8, color: PackedColor) {
         self.palette[index as usize] = color;
-    }
-
-    #[inline]
-    pub fn fg_rgba(&self) -> [f32; 4] {
-        self.foreground.to_rgba_f32()
-    }
-
-    #[inline]
-    pub fn bg_rgba(&self) -> [f32; 4] {
-        self.background.to_rgba_f32()
-    }
-
-    #[inline]
-    pub fn cursor_rgba(&self) -> [f32; 4] {
-        self.cursor.to_rgba_f32()
-    }
-
-    #[inline]
-    pub fn selection_rgba(&self) -> [f32; 4] {
-        self.selection.to_rgba_f32()
     }
 
     fn theme_search_paths() -> Vec<PathBuf> {
@@ -247,8 +220,8 @@ impl Theme {
 
     fn from_theme_file(tf: &ThemeFile) -> Self {
         let mut ansi = [PackedColor(0); 16];
-        for i in 0u8..16 {
-            ansi[i as usize] = hex_to_packed(tf.ansi_color(i));
+        for (i, color) in ansi.iter_mut().enumerate() {
+            *color = hex_to_packed(tf.ansi_color(i as u8));
         }
 
         Self {
@@ -374,40 +347,36 @@ mod tests {
 
     #[test]
     fn fg_rgba_correctness() {
-        let rgba = Theme::default().fg_rgba();
+        let color = Theme::default().foreground;
         let expected = 212.0 / 255.0;
-        assert!((rgba[0] - expected).abs() < 1e-4);
-        assert!((rgba[1] - expected).abs() < 1e-4);
-        assert!((rgba[2] - expected).abs() < 1e-4);
-        assert!((rgba[3] - 1.0).abs() < 1e-6);
+        assert!((color.r() as f32 / 255.0 - expected).abs() < 1e-4);
+        assert!((color.g() as f32 / 255.0 - expected).abs() < 1e-4);
+        assert!((color.b() as f32 / 255.0 - expected).abs() < 1e-4);
     }
 
     #[test]
     fn bg_rgba_correctness() {
-        let rgba = Theme::default().bg_rgba();
+        let color = Theme::default().background;
         let expected = 30.0 / 255.0;
-        assert!((rgba[0] - expected).abs() < 1e-4);
-        assert!((rgba[1] - expected).abs() < 1e-4);
-        assert!((rgba[2] - expected).abs() < 1e-4);
-        assert!((rgba[3] - 1.0).abs() < 1e-6);
+        assert!((color.r() as f32 / 255.0 - expected).abs() < 1e-4);
+        assert!((color.g() as f32 / 255.0 - expected).abs() < 1e-4);
+        assert!((color.b() as f32 / 255.0 - expected).abs() < 1e-4);
     }
 
     #[test]
     fn cursor_rgba_correctness() {
-        let rgba = Theme::default().cursor_rgba();
-        assert!((rgba[0] - 1.0).abs() < 1e-6);
-        assert!((rgba[1] - 1.0).abs() < 1e-6);
-        assert!((rgba[2] - 1.0).abs() < 1e-6);
-        assert!((rgba[3] - 1.0).abs() < 1e-6);
+        let color = Theme::default().cursor;
+        assert_eq!(color.r(), 255);
+        assert_eq!(color.g(), 255);
+        assert_eq!(color.b(), 255);
     }
 
     #[test]
     fn selection_rgba_correctness() {
-        let rgba = Theme::default().selection_rgba();
-        assert!((rgba[0] - 38.0 / 255.0).abs() < 1e-4);
-        assert!((rgba[1] - 79.0 / 255.0).abs() < 1e-4);
-        assert!((rgba[2] - 120.0 / 255.0).abs() < 1e-4);
-        assert!((rgba[3] - 1.0).abs() < 1e-6);
+        let color = Theme::default().selection;
+        assert!((color.r() as f32 / 255.0 - 38.0 / 255.0).abs() < 1e-4);
+        assert!((color.g() as f32 / 255.0 - 79.0 / 255.0).abs() < 1e-4);
+        assert!((color.b() as f32 / 255.0 - 120.0 / 255.0).abs() < 1e-4);
     }
 
     #[test]

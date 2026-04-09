@@ -1,5 +1,4 @@
 //! Shared application constants and default values.
-#![allow(dead_code)]
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
