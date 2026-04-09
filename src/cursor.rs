@@ -1,6 +1,8 @@
 //! Critically-damped spring cursor animation.
 //! Ported from termvide's cursor renderer.
 
+use std::time::Duration;
+
 use crate::defaults::{
     DEFAULT_CURSOR_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
     DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_TRAIL_SIZE,
@@ -17,6 +19,7 @@ const SHORT_MOVE_THRESHOLD_COLS: f32 = 2.001;
 const CURSOR_CELL_CENTER: f32 = 0.5;
 const INITIAL_PREVIOUS_POSITION: f32 = -1000.0;
 const CELL_DIMENSION: f32 = 1.0;
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Debug)]
 pub(crate) struct CriticallyDampedSpring {
@@ -37,7 +40,8 @@ impl CriticallyDampedSpring {
             self.reset();
             return false;
         }
-        if self.position == 0.0 {
+        if self.position.abs() < SPRING_SETTLE_THRESHOLD {
+            self.reset();
             return false;
         }
         let omega = SPRING_DAMPING_FACTOR / (CRITICAL_DAMPING_RATIO * animation_length);
@@ -104,15 +108,7 @@ impl Corner {
         }
     }
 
-    fn update(
-        &mut self,
-        center_x: f32,
-        center_y: f32,
-        cell_w: f32,
-        cell_h: f32,
-        dt: f32,
-        immediate: bool,
-    ) -> bool {
+    fn update(&mut self, center_x: f32, center_y: f32, cell_w: f32, cell_h: f32, dt: f32) -> bool {
         let dest_x = center_x + self.relative_x * cell_w;
         let dest_y = center_y + self.relative_y * cell_h;
         if (dest_x - self.prev_dest_x).abs() > DESTINATION_CHANGE_EPSILON
@@ -122,13 +118,6 @@ impl Corner {
             self.spring_y.position = dest_y - self.current_y;
             self.prev_dest_x = dest_x;
             self.prev_dest_y = dest_y;
-        }
-        if immediate {
-            self.current_x = dest_x;
-            self.current_y = dest_y;
-            self.spring_x.reset();
-            self.spring_y.reset();
-            return false;
         }
         let mut animating = self.spring_x.update(dt, self.animation_length);
         animating |= self.spring_y.update(dt, self.animation_length);
@@ -205,6 +194,11 @@ impl Default for CursorSettings {
     }
 }
 
+pub(crate) struct CursorTick {
+    pub needs_redraw: bool,
+    pub animating: bool,
+}
+
 pub struct CursorRenderer {
     corners: [Corner; 4],
     pub(crate) shape: CursorShape,
@@ -215,6 +209,7 @@ pub struct CursorRenderer {
     blink_on: bool,
     blink_enabled: bool,
     blink_timer: f32,
+    animating: bool,
 }
 
 impl CursorRenderer {
@@ -234,6 +229,7 @@ impl CursorRenderer {
             blink_on: true,
             blink_enabled: false,
             blink_timer: 0.0,
+            animating: false,
         }
     }
 
@@ -271,7 +267,7 @@ impl CursorRenderer {
         !self.blink_enabled || self.blink_on
     }
 
-    pub fn animate(&mut self, cursor_pos: (f32, f32), dt: f32) -> bool {
+    pub fn animate(&mut self, cursor_pos: (f32, f32), dt: f32) -> CursorTick {
         let (col, row) = cursor_pos;
         let moved = (col - self.prev_col).abs() > POSITION_CHANGE_EPSILON
             || (row - self.prev_row).abs() > POSITION_CHANGE_EPSILON;
@@ -280,79 +276,57 @@ impl CursorRenderer {
             self.blink_on = true;
             self.blink_timer = 0.0;
         }
-        if self.blink_enabled {
+
+        let mut blink_changed = false;
+        if self.blink_enabled && self.settings.blink_interval > 0.0 {
             self.blink_timer += dt.max(0.0);
-            while self.settings.blink_interval > 0.0
-                && self.blink_timer >= self.settings.blink_interval
-            {
+            while self.blink_timer >= self.settings.blink_interval {
                 self.blink_timer -= self.settings.blink_interval;
                 self.blink_on = !self.blink_on;
+                blink_changed = true;
             }
         } else {
+            blink_changed = !self.blink_on;
             self.blink_on = true;
             self.blink_timer = 0.0;
         }
         let center_x = col + CURSOR_CELL_CENTER;
         let center_y = row + CURSOR_CELL_CENTER;
         if self.jumped {
-            let mut alignments: [(usize, f32); 4] = [
-                (
-                    0,
-                    self.corners[0].direction_alignment(
-                        center_x,
-                        center_y,
-                        CELL_DIMENSION,
-                        CELL_DIMENSION,
-                    ),
-                ),
-                (
-                    1,
-                    self.corners[1].direction_alignment(
-                        center_x,
-                        center_y,
-                        CELL_DIMENSION,
-                        CELL_DIMENSION,
-                    ),
-                ),
-                (
-                    2,
-                    self.corners[2].direction_alignment(
-                        center_x,
-                        center_y,
-                        CELL_DIMENSION,
-                        CELL_DIMENSION,
-                    ),
-                ),
-                (
-                    3,
-                    self.corners[3].direction_alignment(
-                        center_x,
-                        center_y,
-                        CELL_DIMENSION,
-                        CELL_DIMENSION,
-                    ),
-                ),
-            ];
-            alignments.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut alignments = [(0usize, 0.0f32); 4];
+            for (idx, corner) in self.corners.iter().enumerate() {
+                alignments[idx] = (
+                    idx,
+                    corner.direction_alignment(center_x, center_y, CELL_DIMENSION, CELL_DIMENSION),
+                );
+            }
+            alignments.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             let mut ranks = [0usize; 4];
             for (rank, &(idx, _)) in alignments.iter().enumerate() {
                 ranks[idx] = rank;
             }
+
             let is_short = (col - self.prev_col).abs() <= SHORT_MOVE_THRESHOLD_COLS
                 && (row - self.prev_row).abs() < POSITION_CHANGE_EPSILON;
+            let short_length = self
+                .settings
+                .animation_length
+                .min(self.settings.short_animation_length);
+            let leading =
+                self.settings.animation_length * (1.0 - self.settings.trail_size).clamp(0.0, 1.0);
+            let trailing = self.settings.animation_length;
+            let middle = (leading + trailing) * 0.5;
+
             for (i, corner) in self.corners.iter_mut().enumerate() {
                 corner.animation_length = if is_short {
-                    self.settings
-                        .animation_length
-                        .min(self.settings.short_animation_length)
+                    short_length
                 } else {
-                    let leading = self.settings.animation_length
-                        * (1.0 - self.settings.trail_size).clamp(0.0, 1.0);
-                    let trailing = self.settings.animation_length;
                     match ranks[i] {
                         2..=3 => leading,
-                        1 => (leading + trailing) / 2.0,
-                        0 => trailing,
+                        1 => middle,
                         _ => trailing,
                     }
                 };
@@ -362,25 +336,43 @@ impl CursorRenderer {
         self.prev_row = row;
         let mut animating = false;
         for corner in &mut self.corners {
-            animating |= corner.update(
-                center_x,
-                center_y,
-                CELL_DIMENSION,
-                CELL_DIMENSION,
-                dt,
-                false,
-            );
+            animating |= corner.update(center_x, center_y, CELL_DIMENSION, CELL_DIMENSION, dt);
         }
         self.jumped = false;
-        animating || self.blink_enabled
+        self.animating = animating;
+        CursorTick {
+            needs_redraw: moved || blink_changed || animating,
+            animating,
+        }
+    }
+
+    pub fn next_wakeup_in(&self, elapsed_since_frame: Duration) -> Option<Duration> {
+        let mut next = if self.animating {
+            Some(ANIMATION_FRAME_INTERVAL.saturating_sub(elapsed_since_frame))
+        } else {
+            None
+        };
+
+        if self.blink_enabled && self.settings.blink_interval > 0.0 {
+            let blink_remaining =
+                Duration::from_secs_f32((self.settings.blink_interval - self.blink_timer).max(0.0))
+                    .saturating_sub(elapsed_since_frame);
+            next = Some(match next {
+                Some(current) => current.min(blink_remaining),
+                None => blink_remaining,
+            });
+        }
+
+        next
     }
 
     pub fn corner_positions(&self) -> [(f32, f32); 4] {
+        let [top_left, top_right, bottom_right, bottom_left] = &self.corners;
         [
-            (self.corners[0].current_x, self.corners[0].current_y),
-            (self.corners[1].current_x, self.corners[1].current_y),
-            (self.corners[2].current_x, self.corners[2].current_y),
-            (self.corners[3].current_x, self.corners[3].current_y),
+            (top_left.current_x, top_left.current_y),
+            (top_right.current_x, top_right.current_y),
+            (bottom_right.current_x, bottom_right.current_y),
+            (bottom_left.current_x, bottom_left.current_y),
         ]
     }
 }

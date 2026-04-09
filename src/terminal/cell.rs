@@ -98,15 +98,6 @@ impl PackedColor {
     pub const fn b(self) -> u8 {
         self.0 as u8
     }
-
-    pub const fn to_rgba_f32(self) -> [f32; 4] {
-        [
-            self.r() as f32 / 255.0,
-            self.g() as f32 / 255.0,
-            self.b() as f32 / 255.0,
-            1.0,
-        ]
-    }
 }
 
 /// A single terminal cell - kept compact for cache performance.
@@ -141,22 +132,9 @@ impl Default for Cell {
     }
 }
 
-#[allow(dead_code)]
 impl Cell {
     pub fn character(&self) -> char {
         char::from_u32(self.ch).unwrap_or(' ')
-    }
-
-    pub fn is_wide(&self) -> bool {
-        self.flags.contains(CellFlags::WIDE)
-    }
-
-    pub fn is_wide_spacer(&self) -> bool {
-        self.flags.contains(CellFlags::WIDE_SPACER)
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.flags.contains(CellFlags::DIRTY)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -165,14 +143,6 @@ impl Cell {
 
     pub fn clear_dirty(&mut self) {
         self.flags.remove(CellFlags::DIRTY);
-    }
-
-    pub fn fg_rgba(&self) -> [f32; 4] {
-        self.fg.to_rgba_f32()
-    }
-
-    pub fn bg_rgba(&self) -> [f32; 4] {
-        self.bg.to_rgba_f32()
     }
 }
 

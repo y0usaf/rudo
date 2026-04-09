@@ -163,6 +163,15 @@ impl XkbContextData {
         }
     }
 
+    pub fn reset_state(&mut self) {
+        let xkbh = xkb_fns();
+        // SAFETY: self.state is a valid xkb_state (NonNull). Resetting all
+        // modifier/layout masks to zero clears any stale focus-leaked state.
+        unsafe {
+            (xkbh.xkb_state_update_mask)(self.state.as_ptr(), 0, 0, 0, 0, 0, 0);
+        }
+    }
+
     pub fn key_repeats(&self, key: u32) -> bool {
         let xkbh = xkb_fns();
         // SAFETY: self.keymap is a valid xkb_keymap (NonNull). key + EVDEV_TO_XKB_OFFSET
@@ -235,8 +244,9 @@ impl XkbContextData {
         } else {
             let mut buf = [0u8; 64];
             // SAFETY: self.state is a valid xkb_state (NonNull). buf is a
-            // stack-allocated 64-byte array. xkb_state_key_get_utf8 writes at
-            // most buf.len() bytes including the null terminator.
+            // stack-allocated 64-byte array. xkb_state_key_get_utf8 returns the
+            // UTF-8 byte length excluding the trailing NUL; if that length does
+            // not fit, we retry with a larger heap buffer.
             let written = unsafe {
                 (xkbh.xkb_state_key_get_utf8)(
                     self.state.as_ptr(),
@@ -245,12 +255,29 @@ impl XkbContextData {
                     buf.len(),
                 )
             };
-            if written > 1 {
-                let s = std::str::from_utf8(&buf[..(written as usize - 1)]).unwrap_or("");
-                if s == " " {
+            if written > 0 {
+                let text = if (written as usize) < buf.len() {
+                    std::str::from_utf8(&buf[..written as usize])
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    let mut dyn_buf = vec![0u8; written as usize + 1];
+                    let dyn_written = unsafe {
+                        (xkbh.xkb_state_key_get_utf8)(
+                            self.state.as_ptr(),
+                            code,
+                            dyn_buf.as_mut_ptr().cast(),
+                            dyn_buf.len(),
+                        )
+                    };
+                    std::str::from_utf8(&dyn_buf[..dyn_written.max(0) as usize])
+                        .unwrap_or("")
+                        .to_string()
+                };
+                if text == " " {
                     Key::Space
                 } else {
-                    Key::Text(s.to_string())
+                    Key::Text(text)
                 }
             } else {
                 Key::Unknown
@@ -447,5 +474,38 @@ pub fn map_pointer_button(button: u32) -> MouseButton {
         BTN_MIDDLE => MouseButton::Middle,
         BTN_RIGHT => MouseButton::Right,
         other => MouseButton::Other(other as u16),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires libxkbcommon at runtime"]
+    fn parses_wtype_style_ephemeral_keymaps() {
+        let keymap = concat!(
+            "xkb_keymap {\n",
+            "xkb_keycodes \"(unnamed)\" {\n",
+            "minimum = 8;\n",
+            "maximum = 255;\n",
+            "<K1> = 9;\n",
+            "<K2> = 10;\n",
+            "<K3> = 11;\n",
+            "};\n",
+            "xkb_types \"(unnamed)\" { include \"complete\" };\n",
+            "xkb_compatibility \"(unnamed)\" { include \"complete\" };\n",
+            "xkb_symbols \"(unnamed)\" {\n",
+            "key <K1> {[A]};\n",
+            "key <K2> {[b]};\n",
+            "key <K3> {[question]};\n",
+            "};\n",
+            "};\n"
+        );
+        let mut xkb = XkbContextData::from_keymap_string(keymap.as_bytes()).unwrap();
+
+        assert_eq!(xkb.key_event(1, true).key, Key::Text("A".to_string()));
+        assert_eq!(xkb.key_event(2, true).key, Key::Text("b".to_string()));
+        assert_eq!(xkb.key_event(3, true).key, Key::Text("?".to_string()));
     }
 }

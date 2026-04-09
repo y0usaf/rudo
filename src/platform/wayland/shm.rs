@@ -18,6 +18,7 @@ pub(super) struct ShmBuffer {
     pub pool: wl_shm_pool::WlShmPool,
     pub buffer: wl_buffer::WlBuffer,
     pub busy: bool,
+    pub age: u32,
 }
 
 impl ShmBuffer {
@@ -67,6 +68,7 @@ impl ShmBuffer {
             pool,
             buffer,
             busy: false,
+            age: 0,
         })
     }
 

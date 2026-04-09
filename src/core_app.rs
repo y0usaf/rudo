@@ -1,11 +1,12 @@
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::{
     cli::CliArgs,
     config::Config,
-    cursor::CursorRenderer,
+    cursor::{CursorRenderer, CursorTick},
     defaults::{DEFAULT_CLIPBOARD_COPY_COMMAND, DEFAULT_CLIPBOARD_PASTE_COMMAND},
     input::{Key, KeyEvent, Modifiers, MouseButton},
     keybindings::LocalAction,
@@ -22,12 +23,19 @@ use crate::{
 
 /// Number of bytes to read from PTY per iteration
 const PTY_READ_BUFFER_SIZE: usize = 65536;
+/// Maximum PTY bytes parsed per frame to keep input/render latency bounded.
+const MAX_PTY_BYTES_PER_TICK: usize = PTY_READ_BUFFER_SIZE * 8;
 
 /// Lines scrolled per scroll wheel tick  
 const SCROLL_MULTIPLIER: usize = 3;
 
 /// Default cell size before font metrics are available
 const DEFAULT_CELL_SIZE: (f32, f32) = (9.0, 18.0);
+
+pub(crate) struct TickResult {
+    pub redraw_requested: bool,
+    pub animating: bool,
+}
 
 pub struct CoreApp {
     grid: Grid,
@@ -38,7 +46,7 @@ pub struct CoreApp {
     selection: Selection,
     config: Config,
     theme: Theme,
-    last_frame: std::time::Instant,
+    last_frame: Instant,
     modifiers: Modifiers,
     last_title: Option<String>,
     cell_size: (f32, f32),
@@ -56,61 +64,19 @@ pub struct CoreApp {
 
 impl CoreApp {
     pub fn new(cli: CliArgs) -> Self {
+        let CliArgs {
+            app_id,
+            title,
+            command,
+        } = cli;
         let mut config = Config::load();
-        if let Some(app_id) = cli.app_id {
-            config.window.app_id = app_id;
-        }
-        if let Some(title) = cli.title {
-            config.window.title = title;
-        }
-        let command = cli.command;
-        let theme = Theme::load_theme_file().unwrap_or_else(|| {
-            use crate::terminal::theme::ThemeColorStrings;
-            let c = &config.colors;
-            Theme::from_color_strings(&ThemeColorStrings {
-                foreground: &c.foreground,
-                background: &c.background,
-                cursor: &c.cursor,
-                selection: &c.selection,
-                ansi: [
-                    &c.black,
-                    &c.red,
-                    &c.green,
-                    &c.yellow,
-                    &c.blue,
-                    &c.magenta,
-                    &c.cyan,
-                    &c.white,
-                    &c.bright_black,
-                    &c.bright_red,
-                    &c.bright_green,
-                    &c.bright_yellow,
-                    &c.bright_blue,
-                    &c.bright_magenta,
-                    &c.bright_cyan,
-                    &c.bright_white,
-                ],
-            })
-        });
+        Self::apply_cli_overrides(&mut config, app_id, title);
+        let theme = Theme::load_theme_file().unwrap_or_else(|| Self::theme_from_config(&config));
         let cols = config.terminal.cols.max(2);
         let rows = config.terminal.rows.max(2);
-        let mut cursor_renderer = CursorRenderer::new();
-        cursor_renderer.set_animation_length(config.cursor.animation_length);
-        cursor_renderer.set_short_animation_length(config.cursor.short_animation_length);
-        cursor_renderer.set_trail_size(config.cursor.trail_size);
-        cursor_renderer.set_blink_enabled(config.cursor.blink);
-        cursor_renderer.set_blink_interval(config.cursor.blink_interval);
-        match config.cursor.style.as_str() {
-            "beam" | "bar" | "vertical" => {
-                cursor_renderer.set_shape(crate::cursor::CursorShape::Beam)
-            }
-            "underline" | "horizontal" => {
-                cursor_renderer.set_shape(crate::cursor::CursorShape::Underline)
-            }
-            _ => cursor_renderer.set_shape(crate::cursor::CursorShape::Block),
-        }
+        let cursor_renderer = Self::build_cursor_renderer(&config);
         Self {
-            grid: Grid::new(cols, rows),
+            grid: Grid::with_scrollback(cols, rows, config.scrollback.lines),
             cursor_renderer,
             damage: DamageTracker::new(rows),
             parser: TerminalParser::with_theme(theme.clone()),
@@ -118,7 +84,7 @@ impl CoreApp {
             selection: Selection::new(),
             config,
             theme,
-            last_frame: std::time::Instant::now(),
+            last_frame: Instant::now(),
             modifiers: Modifiers::empty(),
             last_title: None,
             cell_size: DEFAULT_CELL_SIZE,
@@ -135,6 +101,70 @@ impl CoreApp {
         }
     }
 
+    fn apply_cli_overrides(config: &mut Config, app_id: Option<String>, title: Option<String>) {
+        if let Some(app_id) = app_id {
+            config.window.app_id = app_id;
+        }
+        if let Some(title) = title {
+            config.window.title = title;
+        }
+    }
+
+    fn theme_from_config(config: &Config) -> Theme {
+        use crate::terminal::theme::ThemeColorStrings;
+
+        let c = &config.colors;
+        Theme::from_color_strings(&ThemeColorStrings {
+            foreground: &c.foreground,
+            background: &c.background,
+            cursor: &c.cursor,
+            selection: &c.selection,
+            ansi: [
+                &c.black,
+                &c.red,
+                &c.green,
+                &c.yellow,
+                &c.blue,
+                &c.magenta,
+                &c.cyan,
+                &c.white,
+                &c.bright_black,
+                &c.bright_red,
+                &c.bright_green,
+                &c.bright_yellow,
+                &c.bright_blue,
+                &c.bright_magenta,
+                &c.bright_cyan,
+                &c.bright_white,
+            ],
+        })
+    }
+
+    fn build_cursor_renderer(config: &Config) -> CursorRenderer {
+        let mut cursor_renderer = CursorRenderer::new();
+        cursor_renderer.set_animation_length(config.cursor.animation_length);
+        cursor_renderer.set_short_animation_length(config.cursor.short_animation_length);
+        cursor_renderer.set_trail_size(config.cursor.trail_size);
+        cursor_renderer.set_blink_enabled(config.cursor.blink);
+        cursor_renderer.set_blink_interval(config.cursor.blink_interval);
+        match config.cursor.style.as_str() {
+            "beam" | "bar" | "vertical" => {
+                cursor_renderer.set_shape(crate::cursor::CursorShape::Beam)
+            }
+            "underline" | "horizontal" => {
+                cursor_renderer.set_shape(crate::cursor::CursorShape::Underline)
+            }
+            _ => cursor_renderer.set_shape(crate::cursor::CursorShape::Block),
+        }
+        cursor_renderer
+    }
+
+    fn write_pty(&self, bytes: &[u8]) {
+        if let Some(pty) = &self.pty {
+            let _ = pty.write(bytes);
+        }
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -146,6 +176,10 @@ impl CoreApp {
     }
     pub fn grid(&self) -> &Grid {
         &self.grid
+    }
+
+    pub fn render_state_mut(&mut self) -> (&mut Grid, &CursorRenderer, &Selection) {
+        (&mut self.grid, &self.cursor_renderer, &self.selection)
     }
     pub fn cursor_renderer(&self) -> &CursorRenderer {
         &self.cursor_renderer
@@ -182,9 +216,8 @@ impl CoreApp {
     }
 
     pub fn init_terminal(&mut self, cols: usize, rows: usize) {
-        let cols = cols.max(2);
-        let rows = rows.max(2);
-        self.grid = Grid::new(cols, rows);
+        let (cols, rows) = clamp_grid_size(cols, rows);
+        self.grid = Grid::with_scrollback(cols, rows, self.config.scrollback.lines);
         self.damage = DamageTracker::new(rows);
         let spawn_config = PtySpawnConfig {
             term: &self.config.terminal.term,
@@ -193,8 +226,11 @@ impl CoreApp {
             command: &self.command,
         };
         match Pty::spawn(cols as u16, rows as u16, &spawn_config) {
-            Ok(pty) => self.pty = Some(pty),
-            Err(e) => eprintln!("[ERROR] Failed to spawn PTY: {e}"),
+            Ok(pty) => {
+                self.pty = Some(pty);
+                self.pty_dead = false;
+            }
+            Err(e) => crate::error_log!("Failed to spawn PTY: {e}"),
         }
         self.needs_redraw = true;
     }
@@ -204,7 +240,9 @@ impl CoreApp {
     }
 
     pub fn title(&self) -> &str {
-        self.parser.title().unwrap_or(&self.config.window.title)
+        self.last_title
+            .as_deref()
+            .unwrap_or(&self.config.window.title)
     }
 
     pub fn take_title_changed(&mut self) -> bool {
@@ -227,7 +265,9 @@ impl CoreApp {
         if !event.pressed {
             return;
         }
-        let Some(pty) = &self.pty else { return };
+        if self.pty.is_none() {
+            return;
+        }
 
         if self
             .config
@@ -247,7 +287,7 @@ impl CoreApp {
             .matches(LocalAction::Paste, event, self.modifiers)
         {
             if let Some(text) = clipboard_get() {
-                let _ = pty.write(text.as_bytes());
+                self.write_pty(text.as_bytes());
             }
             return;
         }
@@ -257,7 +297,7 @@ impl CoreApp {
                 let ch = c.chars().next().unwrap_or('\0');
                 if ch.is_ascii_alphabetic() {
                     let code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
-                    let _ = pty.write(&[code]);
+                    self.write_pty(&[code]);
                     return;
                 }
             }
@@ -293,14 +333,14 @@ impl CoreApp {
             Key::F(11) => Some(b"\x1b[23~"),
             Key::F(12) => Some(b"\x1b[24~"),
             Key::Text(c) => {
-                let _ = pty.write(c.as_bytes());
+                self.write_pty(c.as_bytes());
                 None
             }
             _ => None,
         };
 
         if let Some(seq) = seq {
-            let _ = pty.write(seq);
+            self.write_pty(seq);
         }
     }
 
@@ -322,8 +362,8 @@ impl CoreApp {
                 } else {
                     mouse::encode_mouse_release(mouse_state, btn_code, mods, col as u16, row as u16)
                 };
-                if let (Some(seq), Some(pty)) = (seq, &self.pty) {
-                    let _ = pty.write(&seq);
+                if let Some(seq) = seq {
+                    self.write_pty(&seq);
                 }
             }
             if pressed {
@@ -377,14 +417,18 @@ impl CoreApp {
             } else {
                 mouse::encode_mouse_move(mouse_state, mods, col as u16, row as u16)
             };
-            if let (Some(seq), Some(pty)) = (seq, &self.pty) {
-                let _ = pty.write(&seq);
+            if let Some(seq) = seq {
+                self.write_pty(&seq);
             }
         } else if self.mouse_pressed {
             let before = self.selection.snapshot();
             if self.selection.state() == selection::SelectionState::None {
                 self.selection.start_selection(col, row);
             } else {
+                let (_, _, end) = before;
+                if end.col == col && end.row == row {
+                    return;
+                }
                 self.selection.update_selection(col, row);
             }
             let after = self.selection.snapshot();
@@ -405,39 +449,41 @@ impl CoreApp {
                 if let Some(seq) =
                     mouse::encode_mouse_scroll(mouse_state, mods, up, col as u16, row as u16)
                 {
-                    if let Some(pty) = &self.pty {
-                        let _ = pty.write(&seq);
-                    }
+                    self.write_pty(&seq);
                 }
             }
+            return;
+        }
+
+        if lines.abs() < 1.0 {
+            self.scroll_accumulator += lines;
+        }
+        let total = if self.scroll_accumulator.abs() >= 1.0 {
+            let whole = self.scroll_accumulator.trunc();
+            self.scroll_accumulator -= whole;
+            whole
         } else {
-            if lines.abs() < 1.0 {
-                self.scroll_accumulator += lines;
-            }
-            let total = if self.scroll_accumulator.abs() >= 1.0 {
-                let v = self.scroll_accumulator.trunc();
-                self.scroll_accumulator -= v;
-                v
-            } else {
-                lines
-            };
-            let count = (total.abs() as usize).max(1);
-            let scroll_lines = count * SCROLL_MULTIPLIER;
-            if total > 0.0 {
-                self.grid.scroll_view_up(scroll_lines);
-                self.damage.mark_all();
-                self.needs_redraw = true;
-            } else if total < 0.0 {
-                self.grid.scroll_view_down(scroll_lines);
-                self.damage.mark_all();
-                self.needs_redraw = true;
-            }
+            lines
+        };
+        if total == 0.0 {
+            return;
+        }
+
+        let count = (total.abs() as usize).max(1);
+        let scroll_lines = count * SCROLL_MULTIPLIER;
+        let changed = if total > 0.0 {
+            self.grid.scroll_view_up(scroll_lines)
+        } else {
+            self.grid.scroll_view_down(scroll_lines)
+        };
+        if changed {
+            self.damage.mark_all();
+            self.needs_redraw = true;
         }
     }
 
     pub fn handle_resize(&mut self, cols: usize, rows: usize) {
-        let cols = cols.max(2);
-        let rows = rows.max(2);
+        let (cols, rows) = clamp_grid_size(cols, rows);
         if cols != self.grid.cols() || rows != self.grid.rows() {
             self.grid.resize(cols, rows);
             self.damage.resize(rows);
@@ -448,29 +494,52 @@ impl CoreApp {
         }
     }
 
-    pub fn tick(&mut self) -> bool {
-        let now = std::time::Instant::now();
+    pub fn tick(&mut self) -> TickResult {
+        let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-        let got_output = self.process_pty_output();
+        self.process_pty_output();
         let cursor_pos = self.grid.cursor_position();
-        let animating = self.cursor_renderer.animate(cursor_pos, dt);
-        let redraw = self.needs_redraw || got_output || animating || self.title_changed;
+        let CursorTick {
+            needs_redraw: cursor_redraw,
+            animating,
+        } = self.cursor_renderer.animate(cursor_pos, dt);
+        let redraw_requested =
+            self.needs_redraw || self.damage.has_damage() || cursor_redraw || self.theme_changed;
         self.needs_redraw = false;
-        redraw
+        TickResult {
+            redraw_requested,
+            animating,
+        }
+    }
+
+    pub fn next_wakeup(&self) -> Option<Duration> {
+        self.cursor_renderer
+            .next_wakeup_in(self.last_frame.elapsed())
+    }
+
+    pub fn cursor_wakeup_due(&self) -> bool {
+        self.next_wakeup()
+            .is_some_and(|duration| duration.is_zero())
     }
 
     fn process_pty_output(&mut self) -> bool {
         let Some(pty) = &self.pty else { return false };
         let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
         let mut got_output = false;
+        let mut bytes_read = 0usize;
         loop {
             match pty.try_read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     got_output = true;
+                    bytes_read = bytes_read.saturating_add(n);
                     self.parser
                         .advance(&mut self.grid, &mut self.damage, &buf[..n]);
+                    if bytes_read >= MAX_PTY_BYTES_PER_TICK {
+                        self.needs_redraw = true;
+                        break;
+                    }
                 }
                 Err(err) => {
                     crate::warn_log!("PTY read error: {err}");
@@ -479,15 +548,16 @@ impl CoreApp {
                 }
             }
         }
-        if got_output && self.grid.is_viewing_scrollback() {
+        if !got_output {
+            return false;
+        }
+
+        if self.grid.is_viewing_scrollback() {
             self.grid.reset_view();
             self.damage.mark_all();
         }
-        let responses = self.parser.take_responses();
-        if let Some(pty) = &self.pty {
-            for resp in responses {
-                let _ = pty.write(&resp);
-            }
+        for resp in self.parser.take_responses() {
+            self.write_pty(&resp);
         }
         if self.parser.take_theme_changed() {
             self.theme = self.parser.theme().clone();
@@ -495,15 +565,16 @@ impl CoreApp {
             self.damage.mark_all();
             self.needs_redraw = true;
         }
-        if self.parser.title() != self.last_title.as_deref() {
-            self.last_title = self.parser.title().map(str::to_string);
+        let title = self.parser.title();
+        if title != self.last_title.as_deref() {
+            self.last_title = title.map(str::to_string);
             self.title_changed = true;
         }
         got_output
     }
 
     fn pixel_to_grid(&self, x: f64, y: f64) -> (usize, usize) {
-        let (cw, ch) = self.cell_size;
+        let (cw, ch) = sanitized_cell_size(self.cell_size);
         let (ox, oy) = self.grid_offset;
         let col = ((x as f32 - ox) / cw).max(0.0) as usize;
         let row = ((y as f32 - oy) / ch).max(0.0) as usize;
@@ -528,18 +599,35 @@ impl CoreApp {
             return;
         }
 
-        let (start, end) = if start.row < end.row || (start.row == end.row && start.col <= end.col)
-        {
-            (start, end)
+        let last_row = self.grid.rows().saturating_sub(1);
+        let start_row = start.row.min(last_row);
+        let end_row = end.row.min(last_row);
+        let (start_row, end_row) = if start_row <= end_row {
+            (start_row, end_row)
         } else {
-            (end, start)
+            (end_row, start_row)
         };
 
-        let last_row = self.grid.rows().saturating_sub(1);
-        for row in start.row.min(last_row)..=end.row.min(last_row) {
-            self.damage.mark_row(row);
-        }
+        self.damage.mark_rows(start_row, end_row);
     }
+}
+
+fn clamp_grid_size(cols: usize, rows: usize) -> (usize, usize) {
+    (cols.max(2), rows.max(2))
+}
+
+fn sanitized_cell_size((cw, ch): (f32, f32)) -> (f32, f32) {
+    let cw = if cw.is_finite() && cw > 0.0 {
+        cw
+    } else {
+        DEFAULT_CELL_SIZE.0
+    };
+    let ch = if ch.is_finite() && ch > 0.0 {
+        ch
+    } else {
+        DEFAULT_CELL_SIZE.1
+    };
+    (cw, ch)
 }
 
 fn clipboard_set(text: &str) {
@@ -552,7 +640,6 @@ fn clipboard_set(text: &str) {
         if let Some(stdin) = child.stdin.as_mut() {
             let _ = stdin.write_all(text.as_bytes());
         }
-        let _ = child.wait();
     }
 }
 

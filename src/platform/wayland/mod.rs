@@ -2,10 +2,12 @@ mod dispatch;
 mod keyboard;
 mod shm;
 
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
+use libc::{POLLERR, POLLHUP, POLLIN};
 use wayland_client::protocol::{
     wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_shm, wl_surface,
 };
@@ -31,6 +33,11 @@ use keyboard::{fallback_key_event, RepeatState, XkbContextData};
 use shm::ShmBuffer;
 
 const BUFFER_COUNT: usize = 3;
+const PTY_RENDER_COALESCE_MS: u64 = 5;
+
+type CursorCorners = [(f32, f32); 4];
+type CursorRowRange = (usize, usize);
+type CursorGeometry = (CursorCorners, CursorRowRange);
 
 // ─── Zoom ────────────────────────────────────────────────────────────────────
 
@@ -86,10 +93,16 @@ struct WaylandState {
     retired_buffers: Vec<ShmBuffer>,
     /// Most recently attached live buffer, used as the copy source for damage-only redraws.
     last_presented_buffer: Option<usize>,
+    /// Dirty row ranges from recent presented frames, oldest first, used with buffer age.
+    recent_damage_history: VecDeque<Vec<(usize, usize)>>,
+    /// Reused scratch buffer for buffer-age copy ranges.
+    copy_ranges_scratch: Vec<(usize, usize)>,
+    /// Reused scratch buffer for the current frame's damage ranges.
+    damage_ranges_scratch: Vec<(usize, usize)>,
     /// Cursor rows redrawn in the previous frame, so the old cursor image can be erased.
-    last_cursor_rows: Option<(usize, usize)>,
+    last_cursor_rows: Option<CursorRowRange>,
     /// Previous cursor quad, used to detect same-row movement where row ranges do not change.
-    last_cursor_corners: Option<[(f32, f32); 4]>,
+    last_cursor_corners: Option<CursorCorners>,
     xkb: Option<XkbContextData>,
     fallback_mods: Modifiers,
     repeat: RepeatState,
@@ -105,10 +118,16 @@ struct WaylandState {
     fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     /// Scale value from wp_fractional_scale_v1 (if available).
     fractional_scale_value: Option<f32>,
+    frame_callback_pending: bool,
+    window_geometry_dirty: bool,
+    opaque_region_dirty: bool,
 }
 
 impl WaylandState {
-    fn update_window_geometry(&self) {
+    fn update_window_geometry(&mut self) {
+        if !self.window_geometry_dirty {
+            return;
+        }
         let Some(xdg_surface) = &self.xdg_surface else {
             return;
         };
@@ -122,9 +141,13 @@ impl WaylandState {
         // viewported buffers and make the compositor's active border appear
         // visually overlaid into the window.
         xdg_surface.set_window_geometry(0, 0, self.width as i32, self.height as i32);
+        self.window_geometry_dirty = false;
     }
 
-    fn update_opaque_region(&self, qh: &QueueHandle<Self>) {
+    fn update_opaque_region(&mut self, qh: &QueueHandle<Self>) {
+        if !self.opaque_region_dirty {
+            return;
+        }
         let Some(surface) = &self.surface else {
             return;
         };
@@ -138,18 +161,19 @@ impl WaylandState {
         region.add(0, 0, i32::MAX, i32::MAX);
         surface.set_opaque_region(Some(&region));
         region.destroy();
+        self.opaque_region_dirty = false;
     }
 
     fn init_window(&mut self, qh: &QueueHandle<Self>) {
-        if self.surface.is_some() || self.compositor.is_none() || self.wm_base.is_none() {
+        if self.surface.is_some() {
             return;
         }
-        let surface = self.compositor.as_ref().unwrap().create_surface(qh, ());
-        let xdg_surface = self
-            .wm_base
-            .as_ref()
-            .unwrap()
-            .get_xdg_surface(&surface, qh, ());
+        let (Some(compositor), Some(wm_base)) = (&self.compositor, &self.wm_base) else {
+            return;
+        };
+
+        let surface = compositor.create_surface(qh, ());
+        let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_title(self.app.title().into());
         toplevel.set_app_id(self.app.app_id().into());
@@ -203,12 +227,16 @@ impl WaylandState {
     }
 
     fn prune_retired_buffers(&mut self) {
+        if self.retired_buffers.iter().all(|buf| buf.busy) {
+            return;
+        }
         self.retired_buffers.retain(|buf| buf.busy);
     }
 
     fn retire_active_buffers(&mut self) {
         let old_buffers = std::mem::take(&mut self.buffers);
         self.last_presented_buffer = None;
+        self.recent_damage_history.clear();
         self.last_cursor_rows = None;
         self.last_cursor_corners = None;
         for buf in old_buffers {
@@ -224,10 +252,14 @@ impl WaylandState {
 
         if self.pending_width > 0 && self.pending_width != self.width {
             self.width = self.pending_width;
+            self.window_geometry_dirty = true;
+            self.opaque_region_dirty = true;
             changed = true;
         }
         if self.pending_height > 0 && self.pending_height != self.height {
             self.height = self.pending_height;
+            self.window_geometry_dirty = true;
+            self.opaque_region_dirty = true;
             changed = true;
         }
 
@@ -247,6 +279,7 @@ impl WaylandState {
         self.sync_terminal_geometry_to_window();
         self.app.damage_mut().mark_all();
         self.last_presented_buffer = None;
+        self.recent_damage_history.clear();
         self.last_cursor_rows = None;
         self.last_cursor_corners = None;
     }
@@ -273,10 +306,30 @@ impl WaylandState {
         self.prune_retired_buffers();
     }
 
-    fn prepare_target_buffer(&mut self, target_idx: usize) -> bool {
-        let Some(source_idx) = self.last_presented_buffer else {
-            return false;
-        };
+    fn merge_damage_ranges(ranges: &mut Vec<(usize, usize)>) {
+        if ranges.len() <= 1 {
+            return;
+        }
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges.drain(..) {
+            if let Some((_, last_end)) = merged.last_mut() {
+                if start <= last_end.saturating_add(1) {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        *ranges = merged;
+    }
+
+    fn copy_row_ranges_between_buffers(
+        &mut self,
+        source_idx: usize,
+        target_idx: usize,
+        row_ranges: &[(usize, usize)],
+    ) -> bool {
         if source_idx >= self.buffers.len() || target_idx >= self.buffers.len() {
             return false;
         }
@@ -285,23 +338,91 @@ impl WaylandState {
         {
             return false;
         }
-        if source_idx == target_idx {
+        if source_idx == target_idx || row_ranges.is_empty() {
             return true;
         }
+
+        let stride = self.buffers[source_idx].stride as usize;
+        let height = self.buffers[source_idx].height;
 
         if source_idx < target_idx {
             let (left, right) = self.buffers.split_at_mut(target_idx);
             let src = left[source_idx].pixels();
-            right[0].pixels_mut().copy_from_slice(src);
+            let dst = right[0].pixels_mut();
+            for &(start_row, end_row) in row_ranges {
+                let (y0, y1) = self.renderer.pixel_bounds_for_row_range(start_row, end_row);
+                let y1 = y1.min(height);
+                if y1 <= y0 {
+                    continue;
+                }
+                let byte_start = y0 as usize * stride;
+                let byte_end = y1 as usize * stride;
+                dst[byte_start..byte_end].copy_from_slice(&src[byte_start..byte_end]);
+            }
         } else {
             let (left, right) = self.buffers.split_at_mut(source_idx);
             let dst = left[target_idx].pixels_mut();
-            dst.copy_from_slice(right[0].pixels());
+            let src = right[0].pixels();
+            for &(start_row, end_row) in row_ranges {
+                let (y0, y1) = self.renderer.pixel_bounds_for_row_range(start_row, end_row);
+                let y1 = y1.min(height);
+                if y1 <= y0 {
+                    continue;
+                }
+                let byte_start = y0 as usize * stride;
+                let byte_end = y1 as usize * stride;
+                dst[byte_start..byte_end].copy_from_slice(&src[byte_start..byte_end]);
+            }
         }
         true
     }
 
-    fn current_cursor_geometry(&self) -> Option<([(f32, f32); 4], (usize, usize))> {
+    fn prepare_target_buffer(
+        &mut self,
+        target_idx: usize,
+        current_damage: &[(usize, usize)],
+    ) -> bool {
+        let target_age = self.buffers.get(target_idx).map(|buf| buf.age).unwrap_or(0);
+        if target_age == 0 {
+            return false;
+        }
+
+        let needed_history = target_age.saturating_sub(1) as usize;
+        if needed_history > self.recent_damage_history.len() {
+            return false;
+        }
+
+        let Some(source_idx) = self.last_presented_buffer else {
+            return false;
+        };
+        if needed_history == 0 {
+            return self.copy_row_ranges_between_buffers(source_idx, target_idx, current_damage);
+        }
+
+        let mut copy_ranges = std::mem::take(&mut self.copy_ranges_scratch);
+        copy_ranges.clear();
+        copy_ranges.reserve(
+            current_damage.len()
+                + self
+                    .recent_damage_history
+                    .iter()
+                    .rev()
+                    .take(needed_history)
+                    .map(Vec::len)
+                    .sum::<usize>(),
+        );
+        copy_ranges.extend_from_slice(current_damage);
+        for history in self.recent_damage_history.iter().rev().take(needed_history) {
+            copy_ranges.extend(history.iter().copied());
+        }
+        Self::merge_damage_ranges(&mut copy_ranges);
+
+        let copied = self.copy_row_ranges_between_buffers(source_idx, target_idx, &copy_ranges);
+        self.copy_ranges_scratch = copy_ranges;
+        copied
+    }
+
+    fn current_cursor_geometry(&self) -> Option<CursorGeometry> {
         let grid = self.app.grid();
         let cursor = self.app.cursor_renderer();
         if !grid.cursor_visible() || !cursor.is_visible() || grid.is_viewing_scrollback() {
@@ -331,17 +452,14 @@ impl WaylandState {
         let Some((start, end)) = range else {
             return;
         };
-        let damage = self.app.damage_mut();
-        for row in start..=end {
-            damage.mark_row(row);
-        }
+        self.app.damage_mut().mark_rows(start, end);
     }
 
     fn mark_cursor_damage(
         &mut self,
-        current_cursor_rows: Option<(usize, usize)>,
-        current_cursor_corners: Option<[(f32, f32); 4]>,
-        keep_animating: bool,
+        current_cursor_rows: Option<CursorRowRange>,
+        current_cursor_corners: Option<CursorCorners>,
+        needs_redraw: bool,
     ) {
         let geometry_changed = match (self.last_cursor_corners, current_cursor_corners) {
             (Some(prev), Some(curr)) => prev
@@ -352,7 +470,7 @@ impl WaylandState {
             _ => true,
         };
 
-        if keep_animating || geometry_changed || current_cursor_rows != self.last_cursor_rows {
+        if needs_redraw || geometry_changed || current_cursor_rows != self.last_cursor_rows {
             self.mark_row_range_damage(self.last_cursor_rows);
             self.mark_row_range_damage(current_cursor_rows);
         }
@@ -364,36 +482,56 @@ impl WaylandState {
             return;
         }
         self.update_window_geometry();
-        self.update_opaque_region(qh);
         self.ensure_buffers(qh);
 
         let Some(target_idx) = self.buffers.iter().position(|b| !b.busy) else {
             return;
         };
 
-        let keep_animating = self.app.tick();
+        let tick = self.app.tick();
         if self.app.take_title_changed() {
             if let Some(toplevel) = &self.toplevel {
                 toplevel.set_title(self.app.title().into());
             }
         }
         if self.app.take_theme_changed() {
-            self.renderer.set_theme(self.app.theme().clone());
+            self.renderer.set_theme(self.app.theme());
         }
 
         let current_cursor_geometry = self.current_cursor_geometry();
         let current_cursor_corners = current_cursor_geometry.map(|(corners, _)| corners);
         let current_cursor_rows = current_cursor_geometry.map(|(_, rows)| rows);
-        self.mark_cursor_damage(current_cursor_rows, current_cursor_corners, keep_animating);
+        self.mark_cursor_damage(
+            current_cursor_rows,
+            current_cursor_corners,
+            tick.redraw_requested,
+        );
 
-        let copied_previous = self.prepare_target_buffer(target_idx);
-        let full_redraw = !copied_previous || self.app.damage().is_full_damage();
+        let is_full_damage = self.app.damage().is_full_damage();
+        let mut current_damage = std::mem::take(&mut self.damage_ranges_scratch);
+        self.app.damage().dirty_row_ranges_into(&mut current_damage);
+        if !is_full_damage && current_damage.is_empty() {
+            self.damage_ranges_scratch = current_damage;
+            return;
+        }
+
+        let copied_previous = if is_full_damage {
+            false
+        } else {
+            self.prepare_target_buffer(target_idx, &current_damage)
+        };
+        let full_redraw = is_full_damage || !copied_previous;
         let draw_cursor = full_redraw
             || current_cursor_rows
-                .map(|(start, end)| (start..=end).any(|row| self.app.damage().is_dirty(row)))
+                .map(|(start, end)| {
+                    current_damage
+                        .iter()
+                        .any(|(dirty_start, dirty_end)| *dirty_start <= end && *dirty_end >= start)
+                })
                 .unwrap_or(false);
 
         {
+            let (grid, cursor, selection) = self.app.render_state_mut();
             let buf = &mut self.buffers[target_idx];
             let mut fb = FrameBuffer {
                 width: buf.width,
@@ -403,43 +541,49 @@ impl WaylandState {
             };
             self.renderer.render(
                 &mut fb,
-                self.app.grid(),
-                self.app.cursor_renderer(),
-                self.app.selection(),
-                self.app.damage(),
-                full_redraw,
-                draw_cursor,
+                crate::software_renderer::RenderState {
+                    grid,
+                    cursor,
+                    selection,
+                    dirty_rows: &current_damage,
+                },
+                crate::software_renderer::RenderOptions {
+                    full_redraw,
+                    draw_cursor,
+                },
             );
         }
 
-        let damage_ranges = if full_redraw {
-            vec![(0, self.app.grid().rows().saturating_sub(1))]
-        } else {
-            self.app.damage().dirty_row_ranges()
-        };
+        let damage_ranges = current_damage.clone();
         self.app.clear_damage();
         self.last_cursor_rows = current_cursor_rows;
         self.last_cursor_corners = current_cursor_corners;
 
-        let buf = &mut self.buffers[target_idx];
-        let buf_w = buf.width as i32;
-        let buf_h = buf.height as i32;
+        let buf_w = self.buffers[target_idx].width as i32;
+        let buf_h = self.buffers[target_idx].height as i32;
 
         let surface = self.surface.as_ref().unwrap();
         if full_redraw {
             // damage_buffer uses buffer (physical) coordinates
             surface.damage_buffer(0, 0, buf_w, buf_h);
         } else {
-            for (start_row, end_row) in damage_ranges {
+            for &(start_row, end_row) in &damage_ranges {
                 let (y0, y1) = self.renderer.pixel_bounds_for_row_range(start_row, end_row);
-                let y1 = y1.min(buf.height);
+                let y1 = y1.min(self.buffers[target_idx].height);
                 if y1 > y0 {
                     surface.damage_buffer(0, y0 as i32, buf_w, (y1 - y0) as i32);
                 }
             }
         }
-        surface.attach(Some(&buf.buffer), 0, 0);
-        buf.busy = true;
+        surface.attach(Some(&self.buffers[target_idx].buffer), 0, 0);
+        for (idx, other) in self.buffers.iter_mut().enumerate() {
+            if idx == target_idx {
+                other.age = 1;
+                other.busy = true;
+            } else if other.age > 0 {
+                other.age = other.age.saturating_add(1);
+            }
+        }
 
         // Apply scaling to the surface
         if self.use_fractional_scaling() {
@@ -453,11 +597,17 @@ impl WaylandState {
             surface.set_buffer_scale(self.scale.round().max(1.0) as i32);
         }
 
-        if keep_animating || self.repeat.key.is_some() {
+        if tick.animating && !self.frame_callback_pending {
             surface.frame(qh, ());
+            self.frame_callback_pending = true;
         }
         surface.commit();
         self.last_presented_buffer = Some(target_idx);
+        self.recent_damage_history.push_back(damage_ranges);
+        while self.recent_damage_history.len() > BUFFER_COUNT.saturating_sub(1) {
+            self.recent_damage_history.pop_front();
+        }
+        self.damage_ranges_scratch = current_damage;
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
@@ -494,13 +644,14 @@ impl WaylandState {
 
         let new_scale = new_scale.max(1.0);
 
-        if (self.scale - new_scale).abs() < 0.001 {
+        if (self.scale - new_scale).abs() < crate::software_renderer::CURSOR_GEOMETRY_EPSILON {
             return false;
         }
 
         info_log!("Scale changed: {:.3} -> {:.3}", self.scale, new_scale);
         self.scale = new_scale;
         self.renderer.set_scale(new_scale);
+        self.opaque_region_dirty = true;
         let (cw, ch) = self.renderer.cell_size();
         self.app.set_cell_size(cw, ch);
         self.refresh_terminal_layout_after_metrics_change();
@@ -508,24 +659,17 @@ impl WaylandState {
     }
 
     fn local_key_action_for(&self, event: &KeyEvent) -> Option<ZoomAction> {
-        if self
-            .app
-            .matches_local_keybinding(LocalAction::ZoomIn, event)
-        {
-            Some(ZoomAction::In)
-        } else if self
-            .app
-            .matches_local_keybinding(LocalAction::ZoomOut, event)
-        {
-            Some(ZoomAction::Out)
-        } else if self
-            .app
-            .matches_local_keybinding(LocalAction::ZoomReset, event)
-        {
-            Some(ZoomAction::Reset)
-        } else {
-            None
-        }
+        [
+            (LocalAction::ZoomIn, ZoomAction::In),
+            (LocalAction::ZoomOut, ZoomAction::Out),
+            (LocalAction::ZoomReset, ZoomAction::Reset),
+        ]
+        .into_iter()
+        .find_map(|(local_action, zoom_action)| {
+            self.app
+                .matches_local_keybinding(local_action, event)
+                .then_some(zoom_action)
+        })
     }
 
     fn handle_local_key_event(&mut self, event: &KeyEvent) -> bool {
@@ -570,6 +714,22 @@ impl WaylandState {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+fn merge_timeout_ms(current: i32, candidate: Option<Duration>) -> i32 {
+    let Some(candidate) = candidate else {
+        return current;
+    };
+    let candidate_ms = candidate.as_millis().min(i32::MAX as u128) as i32;
+    if current < 0 {
+        candidate_ms
+    } else {
+        current.min(candidate_ms)
+    }
+}
+
+fn schedule_pty_render_deadline(deadline: &mut Option<Instant>, now: Instant) {
+    deadline.get_or_insert(now + Duration::from_millis(PTY_RENDER_COALESCE_MS));
+}
+
 pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let mut event_queue = conn.new_event_queue();
@@ -591,16 +751,14 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (cw, ch) = renderer.cell_size();
     let (fit_width, fit_height) =
         renderer.window_size_for_grid(configured_cols as usize, configured_rows as usize);
-    let initial_width = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
-        && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
-    {
+    let using_default_window_size = configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
+        && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT;
+    let initial_width = if using_default_window_size {
         fit_width
     } else {
         configured_width
     };
-    let initial_height = if configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
-        && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT
-    {
+    let initial_height = if using_default_window_size {
         fit_height
     } else {
         configured_height
@@ -636,6 +794,9 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         buffers: Vec::new(),
         retired_buffers: Vec::new(),
         last_presented_buffer: None,
+        recent_damage_history: VecDeque::new(),
+        copy_ranges_scratch: Vec::new(),
+        damage_ranges_scratch: Vec::new(),
         last_cursor_rows: None,
         last_cursor_corners: None,
         xkb: None,
@@ -648,13 +809,25 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         fractional_scale_manager: None,
         fractional_scale: None,
         fractional_scale_value: None,
+        frame_callback_pending: false,
+        window_geometry_dirty: true,
+        opaque_region_dirty: true,
     };
 
+    let mut pending_pty_render_deadline: Option<Instant> = None;
     while state.running {
         let _ = event_queue.dispatch_pending(&mut state)?;
         state.fire_repeat();
         if state.configured && state.frame_ready {
-            state.render_frame(&qh);
+            let now = Instant::now();
+            if let Some(deadline) = pending_pty_render_deadline {
+                if now >= deadline {
+                    pending_pty_render_deadline = None;
+                    state.render_frame(&qh);
+                }
+            } else {
+                state.render_frame(&qh);
+            }
         }
         if state.app.pty_exited() || !state.running {
             break;
@@ -667,18 +840,32 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => return Err(Box::new(err)),
         }
 
-        let timeout_ms = state.repeat.timeout_ms();
+        let mut timeout_ms = state.repeat.timeout_ms();
+        if state.frame_ready {
+            if let Some(deadline) = pending_pty_render_deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    pending_pty_render_deadline = None;
+                    timeout_ms = 0;
+                } else {
+                    timeout_ms =
+                        merge_timeout_ms(timeout_ms, Some(deadline.saturating_duration_since(now)));
+                }
+            }
+        }
+        timeout_ms = merge_timeout_ms(timeout_ms, state.app.next_wakeup());
+
         let pty_fd = state.app.pty_raw_fd();
         if let Some(guard) = event_queue.prepare_read() {
             let mut pfds = [
                 libc::pollfd {
                     fd: guard.connection_fd().as_raw_fd(),
-                    events: libc::POLLIN,
+                    events: POLLIN,
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: pty_fd.unwrap_or(-1),
-                    events: libc::POLLIN,
+                    events: POLLIN,
                     revents: 0,
                 },
             ];
@@ -695,7 +882,7 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(Box::new(std::io::Error::from_raw_os_error(errno)));
             }
             if rc > 0 {
-                if (pfds[0].revents & libc::POLLIN) != 0 {
+                if (pfds[0].revents & POLLIN) != 0 {
                     match guard.read() {
                         Ok(_) => {}
                         Err(wayland_client::backend::WaylandError::Io(err))
@@ -703,16 +890,39 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                         Err(err) => return Err(Box::new(err)),
                     }
                 }
-                if pty_fd.is_some()
-                    && (pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
-                {
+                if pty_fd.is_some() && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0 {
                     state.frame_ready = true;
+                    schedule_pty_render_deadline(&mut pending_pty_render_deadline, Instant::now());
                 }
+            } else if state.app.cursor_wakeup_due() {
+                state.frame_ready = true;
             }
-        } else if timeout_ms > 0 {
-            std::thread::sleep(Duration::from_millis(timeout_ms as u64));
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_pty_render_deadline_sets_deadline_once() {
+        let now = Instant::now();
+        let mut deadline = None;
+
+        schedule_pty_render_deadline(&mut deadline, now);
+        let first = deadline;
+        schedule_pty_render_deadline(&mut deadline, now + Duration::from_secs(1));
+
+        assert_eq!(deadline, first);
+    }
+
+    #[test]
+    fn merge_timeout_ms_keeps_earliest_deadline() {
+        assert_eq!(merge_timeout_ms(-1, Some(Duration::from_millis(10))), 10);
+        assert_eq!(merge_timeout_ms(50, Some(Duration::from_millis(10))), 10);
+        assert_eq!(merge_timeout_ms(5, Some(Duration::from_millis(10))), 5);
+    }
 }

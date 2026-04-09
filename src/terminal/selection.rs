@@ -37,6 +37,11 @@ pub struct Selection {
 
 #[allow(dead_code)]
 impl Selection {
+    #[inline]
+    fn is_forward(start: GridPoint, end: GridPoint) -> bool {
+        start.row < end.row || (start.row == end.row && start.col <= end.col)
+    }
+
     /// Create a new empty selection.
     pub fn new() -> Self {
         Self {
@@ -91,7 +96,10 @@ impl Selection {
 
     /// Returns true if there is an active selection (either selecting or selected).
     pub fn has_selection(&self) -> bool {
-        self.state == SelectionState::Selecting || self.state == SelectionState::Selected
+        matches!(
+            self.state,
+            SelectionState::Selecting | SelectionState::Selected
+        )
     }
 
     /// Get the normalized start and end points, ensuring start comes before end
@@ -100,7 +108,7 @@ impl Selection {
         let s = self.start;
         let e = self.end;
 
-        if s.row < e.row || (s.row == e.row && s.col <= e.col) {
+        if Self::is_forward(s, e) {
             (s, e)
         } else {
             (e, s)
@@ -132,25 +140,9 @@ impl Selection {
     /// Check if a cell at (col, row) falls within the current selection.
     /// Handles both forward and backward selections via normalization.
     pub fn is_selected(&self, col: usize, row: usize) -> bool {
-        if !self.has_selection() {
-            return false;
-        }
-
-        let (start, end) = self.normalized();
-
-        if start.row == end.row {
-            // Single-line selection
-            row == start.row && col >= start.col && col <= end.col
-        } else if row == start.row {
-            // First row of multi-line selection: from start.col to end of line
-            col >= start.col
-        } else if row == end.row {
-            // Last row of multi-line selection: from beginning to end.col
-            col <= end.col
-        } else {
-            // Middle rows: entire row is selected
-            row > start.row && row < end.row
-        }
+        self.row_range(row)
+            .map(|(start, end)| col >= start && col <= end)
+            .unwrap_or(false)
     }
 
     /// Extract the selected text from the terminal grid.
@@ -158,52 +150,72 @@ impl Selection {
     /// characters. Trailing spaces on each row are trimmed, and rows are joined
     /// with newlines.
     pub fn selected_text(&self, grid: &Grid) -> String {
-        if !self.has_selection() {
+        if !self.has_selection() || grid.rows() == 0 || grid.cols() == 0 {
             return String::new();
         }
 
         let (start, end) = self.normalized();
         let grid_rows = grid.rows();
         let grid_cols = grid.cols();
+        if start.row >= grid_rows {
+            return String::new();
+        }
+
         let mut result = String::new();
         let mut wrote_row = false;
+        let wide_spacer = super::cell::CellFlags::WIDE_SPACER;
 
-        for row in start.row..=end.row {
-            if row >= grid_rows {
-                break;
+        for row in start.row..=end.row.min(grid_rows.saturating_sub(1)) {
+            let Some((col_start, col_end)) = self.row_range(row) else {
+                continue;
+            };
+            let col_start = col_start.min(grid_cols);
+            let col_end = col_end.min(grid_cols.saturating_sub(1));
+            if col_start > col_end {
+                continue;
             }
 
-            let col_start = if row == start.row { start.col } else { 0 };
-            let col_end = if row == end.row {
-                end.col.min(grid_cols.saturating_sub(1))
-            } else {
-                grid_cols.saturating_sub(1)
-            };
+            let row_cells = &grid.view_row_cells(row)[col_start..=col_end];
+            let mut trimmed_len = 0usize;
+            let mut row_len = 0usize;
 
-            let row_cells = grid.view_row(row).cells();
-            let mut line = String::new();
-            let mut last_non_space_len = 0;
+            for cell in row_cells {
+                if cell.flags.contains(wide_spacer) {
+                    continue;
+                }
 
-            for cell in row_cells
-                .iter()
-                .skip(col_start)
-                .take(col_end.saturating_sub(col_start).saturating_add(1))
-            {
-                // Skip wide character spacers to avoid duplicating wide chars
-                if !cell.flags.contains(super::cell::CellFlags::WIDE_SPACER) {
-                    line.push(cell.character());
-                    if cell.character() != ' ' {
-                        last_non_space_len = line.len();
-                    }
+                let ch = cell.character();
+                row_len += ch.len_utf8();
+                if ch != ' ' {
+                    trimmed_len = row_len;
                 }
             }
-
-            line.truncate(last_non_space_len);
 
             if wrote_row {
                 result.push('\n');
             }
-            result.push_str(&line);
+            if trimmed_len != 0 {
+                result.reserve(trimmed_len);
+                let mut remaining = trimmed_len;
+
+                for cell in row_cells {
+                    if cell.flags.contains(wide_spacer) {
+                        continue;
+                    }
+
+                    let ch = cell.character();
+                    let ch_len = ch.len_utf8();
+                    if ch_len > remaining {
+                        break;
+                    }
+
+                    result.push(ch);
+                    remaining -= ch_len;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
             wrote_row = true;
         }
 
@@ -427,5 +439,38 @@ mod tests {
 
         let result = sel.selected_text(&grid);
         assert_eq!(result, "two\ntri\nfor");
+    }
+
+    #[test]
+    fn test_selected_text_skips_wide_spacers_and_trims_trailing_spaces() {
+        use crate::terminal::cell::CellFlags;
+
+        let mut grid = Grid::new(6, 1);
+        grid.cell_mut(0, 0).ch = '中' as u32;
+        grid.cell_mut(1, 0).flags.insert(CellFlags::WIDE_SPACER);
+        grid.cell_mut(2, 0).ch = ' ' as u32;
+        grid.cell_mut(3, 0).ch = 'x' as u32;
+        grid.cell_mut(4, 0).ch = ' ' as u32;
+        grid.cell_mut(5, 0).ch = ' ' as u32;
+
+        let mut sel = Selection::new();
+        sel.start_selection(0, 0);
+        sel.update_selection(5, 0);
+
+        assert_eq!(sel.selected_text(&grid), "中 x");
+    }
+
+    #[test]
+    fn test_selected_text_ignores_columns_past_visible_width() {
+        let mut grid = Grid::new(3, 1);
+        for (col, ch) in "abc".chars().enumerate() {
+            grid.cell_mut(col, 0).ch = ch as u32;
+        }
+
+        let mut sel = Selection::new();
+        sel.start_selection(5, 0);
+        sel.update_selection(8, 0);
+
+        assert_eq!(sel.selected_text(&grid), "");
     }
 }

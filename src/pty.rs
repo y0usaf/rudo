@@ -2,11 +2,13 @@
 //! No portable-pty wrapper - raw syscalls for maximum speed.
 
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-use std::fmt;
-
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const PTY_OPEN_FLAGS: libc::c_int = libc::O_RDWR | libc::O_NOCTTY;
+const PTY_NAME_BUFFER_SIZE: usize = 512;
 
 const TERM_ENV_VAR: &str = "TERM";
 const COLORTERM_ENV_VAR: &str = "COLORTERM";
@@ -40,31 +42,43 @@ impl Pty {
     /// Spawn a new PTY with a shell process.
     pub fn spawn(cols: u16, rows: u16, config: &PtySpawnConfig<'_>) -> Result<Self> {
         // SAFETY: posix_openpt returns a valid fd or -1. We check < 0 before use.
-        let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        let master_raw = unsafe { libc::posix_openpt(PTY_OPEN_FLAGS) };
         if master_raw < 0 {
-            return Err(Box::new(PtyError("openpt failed".into())));
+            return Err(Box::new(PtyError(format!(
+                "openpt failed: {}",
+                std::io::Error::last_os_error()
+            ))));
         }
         // SAFETY: master_raw is a valid fd from posix_openpt (checked above).
         let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
 
         // SAFETY: master is a valid PTY master fd.
         if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
-            return Err(Box::new(PtyError("grantpt failed".into())));
+            return Err(Box::new(PtyError(format!(
+                "grantpt failed: {}",
+                std::io::Error::last_os_error()
+            ))));
         }
         // SAFETY: master is a valid, granted PTY master fd.
         if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
-            return Err(Box::new(PtyError("unlockpt failed".into())));
+            return Err(Box::new(PtyError(format!(
+                "unlockpt failed: {}",
+                std::io::Error::last_os_error()
+            ))));
         }
 
         let slave_name = {
-            let mut buf = [0u8; 512];
+            let mut buf = [0u8; PTY_NAME_BUFFER_SIZE];
             // SAFETY: ptsname_r writes into our stack buffer with bounded length,
             // and master_raw is a valid PTY master fd. Using ptsname_r instead of
             // ptsname avoids the thread-safety issue of the static buffer.
             let rc =
                 unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if rc != 0 {
-                return Err(Box::new(PtyError("ptsname_r failed".into())));
+                return Err(Box::new(PtyError(format!(
+                    "ptsname_r failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                ))));
             }
             // SAFETY: ptsname_r writes a null-terminated string into buf on success.
             let cstr = unsafe { CStr::from_ptr(buf.as_ptr().cast()) };
@@ -81,7 +95,10 @@ impl Pty {
         // SAFETY: fork() is safe to call; we handle both parent (pid > 0) and child (pid == 0).
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            return Err(Box::new(PtyError("fork failed".into())));
+            return Err(Box::new(PtyError(format!(
+                "fork failed: {}",
+                std::io::Error::last_os_error()
+            ))));
         }
 
         if pid == 0 {
@@ -92,47 +109,84 @@ impl Pty {
             unsafe {
                 libc::setsid();
 
-                let slave_cstr = CString::new(slave_name.clone()).unwrap();
+                let slave_cstr = match CString::new(slave_name.clone()) {
+                    Ok(value) => value,
+                    Err(_) => libc::_exit(1),
+                };
                 let slave_fd = libc::open(slave_cstr.as_ptr(), libc::O_RDWR);
                 if slave_fd < 0 {
                     libc::_exit(1);
                 }
 
-                libc::ioctl(
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                    libc::_exit(1);
+                }
+
+                if libc::ioctl(
                     slave_fd,
                     libc::TIOCSWINSZ,
                     &winsize as *const _ as *const libc::c_void,
-                );
+                ) < 0
+                {
+                    libc::_exit(1);
+                }
 
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
+                if libc::dup2(slave_fd, 0) < 0
+                    || libc::dup2(slave_fd, 1) < 0
+                    || libc::dup2(slave_fd, 2) < 0
+                {
+                    libc::_exit(1);
+                }
+
                 if slave_fd > 2 {
                     libc::close(slave_fd);
                 }
 
-                let term = CString::new(config.term).unwrap();
-                let term_key = CString::new(TERM_ENV_VAR).unwrap();
-                libc::setenv(term_key.as_ptr(), term.as_ptr(), 1);
+                let term = match CString::new(config.term) {
+                    Ok(value) => value,
+                    Err(_) => libc::_exit(1),
+                };
+                let term_key = match CString::new(TERM_ENV_VAR) {
+                    Ok(value) => value,
+                    Err(_) => libc::_exit(1),
+                };
+                if libc::setenv(term_key.as_ptr(), term.as_ptr(), 1) != 0 {
+                    libc::_exit(1);
+                }
 
-                let colorterm = CString::new(config.colorterm).unwrap();
-                let colorterm_key = CString::new(COLORTERM_ENV_VAR).unwrap();
-                libc::setenv(colorterm_key.as_ptr(), colorterm.as_ptr(), 1);
+                let colorterm = match CString::new(config.colorterm) {
+                    Ok(value) => value,
+                    Err(_) => libc::_exit(1),
+                };
+                let colorterm_key = match CString::new(COLORTERM_ENV_VAR) {
+                    Ok(value) => value,
+                    Err(_) => libc::_exit(1),
+                };
+                if libc::setenv(colorterm_key.as_ptr(), colorterm.as_ptr(), 1) != 0 {
+                    libc::_exit(1);
+                }
 
                 if config.command.is_empty() {
                     let shell = std::env::var(SHELL_ENV_VAR)
                         .unwrap_or_else(|_| config.shell_fallback.to_string());
-                    let shell_cstr = CString::new(shell).unwrap();
+                    let shell_cstr = match CString::new(shell) {
+                        Ok(value) => value,
+                        Err(_) => libc::_exit(1),
+                    };
                     libc::execvp(
                         shell_cstr.as_ptr(),
                         [shell_cstr.as_ptr(), std::ptr::null()].as_ptr(),
                     );
                 } else {
-                    let cmd_cstrs: Vec<CString> = config
+                    let cmd_cstrs: Vec<CString> = match config
                         .command
                         .iter()
-                        .map(|s| CString::new(s.as_str()).unwrap())
-                        .collect();
+                        .map(|s| CString::new(s.as_str()))
+                        .collect()
+                    {
+                        Ok(values) => values,
+                        Err(_) => libc::_exit(1),
+                    };
                     let mut argv: Vec<*const libc::c_char> =
                         cmd_cstrs.iter().map(|c| c.as_ptr()).collect();
                     argv.push(std::ptr::null());
@@ -142,17 +196,27 @@ impl Pty {
             }
         }
 
+        let child_pid = pid;
+
         // Parent - set master to non-blocking
         // SAFETY: master fd is valid; F_GETFL/F_SETFL are standard fcntl operations.
         unsafe {
             let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
-            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if flags < 0 {
+                return Err(Box::new(PtyError(format!(
+                    "fcntl(F_GETFL) failed: {}",
+                    std::io::Error::last_os_error()
+                ))));
+            }
+            if libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(Box::new(PtyError(format!(
+                    "fcntl(F_SETFL) failed: {}",
+                    std::io::Error::last_os_error()
+                ))));
+            }
         }
 
-        Ok(Self {
-            master,
-            child_pid: pid,
-        })
+        Ok(Self { master, child_pid })
     }
 
     /// Try to read from the PTY (non-blocking).
@@ -221,7 +285,8 @@ impl Pty {
                 loop {
                     let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
                     if rc > 0 {
-                        if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                        if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                        {
                             return Err(Box::new(PtyError(format!(
                                 "write failed after writing {written} of {} bytes: poll returned revents=0x{:x}",
                                 buf.len(),
@@ -268,7 +333,10 @@ impl Pty {
             // SAFETY: master fd is valid; winsize is a stack-allocated struct
             // passed by const pointer. TIOCSWINSZ is a standard PTY ioctl.
             if libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) < 0 {
-                return Err(Box::new(PtyError("TIOCSWINSZ failed".into())));
+                return Err(Box::new(PtyError(format!(
+                    "TIOCSWINSZ failed: {}",
+                    std::io::Error::last_os_error()
+                ))));
             }
         }
         Ok(())
@@ -318,8 +386,10 @@ impl Drop for Pty {
         // entire process group (child called setsid(), so pid == pgid).
         // The SIGCHLD handler installed at startup will reap the child
         // asynchronously – no need to wait here at all.
-        unsafe {
-            libc::kill(-self.child_pid, libc::SIGHUP);
+        if self.child_pid > 0 {
+            unsafe {
+                libc::kill(-self.child_pid, libc::SIGHUP);
+            }
         }
     }
 }
@@ -327,40 +397,129 @@ impl Drop for Pty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    fn test_spawn_config<'a>(command: &'a [String]) -> PtySpawnConfig<'a> {
+        PtySpawnConfig {
+            term: "xterm-256color",
+            colorterm: "truecolor",
+            shell_fallback: "/bin/sh",
+            command,
+        }
+    }
+
+    fn read_until_contains(pty: &Pty, needle: &[u8], timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 4096];
+        let mut out = Vec::new();
+
+        while Instant::now() < deadline {
+            match pty.try_read(&mut buf).unwrap() {
+                0 => std::thread::sleep(Duration::from_millis(10)),
+                n => {
+                    out.extend_from_slice(&buf[..n]);
+                    if out.windows(needle.len()).any(|window| window == needle) {
+                        return out;
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn spawn_runs_explicit_command_and_reads_output() {
+        install_sigchld_reaper();
+
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "printf READY".to_string(),
+        ];
+        let pty = Pty::spawn(80, 24, &test_spawn_config(&command)).unwrap();
+        let out = read_until_contains(&pty, b"READY", Duration::from_secs(2));
+
+        assert!(
+            out.windows(5).any(|window| window == b"READY"),
+            "pty output missing READY: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn shell_mode_accepts_input_and_produces_output() {
+        install_sigchld_reaper();
+
+        let previous_shell = std::env::var_os(SHELL_ENV_VAR);
+        unsafe {
+            std::env::set_var(SHELL_ENV_VAR, "/bin/sh");
+        }
+
+        let pty = Pty::spawn(80, 24, &test_spawn_config(&[])).unwrap();
+        pty.write(b"printf READY\\nexit\\n").unwrap();
+        let out = read_until_contains(&pty, b"READY", Duration::from_secs(3));
+
+        match previous_shell {
+            Some(value) => unsafe { std::env::set_var(SHELL_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(SHELL_ENV_VAR) },
+        }
+
+        assert!(
+            out.windows(5).any(|window| window == b"READY"),
+            "interactive shell output missing READY: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
 
     #[test]
     fn write_retries_after_partial_write_until_full_buffer_written() {
         use std::thread;
-        use std::time::Duration;
 
-        let (mut sink, peer) = UnixStream::pair().unwrap();
-        let mut reader = sink.try_clone().unwrap();
-        let reader_for_thread = sink.try_clone().unwrap();
-
+        let (reader, peer) = UnixStream::pair().unwrap();
         let write_end = unsafe { OwnedFd::from_raw_fd(peer.into_raw_fd()) };
         unsafe {
             let flags = libc::fcntl(write_end.as_raw_fd(), libc::F_GETFL);
             assert!(flags >= 0);
             assert_eq!(
-                libc::fcntl(write_end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+                libc::fcntl(
+                    write_end.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK
+                ),
                 0
             );
         }
 
+        let fill = vec![b'y'; 64 * 1024];
+        let mut prefilled = 0usize;
+        loop {
+            let n = unsafe { libc::write(write_end.as_raw_fd(), fill.as_ptr().cast(), fill.len()) };
+            if n > 0 {
+                prefilled += n as usize;
+                continue;
+            }
+
+            let errno = unsafe { *libc::__errno_location() };
+            assert!(errno == libc::EAGAIN || errno == libc::EWOULDBLOCK);
+            break;
+        }
+
+        let requested = 1 << 20;
+        let total_expected = prefilled + requested;
         let reader_thread = thread::spawn(move || {
-            let requested = 1 << 20;
-            let mut reader = reader_for_thread;
-            let mut drain = vec![0u8; requested];
+            let mut reader = reader;
+            let mut drain = vec![0u8; total_expected];
             let mut read_total = 0;
 
-            while read_total < requested {
+            while read_total < total_expected {
                 let n = reader.read(&mut drain[read_total..]).unwrap();
                 assert!(n > 0);
                 read_total += n;
-                if read_total < requested {
+                if read_total < total_expected {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -372,21 +531,14 @@ mod tests {
             master: write_end,
             child_pid: 0,
         };
-
-        let requested = 1 << 20;
         let buf = vec![b'x'; requested];
-
-        sink.write_all(&vec![b'y'; 1 << 20]).unwrap();
-
-        thread::sleep(Duration::from_millis(10));
-        let mut tmp = vec![0u8; 1 << 20];
-        let _ = reader.read(&mut tmp).unwrap();
 
         let written = pty.write(&buf).unwrap();
         assert_eq!(written, requested);
 
         let drain = reader_thread.join().unwrap();
-        assert_eq!(drain.len(), requested);
-        assert_eq!(drain, vec![b'x'; requested]);
+        assert_eq!(drain.len(), total_expected);
+        assert!(drain[..prefilled].iter().all(|&byte| byte == b'y'));
+        assert_eq!(&drain[prefilled..], &buf);
     }
 }

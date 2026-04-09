@@ -22,12 +22,12 @@ impl Row {
     }
 
     pub fn clear(&mut self) {
-        let blank = Cell::default();
-        self.cells.fill(blank);
-        self.dirty = true;
+        self.clear_with(Cell::default());
     }
 
     pub fn clear_with(&mut self, blank: Cell) {
+        let mut blank = blank;
+        blank.mark_dirty();
         self.cells.fill(blank);
         self.dirty = true;
     }
@@ -39,14 +39,16 @@ impl Row {
 
     #[inline]
     #[allow(dead_code)]
-    pub fn cells_mut(&mut self) -> &mut [Cell] {
-        &mut self.cells
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+        for cell in &mut self.cells {
+            cell.clear_dirty();
+        }
     }
 }
 
@@ -82,6 +84,7 @@ struct SavedGrid {
     scroll_top: usize,
     scroll_bottom: usize,
     scrollback_lines: usize,
+    max_scrollback: usize,
 }
 
 // ─── Grid ────────────────────────────────────────────────────────────────────
@@ -104,6 +107,8 @@ pub struct Grid {
 
     /// Lines that have scrolled off the top into scrollback.
     scrollback_lines: usize,
+    /// Maximum retained scrollback lines.
+    max_scrollback: usize,
 
     /// Scroll region top (0-based, inclusive).
     scroll_top: usize,
@@ -130,50 +135,64 @@ fn next_power_of_two(n: usize) -> usize {
     v.next_power_of_two()
 }
 
+#[inline]
 fn copy_row_prefix(dst: &mut Row, src: &Row, copy_cols: usize) {
-    if copy_cols > 0 {
-        dst.cells[..copy_cols].copy_from_slice(&src.cells[..copy_cols]);
-    }
+    dst.cells[..copy_cols].copy_from_slice(&src.cells[..copy_cols]);
     dst.dirty = true;
 }
 
-fn resize_row_store(
-    rows: &[Row],
+fn mark_rows_dirty(rows: &mut [Row], top: usize, bottom: usize, offset: usize, num_rows: usize) {
+    if top > bottom {
+        return;
+    }
+
+    for r in top..=bottom {
+        let idx = (offset + r) & (num_rows - 1);
+        rows[idx].dirty = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResizeRowStoreInput<'a> {
+    rows: &'a [Row],
     num_rows: usize,
     offset: usize,
     screen_cols: usize,
     screen_rows: usize,
     scrollback_lines: usize,
+    max_scrollback: usize,
     cursor_row: usize,
     new_cols: usize,
     new_rows: usize,
     preserve_scrollback: bool,
-) -> (Vec<Row>, usize, usize, usize, usize) {
-    let new_num_rows = next_power_of_two(new_rows * 4);
-    let mut new_buf = Vec::with_capacity(new_num_rows);
-    for _ in 0..new_num_rows {
-        new_buf.push(Row::new(new_cols));
-    }
+}
 
-    let total_history = screen_rows + scrollback_lines;
-    let cursor_row = cursor_row.min(screen_rows.saturating_sub(1));
+fn row_capacity(screen_rows: usize, max_scrollback: usize) -> usize {
+    next_power_of_two(screen_rows.saturating_add(max_scrollback))
+}
+
+fn resize_row_store(input: ResizeRowStoreInput<'_>) -> (Vec<Row>, usize, usize, usize, usize) {
+    let new_num_rows = row_capacity(input.new_rows, input.max_scrollback);
+    let mut new_buf = vec![Row::new(input.new_cols); new_num_rows];
+
+    let total_history = input.screen_rows.saturating_add(input.scrollback_lines);
+    let cursor_row = input.cursor_row.min(input.screen_rows.saturating_sub(1));
 
     // Total content lines from top of scrollback through the cursor row (inclusive).
-    let total_content = scrollback_lines + cursor_row + 1;
+    let total_content = input
+        .scrollback_lines
+        .saturating_add(cursor_row)
+        .saturating_add(1);
 
-    let new_anchor = if total_content <= new_rows {
+    let new_anchor = if total_content <= input.new_rows {
         // All content fits in the new screen — place it at the top, no blank padding.
         cursor_row
     } else {
         // Screen is full (or overflowing): keep cursor at the same distance from the bottom.
-        let rows_at_and_below = screen_rows.saturating_sub(cursor_row);
-        if rows_at_and_below >= new_rows {
-            0
-        } else {
-            new_rows - rows_at_and_below
-        }
+        let rows_at_and_below = input.screen_rows.saturating_sub(cursor_row);
+        input.new_rows.saturating_sub(rows_at_and_below)
     };
-    let anchor_logical = scrollback_lines + cursor_row;
+    let anchor_logical = input.scrollback_lines + cursor_row;
     let window_start = anchor_logical as isize - new_anchor as isize;
     let blank_top = if window_start < 0 {
         (-window_start) as usize
@@ -181,34 +200,30 @@ fn resize_row_store(
         0
     };
     let visible_src_start = window_start.max(0) as usize;
-    let max_scrollback = if preserve_scrollback {
-        new_num_rows - new_rows
-    } else {
-        0
-    };
+    let max_scrollback = usize::from(input.preserve_scrollback) * input.max_scrollback;
     let new_scrollback = visible_src_start.min(max_scrollback);
     let scrollback_src_start = visible_src_start.saturating_sub(new_scrollback);
-    let copy_cols = screen_cols.min(new_cols);
-    let history_start = offset.wrapping_sub(scrollback_lines) & (num_rows - 1);
+    let copy_cols = input.screen_cols.min(input.new_cols);
+    let history_start = input.offset.wrapping_sub(input.scrollback_lines) & (input.num_rows - 1);
 
-    for i in 0..new_scrollback {
+    for (i, dst_row) in new_buf.iter_mut().enumerate().take(new_scrollback) {
         let src_logical = scrollback_src_start + i;
         if src_logical >= total_history {
             break;
         }
-        let src_idx = (history_start + src_logical) & (num_rows - 1);
-        copy_row_prefix(&mut new_buf[i], &rows[src_idx], copy_cols);
+        let src_idx = (history_start + src_logical) & (input.num_rows - 1);
+        copy_row_prefix(dst_row, &input.rows[src_idx], copy_cols);
     }
 
-    let visible_slots = new_rows.saturating_sub(blank_top);
+    let visible_slots = input.new_rows.saturating_sub(blank_top);
     let visible_copy = total_history
         .saturating_sub(visible_src_start)
         .min(visible_slots);
     for i in 0..visible_copy {
         let src_logical = visible_src_start + i;
-        let src_idx = (history_start + src_logical) & (num_rows - 1);
+        let src_idx = (history_start + src_logical) & (input.num_rows - 1);
         let dst_idx = new_scrollback + blank_top + i;
-        copy_row_prefix(&mut new_buf[dst_idx], &rows[src_idx], copy_cols);
+        copy_row_prefix(&mut new_buf[dst_idx], &input.rows[src_idx], copy_cols);
     }
 
     (
@@ -216,7 +231,7 @@ fn resize_row_store(
         new_num_rows,
         new_scrollback,
         new_scrollback,
-        new_anchor.min(new_rows.saturating_sub(1)),
+        new_anchor.min(input.new_rows.saturating_sub(1)),
     )
 }
 
@@ -226,13 +241,14 @@ impl Grid {
 
     pub fn new(cols: usize, rows: usize) -> Self {
         let screen_rows = rows.max(1);
+        Self::with_scrollback(cols, screen_rows, screen_rows.saturating_mul(3))
+    }
+
+    pub fn with_scrollback(cols: usize, rows: usize, max_scrollback: usize) -> Self {
+        let screen_rows = rows.max(1);
         let screen_cols = cols.max(1);
-        // Allocate enough for scrollback: at least 4x screen rows, power of 2.
-        let num_rows = next_power_of_two(screen_rows * 4);
-        let mut row_buf = Vec::with_capacity(num_rows);
-        for _ in 0..num_rows {
-            row_buf.push(Row::new(screen_cols));
-        }
+        let num_rows = row_capacity(screen_rows, max_scrollback);
+        let row_buf = vec![Row::new(screen_cols); num_rows];
         Self {
             cursor: CursorState::default(),
             rows: row_buf,
@@ -241,6 +257,7 @@ impl Grid {
             screen_rows,
             screen_cols,
             scrollback_lines: 0,
+            max_scrollback,
             scroll_top: 0,
             scroll_bottom: screen_rows.saturating_sub(1),
             saved_cursor: CursorState::default(),
@@ -281,6 +298,11 @@ impl Grid {
         col.min(self.screen_cols.saturating_sub(1))
     }
 
+    #[inline]
+    fn view_abs_row(&self, row: usize) -> usize {
+        (self.offset.wrapping_sub(self.view_offset) + row) & (self.num_rows - 1)
+    }
+
     /// Clamp a row value to the valid range.
     #[inline]
     fn clamp_row(&self, row: usize) -> usize {
@@ -288,23 +310,6 @@ impl Grid {
     }
 
     // ── Row / Cell access ────────────────────────────────────────────────
-
-    /// Get an immutable reference to a visible row (0 = top of screen).
-    #[inline]
-    pub fn row(&self, row: usize) -> &Row {
-        let idx = self.abs_row(row);
-        debug_assert!(idx < self.rows.len());
-        &self.rows[idx]
-    }
-
-    /// Get a mutable reference to a visible row.
-    #[inline]
-    pub fn row_mut(&mut self, row: usize) -> &mut Row {
-        let idx = self.abs_row(row);
-        debug_assert!(idx < self.rows.len());
-        self.rows[idx].dirty = true;
-        &mut self.rows[idx]
-    }
 
     /// Get an immutable reference to a cell.
     #[inline]
@@ -321,8 +326,9 @@ impl Grid {
         let idx = self.abs_row(row);
         debug_assert!(idx < self.rows.len());
         debug_assert!(col < self.rows[idx].cells.len());
-        self.rows[idx].dirty = true;
-        &mut self.rows[idx].cells[col]
+        let cell = &mut self.rows[idx].cells[col];
+        cell.mark_dirty();
+        cell
     }
 
     // ── Cursor ───────────────────────────────────────────────────────────
@@ -430,16 +436,17 @@ impl Grid {
         let bot = self.scroll_bottom;
         let region_size = bot - top + 1;
         let lines = lines.min(region_size);
+        if lines == 0 {
+            return;
+        }
 
         if top == 0 && bot == self.screen_rows - 1 && !self.alternate_active {
             // Full-screen scroll: advance offset (old top rows become scrollback).
             for _ in 0..lines {
                 self.offset = (self.offset + 1) & (self.num_rows - 1);
-                let max_scrollback = self.num_rows - self.screen_rows;
-                self.scrollback_lines = (self.scrollback_lines + 1).min(max_scrollback);
+                self.scrollback_lines = (self.scrollback_lines + 1).min(self.max_scrollback);
                 // Clear the new bottom row.
                 let bottom_abs = self.abs_row(self.screen_rows - 1);
-                self.rows[bottom_abs].cells.resize(self.screen_cols, blank);
                 self.rows[bottom_abs].clear_with(blank);
             }
         } else {
@@ -470,15 +477,7 @@ impl Grid {
                 self.rows[idx].clear_with(blank);
             }
         }
-        // Mark visible rows dirty.
-        for r in top..=bot {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
-    }
-
-    pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll_up_with(lines, Cell::default());
+        mark_rows_dirty(&mut self.rows, top, bot, self.offset, self.num_rows);
     }
 
     /// Scroll the scroll region down by `lines` lines. New blank lines appear at the top
@@ -488,6 +487,9 @@ impl Grid {
         let bot = self.scroll_bottom;
         let region_size = bot - top + 1;
         let lines = lines.min(region_size);
+        if lines == 0 {
+            return;
+        }
 
         let abs_top = self.abs_row(top);
         let abs_bot = self.abs_row(bot);
@@ -512,15 +514,7 @@ impl Grid {
             let idx = self.abs_row(top + i);
             self.rows[idx].clear_with(blank);
         }
-        // Mark visible rows dirty.
-        for r in top..=bot {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
-    }
-
-    pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll_down_with(lines, Cell::default());
+        mark_rows_dirty(&mut self.rows, top, bot, self.offset, self.num_rows);
     }
 
     /// Insert blank lines starting at `row`, shifting the rest of the active scroll region down.
@@ -558,10 +552,7 @@ impl Grid {
             let idx = self.abs_row(top + i);
             self.rows[idx].clear_with(blank);
         }
-        for r in top..=bot {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
+        mark_rows_dirty(&mut self.rows, top, bot, self.offset, self.num_rows);
     }
 
     pub fn insert_lines_at(&mut self, row: usize, count: usize) {
@@ -603,10 +594,7 @@ impl Grid {
             let idx = self.abs_row(bot - (lines - 1) + i);
             self.rows[idx].clear_with(blank);
         }
-        for r in top..=bot {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
+        mark_rows_dirty(&mut self.rows, top, bot, self.offset, self.num_rows);
     }
 
     pub fn delete_lines_at(&mut self, row: usize, count: usize) {
@@ -624,12 +612,6 @@ impl Grid {
         // Per DEC spec: setting scroll region moves cursor to home.
         self.cursor.col = 0;
         self.cursor.row = 0;
-    }
-
-    /// Reset scroll region to the full screen.
-    pub fn reset_scroll_region(&mut self) {
-        self.scroll_top = 0;
-        self.scroll_bottom = self.screen_rows.saturating_sub(1);
     }
 
     // ── Erase operations ─────────────────────────────────────────────────
@@ -711,18 +693,6 @@ impl Grid {
         self.erase_to_start_of_line_with(Cell::default());
     }
 
-    pub fn erase_line(&mut self) {
-        self.erase_line_with(Cell::default());
-    }
-
-    pub fn erase_below(&mut self) {
-        self.erase_below_with(Cell::default());
-    }
-
-    pub fn erase_above(&mut self) {
-        self.erase_above_with(Cell::default());
-    }
-
     pub fn erase_all(&mut self) {
         self.erase_all_with(Cell::default());
     }
@@ -794,6 +764,7 @@ impl Grid {
             scroll_top: self.scroll_top,
             scroll_bottom: self.scroll_bottom,
             scrollback_lines: self.scrollback_lines,
+            max_scrollback: self.max_scrollback,
         };
         self.saved_grid = Some(Box::new(saved));
         self.alternate_active = true;
@@ -809,9 +780,8 @@ impl Grid {
         self.view_offset = 0;
 
         // Clear all rows in the buffer for alternate screen (no scrollback).
-        for r in 0..self.num_rows {
-            self.rows[r].cells.resize(self.screen_cols, Cell::default());
-            self.rows[r].clear();
+        for row in &mut self.rows {
+            row.clear();
         }
     }
 
@@ -830,15 +800,19 @@ impl Grid {
             self.scroll_top = saved.scroll_top;
             self.scroll_bottom = saved.scroll_bottom;
             self.scrollback_lines = saved.scrollback_lines;
+            self.max_scrollback = saved.max_scrollback;
         }
         self.alternate_active = false;
         self.view_offset = 0;
 
         // Mark all visible rows dirty so they get redrawn.
-        for r in 0..self.screen_rows {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
+        mark_rows_dirty(
+            &mut self.rows,
+            0,
+            self.screen_rows.saturating_sub(1),
+            self.offset,
+            self.num_rows,
+        );
     }
 
     // ── Scrollback ───────────────────────────────────────────────────────
@@ -882,27 +856,30 @@ impl Grid {
         self.view_offset > 0
     }
 
-    /// Get the cells of a view row as a slice. Used by the renderer for
-    /// cache-friendly iteration without per-cell circular buffer lookups.
     #[inline]
     pub fn view_row_cells(&self, row: usize) -> &[Cell] {
-        let abs = (self.offset.wrapping_sub(self.view_offset) + row) & (self.num_rows - 1);
+        let abs = self.view_abs_row(row);
         &self.rows[abs].cells
     }
 
-    /// Get an immutable reference to a cell, accounting for view offset.
-    /// Used by the renderer to display scrollback content.
     #[inline]
-    pub fn view_cell(&self, col: usize, row: usize) -> &Cell {
-        let abs = (self.offset.wrapping_sub(self.view_offset) + row) & (self.num_rows - 1);
-        &self.rows[abs].cells[col]
+    pub fn clear_view_row_dirty(&mut self, row: usize) {
+        let abs = self.view_abs_row(row);
+        self.rows[abs].clear_dirty();
     }
 
     /// Get an immutable reference to a row, accounting for view offset.
     #[inline]
     pub fn view_row(&self, row: usize) -> &Row {
-        let abs = (self.offset.wrapping_sub(self.view_offset) + row) & (self.num_rows - 1);
+        let abs = self.view_abs_row(row);
         &self.rows[abs]
+    }
+
+    /// Get a mutable reference to a row, accounting for view offset.
+    #[inline]
+    pub fn view_row_mut(&mut self, row: usize) -> &mut Row {
+        let abs = self.view_abs_row(row);
+        &mut self.rows[abs]
     }
 
     // ── Resize ───────────────────────────────────────────────────────────
@@ -920,22 +897,23 @@ impl Grid {
         let old_rows = self.screen_rows;
 
         let (new_rows_buf, new_num_rows, new_offset, new_scrollback_lines, new_cursor_row) =
-            resize_row_store(
-                &self.rows,
-                self.num_rows,
-                self.offset,
-                old_cols,
-                old_rows,
-                if self.alternate_active {
+            resize_row_store(ResizeRowStoreInput {
+                rows: &self.rows,
+                num_rows: self.num_rows,
+                offset: self.offset,
+                screen_cols: old_cols,
+                screen_rows: old_rows,
+                scrollback_lines: if self.alternate_active {
                     0
                 } else {
                     self.scrollback_lines
                 },
-                self.cursor.row,
+                max_scrollback: self.max_scrollback,
+                cursor_row: self.cursor.row,
                 new_cols,
                 new_rows,
-                !self.alternate_active,
-            );
+                preserve_scrollback: !self.alternate_active,
+            });
 
         self.rows = new_rows_buf;
         self.num_rows = new_num_rows;
@@ -949,18 +927,19 @@ impl Grid {
 
         if let Some(saved) = self.saved_grid.as_mut() {
             let (saved_rows, saved_num_rows, saved_offset, saved_scrollback, saved_cursor_row) =
-                resize_row_store(
-                    &saved.rows,
-                    saved.num_rows,
-                    saved.offset,
-                    old_cols,
-                    old_rows,
-                    saved.scrollback_lines,
-                    saved.cursor.row,
+                resize_row_store(ResizeRowStoreInput {
+                    rows: &saved.rows,
+                    num_rows: saved.num_rows,
+                    offset: saved.offset,
+                    screen_cols: old_cols,
+                    screen_rows: old_rows,
+                    scrollback_lines: saved.scrollback_lines,
+                    max_scrollback: saved.max_scrollback,
+                    cursor_row: saved.cursor.row,
                     new_cols,
                     new_rows,
-                    true,
-                );
+                    preserve_scrollback: true,
+                });
             saved.rows = saved_rows;
             saved.num_rows = saved_num_rows;
             saved.offset = saved_offset;
@@ -989,10 +968,13 @@ impl Grid {
         self.view_offset = 0;
 
         // Mark all visible rows dirty.
-        for r in 0..self.screen_rows {
-            let idx = self.abs_row(r);
-            self.rows[idx].dirty = true;
-        }
+        mark_rows_dirty(
+            &mut self.rows,
+            0,
+            self.screen_rows.saturating_sub(1),
+            self.offset,
+            self.num_rows,
+        );
     }
 }
 
@@ -1057,15 +1039,6 @@ mod tests {
         // Cursor moves home.
         assert_eq!(g.cursor.col, 0);
         assert_eq!(g.cursor.row, 0);
-    }
-
-    #[test]
-    fn test_reset_scroll_region() {
-        let mut g = Grid::new(80, 24);
-        g.set_scroll_region(5, 15);
-        g.reset_scroll_region();
-        assert_eq!(g.scroll_top, 0);
-        assert_eq!(g.scroll_bottom, 23);
     }
 
     #[test]
@@ -1159,12 +1132,22 @@ mod tests {
     #[test]
     fn test_scrollback_cap() {
         let mut g = Grid::new(80, 24);
-        let max = g.num_rows - g.screen_rows;
+        let max = g.max_scrollback;
         for _ in 0..(max + 10) {
             g.set_cursor(0, 23);
             g.linefeed();
         }
         assert_eq!(g.scrollback_count(), max);
+    }
+
+    #[test]
+    fn test_custom_scrollback_cap() {
+        let mut g = Grid::with_scrollback(80, 24, 5);
+        for _ in 0..32 {
+            g.set_cursor(0, 23);
+            g.linefeed();
+        }
+        assert_eq!(g.scrollback_count(), 5);
     }
 
     #[test]

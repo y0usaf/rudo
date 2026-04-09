@@ -1,7 +1,6 @@
 //! Wayland protocol dispatch implementations.
 
-use std::fs::File;
-use std::io::Read;
+use std::os::fd::AsRawFd;
 
 use wayland_client::{
     delegate_noop,
@@ -42,13 +41,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => match interface.as_str() {
                 "wl_compositor" => {
                     let compositor =
                         registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4, qh, ());
@@ -58,6 +56,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 "wl_shm" => {
                     let shm = registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ());
                     state.shm = Some(shm);
+                    // xdg_surface.configure can race ahead of wl_shm discovery.
+                    // If we already consumed the initial frame request while shm
+                    // was still missing, request another render now that buffers
+                    // can actually be created.
+                    if state.surface.is_some() {
+                        state.frame_ready = true;
+                    }
                 }
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, 5, qh, ());
@@ -101,7 +106,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.fractional_scale_manager = Some(mgr);
                 }
                 _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                let old_len = state.outputs.len();
+                state.outputs.retain(|info| info.name != name);
+                state
+                    .surface_outputs
+                    .retain(|output_name| *output_name != name);
+                if state.outputs.len() != old_len && state.update_scale() {
+                    state.frame_ready = true;
+                }
             }
+            _ => {}
         }
     }
 }
@@ -191,16 +207,13 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState 
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        match event {
-            wp_fractional_scale_v1::Event::PreferredScale { scale } => {
-                // Wire format: scale × 120 (e.g. 180 = 1.5×, 240 = 2.0×)
-                let new_scale = scale as f32 / FRACTIONAL_SCALE_DIVISOR;
-                state.fractional_scale_value = Some(new_scale);
-                if state.update_scale() {
-                    state.frame_ready = true;
-                }
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            // Wire format: scale × 120 (e.g. 180 = 1.5×, 240 = 2.0×)
+            let new_scale = scale as f32 / FRACTIONAL_SCALE_DIVISOR;
+            state.fractional_scale_value = Some(new_scale);
+            if state.update_scale() {
+                state.frame_ready = true;
             }
-            _ => {}
         }
     }
 }
@@ -208,14 +221,14 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState 
 impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        callback: &wl_callback::WlCallback,
+        _callback: &wl_callback::WlCallback,
         event: wl_callback::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
-            let _ = callback;
+            state.frame_callback_pending = false;
             state.frame_ready = true;
         }
     }
@@ -334,9 +347,7 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for Way
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
-            let _ = mode;
-        }
+        if let zxdg_toplevel_decoration_v1::Event::Configure { mode: _mode } = event {}
     }
 }
 
@@ -353,11 +364,23 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
-                state.keyboard = Some(seat.get_keyboard(qh, ()));
+            let has_keyboard = capabilities.contains(wl_seat::Capability::Keyboard);
+            if has_keyboard {
+                if state.keyboard.is_none() {
+                    state.keyboard = Some(seat.get_keyboard(qh, ()));
+                }
+            } else {
+                state.keyboard = None;
             }
-            if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                state.pointer = Some(seat.get_pointer(qh, ()));
+
+            let has_pointer = capabilities.contains(wl_seat::Capability::Pointer);
+            if has_pointer {
+                if state.pointer.is_none() {
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                }
+            } else {
+                state.pointer = None;
+                state.pointer_focus = false;
             }
         }
     }
@@ -457,18 +480,49 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 fd,
                 size,
             } => {
-                let mut file = File::from(fd);
-                let mut buf = vec![0u8; size as usize];
-                if file.read_exact(&mut buf).is_ok() {
-                    state.xkb = XkbContextData::from_keymap_string(&buf);
-                    if let Some(xkb) = &mut state.xkb {
-                        info_log!("Wayland xkb keymap loaded");
-                        state.app.set_modifiers(xkb.modifiers());
-                    } else {
-                        warn_log!("Wayland xkb keymap parse failed, using fallback keymap");
-                    }
+                let map_len = size as usize;
+                if map_len == 0 {
+                    warn_log!("Wayland keymap was empty, using fallback keymap");
                 } else {
-                    warn_log!("Wayland keymap read failed, using fallback keymap");
+                    // Match foot here: wl_keyboard.keymap hands us a shared
+                    // file descriptor intended for mmap(). Some compositors /
+                    // proxy layers are unhappy when clients try to stream-read
+                    // the whole fd, which left us stuck on the fallback US
+                    // keymap and broke synthetic input (e.g. wtype/Handy).
+                    let map_ptr = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            map_len,
+                            libc::PROT_READ,
+                            libc::MAP_PRIVATE,
+                            fd.as_raw_fd(),
+                            0,
+                        )
+                    };
+                    if map_ptr == libc::MAP_FAILED {
+                        warn_log!(
+                            "Wayland keymap mmap failed ({}), using fallback keymap",
+                            std::io::Error::last_os_error()
+                        );
+                    } else {
+                        let keymap_buf =
+                            unsafe { std::slice::from_raw_parts(map_ptr.cast::<u8>(), map_len) };
+                        let trimmed_len = keymap_buf
+                            .iter()
+                            .rposition(|&byte| byte != 0)
+                            .map(|idx| idx + 1)
+                            .unwrap_or(0);
+                        state.xkb = XkbContextData::from_keymap_string(&keymap_buf[..trimmed_len]);
+                        unsafe {
+                            libc::munmap(map_ptr, map_len);
+                        }
+                        if let Some(xkb) = &mut state.xkb {
+                            info_log!("Wayland xkb keymap loaded");
+                            state.app.set_modifiers(xkb.modifiers());
+                        } else {
+                            warn_log!("Wayland xkb keymap parse failed, using fallback keymap");
+                        }
+                    }
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -525,6 +579,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.repeat.stop(None);
+                state.fallback_mods = crate::input::Modifiers::empty();
+                if let Some(xkb) = &mut state.xkb {
+                    xkb.reset_state();
+                    state.app.set_modifiers(xkb.modifiers());
+                } else {
+                    state.app.set_modifiers(state.fallback_mods);
+                }
             }
             _ => {}
         }
