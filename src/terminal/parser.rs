@@ -38,7 +38,7 @@ fn parse_extended_color(params: &[u16], theme: &Theme) -> (PackedColor, ColorSou
 }
 
 fn parse_osc_color_component(component: &str) -> Option<u8> {
-    if component.is_empty() || !component.chars().all(|c| c.is_ascii_hexdigit()) {
+    if component.is_empty() {
         return None;
     }
 
@@ -63,7 +63,7 @@ fn parse_osc_color(spec: &str) -> Option<PackedColor> {
     }
 
     let hex = spec.strip_prefix('#').unwrap_or(spec);
-    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if hex.len() != 6 {
         return None;
     }
 
@@ -87,6 +87,18 @@ fn format_osc_color(color: PackedColor) -> String {
 // ---------------------------------------------------------------------------
 
 /// VT100/xterm terminal parser wrapping the `vte` state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CharsetSlot {
+    G0,
+    G1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecCharset {
+    Ascii,
+    DecSpecialGraphics,
+}
+
 pub struct TerminalParser {
     parser: vte::Parser,
     current_attrs: Cell,
@@ -98,35 +110,24 @@ pub struct TerminalParser {
     mouse_state: MouseState,
     application_cursor_keys: bool,
     origin_mode: bool,
+    g0_charset: DecCharset,
+    g1_charset: DecCharset,
+    active_charset: CharsetSlot,
 }
 
 #[allow(dead_code)]
 impl TerminalParser {
     pub fn new() -> Self {
-        let theme = Theme::default();
-        let base_theme = theme.clone();
-        let mut default_cell = Cell::default();
-        default_cell.fg = theme.foreground;
-        default_cell.bg = theme.background;
-        Self {
-            parser: vte::Parser::new(),
-            current_attrs: default_cell,
-            title: None,
-            responses: Vec::new(),
-            theme,
-            base_theme,
-            theme_changed: false,
-            mouse_state: MouseState::new(),
-            application_cursor_keys: false,
-            origin_mode: false,
-        }
+        Self::with_theme(Theme::default())
     }
 
     pub fn with_theme(theme: Theme) -> Self {
         let base_theme = theme.clone();
-        let mut default_cell = Cell::default();
-        default_cell.fg = theme.foreground;
-        default_cell.bg = theme.background;
+        let default_cell = Cell {
+            fg: theme.foreground,
+            bg: theme.background,
+            ..Cell::default()
+        };
         Self {
             parser: vte::Parser::new(),
             current_attrs: default_cell,
@@ -138,6 +139,9 @@ impl TerminalParser {
             mouse_state: MouseState::new(),
             application_cursor_keys: false,
             origin_mode: false,
+            g0_charset: DecCharset::Ascii,
+            g1_charset: DecCharset::Ascii,
+            active_charset: CharsetSlot::G0,
         }
     }
 
@@ -155,6 +159,9 @@ impl TerminalParser {
             mouse_state: &mut self.mouse_state,
             application_cursor_keys: &mut self.application_cursor_keys,
             origin_mode: &mut self.origin_mode,
+            g0_charset: &mut self.g0_charset,
+            g1_charset: &mut self.g1_charset,
+            active_charset: &mut self.active_charset,
         };
         self.parser.advance(&mut performer, bytes);
     }
@@ -205,6 +212,9 @@ struct Performer<'a> {
     mouse_state: &'a mut MouseState,
     application_cursor_keys: &'a mut bool,
     origin_mode: &'a mut bool,
+    g0_charset: &'a mut DecCharset,
+    g1_charset: &'a mut DecCharset,
+    active_charset: &'a mut CharsetSlot,
 }
 
 impl<'a> Performer<'a> {
@@ -240,26 +250,7 @@ impl<'a> Performer<'a> {
     }
 
     fn set_dynamic_color(&mut self, code: u16, color: PackedColor) {
-        let changed = match code {
-            10 => {
-                let changed = self.theme.foreground != color;
-                self.theme.foreground = color;
-                changed
-            }
-            11 => {
-                let changed = self.theme.background != color;
-                self.theme.background = color;
-                changed
-            }
-            12 => {
-                let changed = self.theme.cursor != color;
-                self.theme.cursor = color;
-                changed
-            }
-            _ => false,
-        };
-
-        if changed {
+        if self.set_dynamic_color_value(code, color) {
             self.sync_default_attrs_with_theme();
             self.mark_theme_changed();
         }
@@ -275,13 +266,7 @@ impl<'a> Performer<'a> {
     }
 
     fn query_dynamic_color(&mut self, code: u16, bell_terminated: bool) {
-        let color = match code {
-            10 => Some(self.theme.foreground),
-            11 => Some(self.theme.background),
-            12 => Some(self.theme.cursor),
-            _ => None,
-        };
-        if let Some(color) = color {
+        if let Some(color) = self.dynamic_color(code) {
             self.respond_with_dynamic_color(code, color, bell_terminated);
         }
     }
@@ -423,23 +408,25 @@ impl<'a> Performer<'a> {
     // CSI dispatch helpers
     // -----------------------------------------------------------------------
 
+    fn param_value(params: &vte::Params, idx: usize) -> Option<u16> {
+        for (param_idx, group) in params.iter().enumerate() {
+            if param_idx == idx {
+                return group.first().copied();
+            }
+        }
+        None
+    }
+
     /// Extract the first parameter, defaulting to `default` when absent or 0.
     fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
-        params
-            .iter()
-            .nth(idx)
-            .and_then(|p| p.first().copied())
-            .map(|v| if v == 0 { default } else { v })
+        Self::param_value(params, idx)
+            .map(|value| if value == 0 { default } else { value })
             .unwrap_or(default)
     }
 
     /// Extract the first parameter, defaulting to `default` when absent (0 IS valid).
     fn param_zero_ok(params: &vte::Params, idx: usize, default: u16) -> u16 {
-        params
-            .iter()
-            .nth(idx)
-            .and_then(|p| p.first().copied())
-            .unwrap_or(default)
+        Self::param_value(params, idx).unwrap_or(default)
     }
 
     #[inline]
@@ -458,6 +445,20 @@ impl<'a> Performer<'a> {
             (min_row + row).min(max_row)
         } else {
             row.min(max_row)
+        }
+    }
+
+    fn current_charset(&self) -> DecCharset {
+        match *self.active_charset {
+            CharsetSlot::G0 => *self.g0_charset,
+            CharsetSlot::G1 => *self.g1_charset,
+        }
+    }
+
+    fn map_printable_char(&self, ch: char) -> char {
+        match self.current_charset() {
+            DecCharset::Ascii => ch,
+            DecCharset::DecSpecialGraphics => map_dec_special_graphics(ch),
         }
     }
 
@@ -485,15 +486,49 @@ impl<'a> Performer<'a> {
     fn insert_lines(&mut self, count: usize) {
         let blank = self.blank_cell();
         let row = self.grid.cursor_row();
+        let (_, bottom) = self.grid.scroll_region();
+        let lines = count.min(bottom.saturating_sub(row).saturating_add(1));
         self.grid.insert_lines_at_with(row, count, blank);
-        self.damage.mark_all();
+        self.damage.mark_scroll(row, bottom, lines);
     }
 
     fn delete_lines(&mut self, count: usize) {
         let blank = self.blank_cell();
         let row = self.grid.cursor_row();
+        let (_, bottom) = self.grid.scroll_region();
+        let lines = count.min(bottom.saturating_sub(row).saturating_add(1));
         self.grid.delete_lines_at_with(row, count, blank);
-        self.damage.mark_all();
+        self.damage.mark_scroll(row, bottom, lines);
+    }
+
+    fn dynamic_color(&self, code: u16) -> Option<PackedColor> {
+        match code {
+            10 => Some(self.theme.foreground),
+            11 => Some(self.theme.background),
+            12 => Some(self.theme.cursor),
+            _ => None,
+        }
+    }
+
+    fn set_dynamic_color_value(&mut self, code: u16, color: PackedColor) -> bool {
+        match code {
+            10 => {
+                let changed = self.theme.foreground != color;
+                self.theme.foreground = color;
+                changed
+            }
+            11 => {
+                let changed = self.theme.background != color;
+                self.theme.background = color;
+                changed
+            }
+            12 => {
+                let changed = self.theme.cursor != color;
+                self.theme.cursor = color;
+                changed
+            }
+            _ => false,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -520,8 +555,8 @@ impl<'a> vte::Perform for Performer<'a> {
     // ------ Print a visible character ------------------------------------
     #[inline]
     fn print(&mut self, c: char) {
+        let c = self.map_printable_char(c);
         let col = self.grid.cursor_col();
-        let _row = self.grid.cursor_row();
         let cols = self.grid.cols();
 
         // Determine character width
@@ -545,12 +580,11 @@ impl<'a> vte::Perform for Performer<'a> {
         // Write the cell
         let cell = self.grid.cell_mut(col, row);
         cell.ch = c as u32;
-        cell.flags = self.current_attrs.flags & PRINT_FLAGS_MASK;
+        cell.flags = (self.current_attrs.flags & PRINT_FLAGS_MASK) | CellFlags::DIRTY;
         cell.fg = self.current_attrs.fg;
         cell.bg = self.current_attrs.bg;
         cell.fg_src = self.current_attrs.fg_src;
         cell.bg_src = self.current_attrs.bg_src;
-        cell.mark_dirty();
 
         if width == 2 {
             cell.flags.insert(CellFlags::WIDE);
@@ -558,8 +592,7 @@ impl<'a> vte::Perform for Performer<'a> {
             if col + 1 < cols {
                 let spacer = self.grid.cell_mut(col + 1, row);
                 *spacer = Cell::default();
-                spacer.flags.insert(CellFlags::WIDE_SPACER);
-                spacer.mark_dirty();
+                spacer.flags = CellFlags::WIDE_SPACER | CellFlags::DIRTY;
                 self.grid.set_cursor_col(col + 2);
             } else {
                 self.grid.set_cursor_col(col + 1);
@@ -568,7 +601,6 @@ impl<'a> vte::Perform for Performer<'a> {
             self.grid.set_cursor_col(col + 1);
         }
 
-        let _ = self.grid.row_mut(row);
         self.damage.mark_row(row);
     }
 
@@ -593,11 +625,18 @@ impl<'a> vte::Perform for Performer<'a> {
                 self.grid.set_cursor_col(next.min(cols.saturating_sub(1)));
             }
             // LF, VT, FF
-            0x0A | 0x0B | 0x0C => {
+            0x0A..=0x0C => {
                 let blank = self.blank_cell();
+                let row = self.grid.cursor_row();
+                let (top, bottom) = self.grid.scroll_region();
                 self.grid.linefeed_with(blank);
-                self.damage.mark_all();
+                if row == bottom {
+                    self.damage.mark_scroll(top, bottom, 1);
+                }
             }
+            // SO / SI - switch between G1 / G0 character sets
+            0x0E => *self.active_charset = CharsetSlot::G1,
+            0x0F => *self.active_charset = CharsetSlot::G0,
             // CR
             0x0D => {
                 self.grid.carriage_return();
@@ -681,12 +720,21 @@ impl<'a> vte::Perform for Performer<'a> {
                 let blank = self.blank_cell();
                 let mode = Self::param_zero_ok(params, 0, 0);
                 match mode {
-                    0 => self.grid.erase_below_with(blank),
-                    1 => self.grid.erase_above_with(blank),
-                    2 | 3 => self.grid.erase_all_with(blank),
+                    0 => {
+                        self.grid.erase_below_with(blank);
+                        self.damage
+                            .mark_rows(self.grid.cursor_row(), self.grid.rows().saturating_sub(1));
+                    }
+                    1 => {
+                        self.grid.erase_above_with(blank);
+                        self.damage.mark_rows(0, self.grid.cursor_row());
+                    }
+                    2 | 3 => {
+                        self.grid.erase_all_with(blank);
+                        self.damage.mark_all();
+                    }
                     _ => {}
                 }
-                self.damage.mark_all();
             }
             // EL – Erase in Line
             'K' => {
@@ -733,15 +781,19 @@ impl<'a> vte::Perform for Performer<'a> {
             'S' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let blank = self.blank_cell();
+                let (top, bottom) = self.grid.scroll_region();
+                let lines = n.min(bottom.saturating_sub(top).saturating_add(1));
                 self.grid.scroll_up_with(n, blank);
-                self.damage.mark_all();
+                self.damage.mark_scroll(top, bottom, lines);
             }
             // SD – Scroll Down
             'T' => {
                 let n = Self::param(params, 0, 1) as usize;
                 let blank = self.blank_cell();
+                let (top, bottom) = self.grid.scroll_region();
+                let lines = n.min(bottom.saturating_sub(top).saturating_add(1));
                 self.grid.scroll_down_with(n, blank);
-                self.damage.mark_all();
+                self.damage.mark_scroll(top, bottom, lines);
             }
             // VPA – Vertical Position Absolute
             'd' => {
@@ -900,6 +952,11 @@ impl<'a> vte::Perform for Performer<'a> {
     // ------ ESC dispatch -------------------------------------------------
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         match (byte, intermediates) {
+            // Designate G0/G1 character set
+            (b'0', [b'(']) => *self.g0_charset = DecCharset::DecSpecialGraphics,
+            (b'B', [b'(']) => *self.g0_charset = DecCharset::Ascii,
+            (b'0', [b')']) => *self.g1_charset = DecCharset::DecSpecialGraphics,
+            (b'B', [b')']) => *self.g1_charset = DecCharset::Ascii,
             // DECSC – Save Cursor
             (b'7', []) => {
                 self.grid.save_cursor();
@@ -911,14 +968,22 @@ impl<'a> vte::Perform for Performer<'a> {
             // RI – Reverse Index (scroll down if cursor is at the top of scroll region)
             (b'M', []) => {
                 let blank = self.blank_cell();
+                let row = self.grid.cursor_row();
+                let (top, bottom) = self.grid.scroll_region();
                 self.grid.reverse_index_with(blank);
-                self.damage.mark_all();
+                if row == top {
+                    self.damage.mark_scroll(top, bottom, 1);
+                }
             }
             // IND – Index (like linefeed)
             (b'D', []) => {
                 let blank = self.blank_cell();
+                let row = self.grid.cursor_row();
+                let (top, bottom) = self.grid.scroll_region();
                 self.grid.linefeed_with(blank);
-                self.damage.mark_all();
+                if row == bottom {
+                    self.damage.mark_scroll(top, bottom, 1);
+                }
             }
             _ => {
                 // Unhandled escape – ignore
@@ -939,13 +1004,18 @@ impl<'a> vte::Perform for Performer<'a> {
 
         match cmd {
             // 0: Set icon name + title, 1: Set icon name, 2: Set title
-            Some(0) | Some(1) | Some(2) => {
+            Some(0..=2) => {
                 if params.len() >= 2 {
-                    let title = params[1..]
-                        .iter()
-                        .filter_map(|param| std::str::from_utf8(param).ok())
-                        .collect::<Vec<_>>()
-                        .join(";");
+                    let mut title = String::new();
+                    for param in &params[1..] {
+                        let Some(part) = std::str::from_utf8(param).ok() else {
+                            continue;
+                        };
+                        if !title.is_empty() {
+                            title.push(';');
+                        }
+                        title.push_str(part);
+                    }
                     *self.title = Some(title);
                 }
             }
@@ -983,8 +1053,7 @@ impl<'a> vte::Perform for Performer<'a> {
                 }
             }
             // 10/11/12: foreground/background/cursor dynamic colors.
-            Some(10) | Some(11) | Some(12) => {
-                let mut dynamic_code = cmd.unwrap();
+            Some(mut dynamic_code @ 10..=12) => {
                 for param in &params[1..] {
                     let Some(spec) = std::str::from_utf8(param).ok() else {
                         dynamic_code += 1;
@@ -1017,7 +1086,9 @@ impl<'a> vte::Perform for Performer<'a> {
                 }
             }
             // 110/111/112: reset dynamic foreground/background/cursor.
-            Some(110) | Some(111) | Some(112) => self.reset_dynamic_color(cmd.unwrap()),
+            Some(dynamic_code @ 110..=112) => {
+                self.reset_dynamic_color(dynamic_code);
+            }
             _ => {
                 // Unhandled OSC – ignore
             }
@@ -1029,6 +1100,37 @@ impl<'a> vte::Perform for Performer<'a> {
     }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
+}
+
+fn map_dec_special_graphics(ch: char) -> char {
+    match ch {
+        '`' => '◆',
+        'a' => '▒',
+        'f' => '°',
+        'g' => '±',
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'o' => '⎺',
+        'p' => '⎻',
+        'q' => '─',
+        'r' => '⎼',
+        's' => '⎽',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        _ => ch,
+    }
 }
 
 #[cfg(test)]
@@ -1139,16 +1241,16 @@ mod tests {
 
     #[test]
     fn sgr_reset_clears_all() {
-        let (mut p, mut g, mut d) = setup(10, 2);
-        p.advance(&mut g, &mut d, b"\x1b[1;3;4;7mX\x1b[0mY");
-        let x = g.cell(0, 0);
-        assert!(x.flags.contains(CellFlags::BOLD));
-        assert!(x.flags.contains(CellFlags::ITALIC));
-        let y = g.cell(1, 0);
-        assert!(!y.flags.contains(CellFlags::BOLD));
-        assert!(!y.flags.contains(CellFlags::ITALIC));
-        assert!(!y.flags.contains(CellFlags::UNDERLINE));
-        assert!(!y.flags.contains(CellFlags::REVERSE));
+        let (mut parser, mut grid, mut damage) = setup(10, 2);
+        parser.advance(&mut grid, &mut damage, b"\x1b[1;3;4;7mX\x1b[0mY");
+        let first = grid.cell(0, 0);
+        assert!(first.flags.contains(CellFlags::BOLD));
+        assert!(first.flags.contains(CellFlags::ITALIC));
+        let second = grid.cell(1, 0);
+        assert!(!second.flags.contains(CellFlags::BOLD));
+        assert!(!second.flags.contains(CellFlags::ITALIC));
+        assert!(!second.flags.contains(CellFlags::UNDERLINE));
+        assert!(!second.flags.contains(CellFlags::REVERSE));
     }
 
     #[test]
@@ -1709,5 +1811,26 @@ mod tests {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b[?1003h");
         assert_eq!(p.mouse_state().mode, MouseMode::Motion);
+    }
+
+    #[test]
+    fn dec_special_graphics_maps_g0_printables() {
+        let (mut p, mut g, mut d) = setup(8, 2);
+        p.advance(&mut g, &mut d, b"\x1b(0lqk");
+        assert_eq!(g.cell(0, 0).character(), '┌');
+        assert_eq!(g.cell(1, 0).character(), '─');
+        assert_eq!(g.cell(2, 0).character(), '┐');
+    }
+
+    #[test]
+    fn dec_special_graphics_shift_out_and_in_switch_g1_and_g0() {
+        let (mut p, mut g, mut d) = setup(8, 2);
+        p.advance(&mut g, &mut d, b"\x1b)0\x0elqk\x0fABC");
+        assert_eq!(g.cell(0, 0).character(), '┌');
+        assert_eq!(g.cell(1, 0).character(), '─');
+        assert_eq!(g.cell(2, 0).character(), '┐');
+        assert_eq!(g.cell(3, 0).character(), 'A');
+        assert_eq!(g.cell(4, 0).character(), 'B');
+        assert_eq!(g.cell(5, 0).character(), 'C');
     }
 }
