@@ -66,6 +66,7 @@ impl Selection {
         self.state = SelectionState::Selecting;
         self.start = GridPoint::new(col, row);
         self.end = GridPoint::new(col, row);
+        ensures!(self.state == SelectionState::Selecting);
     }
 
     /// Update the end point of the selection (e.g., on mouse drag).
@@ -92,6 +93,7 @@ impl Selection {
         self.state = SelectionState::None;
         self.start = GridPoint::new(0, 0);
         self.end = GridPoint::new(0, 0);
+        ensures!(self.state == SelectionState::None);
     }
 
     /// Returns true if there is an active selection (either selecting or selected).

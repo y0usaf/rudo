@@ -1,6 +1,8 @@
 //! Damage tracking - only re-render what changed.
 //! Inspired by foot's per-row dirty tracking with bitset.
 
+use crate::contracts::CheckInvariant;
+
 /// Tracks which rows need re-rendering.
 #[derive(Clone, Debug)]
 pub struct DamageTracker {
@@ -20,6 +22,7 @@ impl DamageTracker {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn row_bit(row: usize) -> (usize, u64) {
         (row / 64, 1u64 << (row % 64))
     }
@@ -32,14 +35,19 @@ impl DamageTracker {
         }
     }
 
-    #[inline]
+    /// # Contracts
+    /// - **requires**: `row < self.num_rows` (or full_damage, in which case it's a no-op)
+    #[inline(always)]
     pub fn mark_row(&mut self, row: usize) {
         if self.full_damage || row >= self.num_rows {
             return;
         }
-
-        let (word, bit) = Self::row_bit(row);
-        self.dirty[word] |= bit;
+        let word = row >> 6;
+        requires!(word < self.dirty.len(),
+            "mark_row: word index ({}) >= dirty.len() ({})", word, self.dirty.len());
+        // SAFETY: word = row/64, and dirty.len() == ceil(num_rows/64).
+        //         Since row < num_rows, word < dirty.len().
+        unsafe { *self.dirty.get_unchecked_mut(word) |= 1u64 << (row & 63); }
     }
 
     #[inline]
@@ -164,9 +172,18 @@ impl DamageTracker {
     }
 }
 
+impl CheckInvariant for DamageTracker {
+    fn check_invariant(&self) {
+        let expected_words = self.num_rows.div_ceil(64);
+        invariant!(self.dirty.len() == expected_words,
+            "dirty.len() ({}) != ceil(num_rows/64) ({})", self.dirty.len(), expected_words);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::DamageTracker;
+    use crate::contracts::CheckInvariant;
 
     #[test]
     fn mark_rows_handles_single_and_multi_word_ranges() {
@@ -230,5 +247,34 @@ mod tests {
 
         assert!(damage.is_full_damage());
         assert_eq!(damage.dirty_row_ranges(), before);
+    }
+
+    // ── Contract / invariant tests ──────────────────────────────────────
+
+    #[test]
+    fn invariant_after_construction() {
+        let d = DamageTracker::new(130);
+        d.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_resize() {
+        let mut d = DamageTracker::new(64);
+        d.resize(200);
+        d.check_invariant();
+        d.resize(1);
+        d.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_mark_and_clear() {
+        let mut d = DamageTracker::new(128);
+        d.clear();
+        d.mark_row(0);
+        d.mark_row(127);
+        d.mark_rows(30, 90);
+        d.check_invariant();
+        d.clear();
+        d.check_invariant();
     }
 }

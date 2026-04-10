@@ -1,6 +1,7 @@
 //! Compact terminal cell representation.
 //! Inspired by foot's 12-byte cell design for cache efficiency.
 
+use crate::contracts::CheckInvariant;
 use crate::defaults::{DEFAULT_BACKGROUND_RGB, DEFAULT_FOREGROUND_RGB};
 
 /// Cell text attributes packed into 2 bytes.
@@ -143,6 +144,19 @@ impl Cell {
 
     pub fn clear_dirty(&mut self) {
         self.flags.remove(CellFlags::DIRTY);
+    }
+}
+
+impl CheckInvariant for Cell {
+    fn check_invariant(&self) {
+        invariant!(
+            !(self.flags.contains(CellFlags::WIDE) && self.flags.contains(CellFlags::WIDE_SPACER)),
+            "Cell cannot be both WIDE and WIDE_SPACER"
+        );
+        invariant!(
+            self.fg.0 & 0xFF00_0000 == 0 && self.bg.0 & 0xFF00_0000 == 0,
+            "PackedColor upper byte must be zero"
+        );
     }
 }
 

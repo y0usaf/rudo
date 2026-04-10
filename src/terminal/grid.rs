@@ -1,6 +1,7 @@
 //! Terminal grid with circular buffer, scrollback, alternate screen, and scroll regions.
 
 use super::cell::Cell;
+use crate::contracts::CheckInvariant;
 
 pub const DEFAULT_TAB_WIDTH: usize = 8;
 
@@ -21,10 +22,7 @@ impl Row {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.clear_with(Cell::default());
-    }
-
+    #[inline]
     pub fn clear_with(&mut self, blank: Cell) {
         let mut blank = blank;
         blank.mark_dirty();
@@ -249,7 +247,7 @@ impl Grid {
         let screen_cols = cols.max(1);
         let num_rows = row_capacity(screen_rows, max_scrollback);
         let row_buf = vec![Row::new(screen_cols); num_rows];
-        Self {
+        let grid = Self {
             cursor: CursorState::default(),
             rows: row_buf,
             num_rows,
@@ -264,7 +262,9 @@ impl Grid {
             saved_grid: None,
             alternate_active: false,
             view_offset: 0,
-        }
+        };
+        debug_check_invariant!(grid);
+        grid
     }
 
     // ── Dimensions ───────────────────────────────────────────────────────
@@ -287,24 +287,24 @@ impl Grid {
     // ── Internal helpers ─────────────────────────────────────────────────
 
     /// Map a visible-screen row index to the circular buffer index.
-    #[inline]
+    #[inline(always)]
     fn abs_row(&self, row: usize) -> usize {
         (self.offset + row) & (self.num_rows - 1)
     }
 
     /// Clamp a column value to the valid range.
-    #[inline]
+    #[inline(always)]
     fn clamp_col(&self, col: usize) -> usize {
         col.min(self.screen_cols.saturating_sub(1))
     }
 
-    #[inline]
+    #[inline(always)]
     fn view_abs_row(&self, row: usize) -> usize {
         (self.offset.wrapping_sub(self.view_offset) + row) & (self.num_rows - 1)
     }
 
     /// Clamp a row value to the valid range.
-    #[inline]
+    #[inline(always)]
     fn clamp_row(&self, row: usize) -> usize {
         row.min(self.screen_rows.saturating_sub(1))
     }
@@ -312,21 +312,32 @@ impl Grid {
     // ── Row / Cell access ────────────────────────────────────────────────
 
     /// Get an immutable reference to a cell.
-    #[inline]
+    ///
+    /// # Contracts
+    /// - **requires**: `row < self.screen_rows`
+    /// - **requires**: `col < self.screen_cols`
+    #[inline(always)]
     pub fn cell(&self, col: usize, row: usize) -> &Cell {
+        requires!(row < self.screen_rows, "cell: row ({}) >= screen_rows ({})", row, self.screen_rows);
+        requires!(col < self.screen_cols, "cell: col ({}) >= screen_cols ({})", col, self.screen_cols);
         let idx = self.abs_row(row);
-        debug_assert!(idx < self.rows.len());
-        debug_assert!(col < self.rows[idx].cells.len());
-        &self.rows[idx].cells[col]
+        // SAFETY: idx = (offset + row) & (num_rows-1), always < rows.len().
+        //         col < screen_cols == rows[idx].cells.len() (invariant).
+        unsafe { self.rows.get_unchecked(idx).cells.get_unchecked(col) }
     }
 
     /// Get a mutable reference to a cell.
-    #[inline]
+    ///
+    /// # Contracts
+    /// - **requires**: `row < self.screen_rows`
+    /// - **requires**: `col < self.screen_cols`
+    #[inline(always)]
     pub fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
+        requires!(row < self.screen_rows, "cell_mut: row ({}) >= screen_rows ({})", row, self.screen_rows);
+        requires!(col < self.screen_cols, "cell_mut: col ({}) >= screen_cols ({})", col, self.screen_cols);
         let idx = self.abs_row(row);
-        debug_assert!(idx < self.rows.len());
-        debug_assert!(col < self.rows[idx].cells.len());
-        let cell = &mut self.rows[idx].cells[col];
+        // SAFETY: same as cell() above.
+        let cell = unsafe { self.rows.get_unchecked_mut(idx).cells.get_unchecked_mut(col) };
         cell.mark_dirty();
         cell
     }
@@ -346,6 +357,10 @@ impl Grid {
     #[inline]
     pub fn cursor_visible(&self) -> bool {
         self.cursor.visible
+    }
+
+    pub fn is_alternate_active(&self) -> bool {
+        self.alternate_active
     }
 
     #[inline]
@@ -431,7 +446,14 @@ impl Grid {
 
     /// Scroll the scroll region up by `lines` lines. New blank lines appear at the bottom
     /// of the scroll region.
+    ///
+    /// # Contracts
+    /// - **requires**: `scroll_top <= scroll_bottom < screen_rows`
+    /// - **ensures**: ring buffer and scrollback remain consistent
+    #[inline(never)]
     pub fn scroll_up_with(&mut self, lines: usize, blank: Cell) {
+        requires!(self.scroll_top <= self.scroll_bottom);
+        requires!(self.scroll_bottom < self.screen_rows);
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
         let region_size = bot - top + 1;
@@ -441,13 +463,16 @@ impl Grid {
         }
 
         if top == 0 && bot == self.screen_rows - 1 && !self.alternate_active {
-            // Full-screen scroll: advance offset (old top rows become scrollback).
-            for _ in 0..lines {
-                self.offset = (self.offset + 1) & (self.num_rows - 1);
-                self.scrollback_lines = (self.scrollback_lines + 1).min(self.max_scrollback);
-                // Clear the new bottom row.
-                let bottom_abs = self.abs_row(self.screen_rows - 1);
-                self.rows[bottom_abs].clear_with(blank);
+            // Full-screen scroll: advance the ring once and clear only the new
+            // bottom rows instead of iterating one line at a time.
+            self.offset = (self.offset + lines) & (self.num_rows - 1);
+            self.scrollback_lines = self
+                .scrollback_lines
+                .saturating_add(lines)
+                .min(self.max_scrollback);
+            for r in self.screen_rows.saturating_sub(lines)..self.screen_rows {
+                let idx = self.abs_row(r);
+                self.rows[idx].clear_with(blank);
             }
         } else {
             // Scroll region: use rotate_left on the physical slice if contiguous,
@@ -482,7 +507,13 @@ impl Grid {
 
     /// Scroll the scroll region down by `lines` lines. New blank lines appear at the top
     /// of the scroll region.
+    ///
+    /// # Contracts
+    /// - **requires**: `scroll_top <= scroll_bottom < screen_rows`
+    #[inline(never)]
     pub fn scroll_down_with(&mut self, lines: usize, blank: Cell) {
+        requires!(self.scroll_top <= self.scroll_bottom);
+        requires!(self.scroll_bottom < self.screen_rows);
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
         let region_size = bot - top + 1;
@@ -602,6 +633,10 @@ impl Grid {
     }
 
     /// Set the scroll region (0-based, inclusive top and bottom).
+    ///
+    /// # Contracts
+    /// - **ensures**: `scroll_top < scroll_bottom < screen_rows`
+    /// - **ensures**: cursor at (0, 0)
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         let t = top.min(self.screen_rows.saturating_sub(1));
         let b = bottom.min(self.screen_rows.saturating_sub(1));
@@ -612,6 +647,8 @@ impl Grid {
         // Per DEC spec: setting scroll region moves cursor to home.
         self.cursor.col = 0;
         self.cursor.row = 0;
+        ensures!(self.scroll_top <= self.scroll_bottom);
+        ensures!(self.scroll_bottom < self.screen_rows);
     }
 
     // ── Erase operations ─────────────────────────────────────────────────
@@ -754,9 +791,14 @@ impl Grid {
             return;
         }
 
-        // Save current state.
+        // Save current state by moving the main-screen row store out whole.
+        // This avoids cloning the entire scrollback/cell buffer on every alt-screen enter.
+        let saved_rows = std::mem::replace(
+            &mut self.rows,
+            vec![Row::new(self.screen_cols); self.num_rows],
+        );
         let saved = SavedGrid {
-            rows: self.rows.clone(),
+            rows: saved_rows,
             num_rows: self.num_rows,
             offset: self.offset,
             cursor: self.cursor,
@@ -769,8 +811,7 @@ impl Grid {
         self.saved_grid = Some(Box::new(saved));
         self.alternate_active = true;
 
-        // Reset to a fresh screen (same buffer size, but cleared visible area).
-        // Re-use the existing buffer to avoid allocation; just clear visible rows and reset offset.
+        // Reset to a fresh blank screen with no scrollback.
         self.offset = 0;
         self.scrollback_lines = 0;
         self.scroll_top = 0;
@@ -779,10 +820,7 @@ impl Grid {
         self.saved_cursor = CursorState::default();
         self.view_offset = 0;
 
-        // Clear all rows in the buffer for alternate screen (no scrollback).
-        for row in &mut self.rows {
-            row.clear();
-        }
+        debug_check_invariant!(self);
     }
 
     /// Leave the alternate screen buffer, restoring the main screen.
@@ -804,6 +842,8 @@ impl Grid {
         }
         self.alternate_active = false;
         self.view_offset = 0;
+
+        debug_check_invariant!(self);
 
         // Mark all visible rows dirty so they get redrawn.
         mark_rows_dirty(
@@ -856,10 +896,14 @@ impl Grid {
         self.view_offset > 0
     }
 
-    #[inline]
+    /// # Contracts
+    /// - **requires**: `row < self.screen_rows`
+    #[inline(always)]
     pub fn view_row_cells(&self, row: usize) -> &[Cell] {
+        requires!(row < self.screen_rows, "view_row_cells: row ({}) >= screen_rows ({})", row, self.screen_rows);
         let abs = self.view_abs_row(row);
-        &self.rows[abs].cells
+        // SAFETY: abs = (offset - view_offset + row) & (num_rows-1), always < rows.len().
+        unsafe { self.rows.get_unchecked(abs).cells() }
     }
 
     #[inline]
@@ -975,12 +1019,67 @@ impl Grid {
             self.offset,
             self.num_rows,
         );
+
+        debug_check_invariant!(self);
+    }
+}
+
+// ─── Contracts ───────────────────────────────────────────────────────────────
+
+impl CheckInvariant for Grid {
+    fn check_invariant(&self) {
+        // Ring buffer structure
+        invariant!(self.num_rows.is_power_of_two(),
+            "num_rows ({}) must be power of 2", self.num_rows);
+        invariant!(self.rows.len() == self.num_rows,
+            "rows.len() ({}) != num_rows ({})", self.rows.len(), self.num_rows);
+        invariant!(self.offset < self.num_rows,
+            "offset ({}) >= num_rows ({})", self.offset, self.num_rows);
+
+        // Screen dimensions
+        invariant!(self.screen_rows >= 1, "screen_rows must be >= 1");
+        invariant!(self.screen_cols >= 1, "screen_cols must be >= 1");
+        invariant!(self.screen_rows <= self.num_rows,
+            "screen_rows ({}) > num_rows ({})", self.screen_rows, self.num_rows);
+
+        // Scroll region
+        invariant!(self.scroll_top <= self.scroll_bottom,
+            "scroll_top ({}) > scroll_bottom ({})", self.scroll_top, self.scroll_bottom);
+        invariant!(self.scroll_bottom < self.screen_rows,
+            "scroll_bottom ({}) >= screen_rows ({})", self.scroll_bottom, self.screen_rows);
+
+        // Cursor bounds
+        invariant!(self.cursor.row < self.screen_rows,
+            "cursor.row ({}) >= screen_rows ({})", self.cursor.row, self.screen_rows);
+        // col can be == screen_cols when a wrap is pending (autowrap)
+        invariant!(self.cursor.col <= self.screen_cols,
+            "cursor.col ({}) > screen_cols ({})", self.cursor.col, self.screen_cols);
+
+        // Saved cursor bounds (clamped to current dimensions)
+        invariant!(self.saved_cursor.row < self.screen_rows,
+            "saved_cursor.row ({}) >= screen_rows ({})", self.saved_cursor.row, self.screen_rows);
+        invariant!(self.saved_cursor.col <= self.screen_cols,
+            "saved_cursor.col ({}) > screen_cols ({})", self.saved_cursor.col, self.screen_cols);
+
+        // Scrollback
+        invariant!(self.scrollback_lines <= self.max_scrollback,
+            "scrollback_lines ({}) > max_scrollback ({})", self.scrollback_lines, self.max_scrollback);
+        invariant!(self.view_offset <= self.scrollback_lines,
+            "view_offset ({}) > scrollback_lines ({})", self.view_offset, self.scrollback_lines);
+
+        // Row cell count consistency
+        for (i, row) in self.rows.iter().enumerate() {
+            invariant!(row.cells.len() == self.screen_cols,
+                "row[{}].cells.len() ({}) != screen_cols ({})", i, row.cells.len(), self.screen_cols);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::cell::Cell;
+    use crate::contracts::CheckInvariant;
 
     #[test]
     fn test_new_grid_dimensions() {
@@ -1028,6 +1127,22 @@ mod tests {
         // After scroll, cursor should still be at bottom.
         assert_eq!(g.cursor.row, 23);
         assert_eq!(g.scrollback_count(), 1);
+    }
+
+    #[test]
+    fn test_full_screen_multi_line_scroll_uses_single_ring_advance() {
+        let mut g = Grid::new(1, 4);
+        for (row, ch) in ['A', 'B', 'C', 'D'].into_iter().enumerate() {
+            g.cell_mut(0, row).ch = ch as u32;
+        }
+
+        g.scroll_up_with(2, Cell::default());
+
+        assert_eq!(g.scrollback_count(), 2);
+        assert_eq!(g.cell(0, 0).ch, 'C' as u32);
+        assert_eq!(g.cell(0, 1).ch, 'D' as u32);
+        assert_eq!(g.cell(0, 2).ch, ' ' as u32);
+        assert_eq!(g.cell(0, 3).ch, ' ' as u32);
     }
 
     #[test]
@@ -1364,5 +1479,161 @@ mod tests {
 
         // Cursor line ('d') should still be visible and the content above it preserved.
         assert_eq!(g.cell(0, g.cursor.row).ch, 'd' as u32);
+    }
+
+    // ── Contract / invariant tests ───────────────────────────────────────
+
+    #[test]
+    fn invariant_after_construction() {
+        let g = Grid::new(80, 24);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_construction_small() {
+        let g = Grid::new(1, 1);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_resize_grow() {
+        let mut g = Grid::new(80, 24);
+        g.resize(120, 48);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_resize_shrink() {
+        let mut g = Grid::new(80, 24);
+        g.set_cursor(0, 23);
+        // Generate some scrollback first.
+        for _ in 0..30 {
+            g.linefeed();
+        }
+        g.resize(40, 10);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_scroll_up() {
+        let mut g = Grid::new(80, 24);
+        g.scroll_up_with(5, Cell::default());
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_scroll_down() {
+        let mut g = Grid::new(80, 24);
+        g.scroll_down_with(5, Cell::default());
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_scroll_region_ops() {
+        let mut g = Grid::new(80, 24);
+        g.set_scroll_region(5, 15);
+        g.check_invariant();
+        g.scroll_up_with(3, Cell::default());
+        g.check_invariant();
+        g.scroll_down_with(2, Cell::default());
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_alternate_screen_roundtrip() {
+        let mut g = Grid::new(80, 24);
+        g.set_cursor(10, 5);
+        g.enter_alternate_screen();
+        g.check_invariant();
+        g.set_cursor(3, 3);
+        g.leave_alternate_screen();
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_heavy_scrolling() {
+        let mut g = Grid::new(80, 24);
+        for _ in 0..500 {
+            g.set_cursor(0, 23);
+            g.linefeed();
+        }
+        g.check_invariant();
+        assert!(g.scrollback_count() > 0);
+    }
+
+    #[test]
+    fn invariant_after_insert_delete_lines() {
+        let mut g = Grid::new(80, 24);
+        g.set_scroll_region(5, 20);
+        g.insert_lines_at(10, 3);
+        g.check_invariant();
+        g.delete_lines_at(8, 5);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_erase_operations() {
+        let mut g = Grid::new(80, 24);
+        g.set_cursor(40, 12);
+        g.erase_to_end_of_line();
+        g.check_invariant();
+        g.erase_to_start_of_line();
+        g.check_invariant();
+        g.erase_all();
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_resize_to_1x1() {
+        let mut g = Grid::new(80, 24);
+        g.set_cursor(10, 10);
+        g.resize(1, 1);
+        g.check_invariant();
+    }
+
+    #[test]
+    fn invariant_after_resize_sequence() {
+        let mut g = Grid::new(80, 24);
+        // Simulate rapid resize events.
+        for (c, r) in [(120, 40), (20, 5), (200, 60), (80, 24)] {
+            g.resize(c, r);
+            g.check_invariant();
+        }
+    }
+
+    #[test]
+    fn invariant_scroll_view_offset() {
+        let mut g = Grid::new(80, 24);
+        for _ in 0..100 {
+            g.set_cursor(0, 23);
+            g.linefeed();
+        }
+        g.scroll_view_up(50);
+        g.check_invariant();
+        g.scroll_view_down(20);
+        g.check_invariant();
+        g.reset_view();
+        g.check_invariant();
+    }
+
+    #[test]
+    #[should_panic(expected = "precondition violated")]
+    fn contract_cell_row_oob() {
+        let g = Grid::new(80, 24);
+        let _ = g.cell(0, 24); // row == screen_rows → panic
+    }
+
+    #[test]
+    #[should_panic(expected = "precondition violated")]
+    fn contract_cell_col_oob() {
+        let g = Grid::new(80, 24);
+        let _ = g.cell(80, 0); // col == screen_cols → panic
+    }
+
+    #[test]
+    #[should_panic(expected = "precondition violated")]
+    fn contract_view_row_cells_oob() {
+        let g = Grid::new(80, 24);
+        let _ = g.view_row_cells(24);
     }
 }
