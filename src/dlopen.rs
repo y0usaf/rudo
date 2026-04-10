@@ -10,7 +10,7 @@ impl DlLibrary {
     pub(crate) fn open_any(names: &[&[u8]]) -> Option<Self> {
         for name in names {
             let handle =
-                unsafe { libc::dlopen(name.as_ptr().cast(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+                unsafe { libc::dlopen(name.as_ptr().cast(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if !handle.is_null() {
                 return Some(Self { handle });
             }
@@ -69,6 +69,6 @@ union SymbolCast<T> {
 }
 
 unsafe fn symbol_cast<T>(ptr: *mut c_void) -> T {
-    debug_assert_eq!(mem::size_of::<T>(), mem::size_of::<*mut c_void>());
+    assert_eq!(mem::size_of::<T>(), mem::size_of::<*mut c_void>());
     unsafe { ManuallyDrop::into_inner(SymbolCast { raw: ptr }.typed) }
 }

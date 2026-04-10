@@ -44,7 +44,14 @@
       useMold = pkgs.stdenv.isLinux;
 
       commonArgs = {
-        src = craneLib.cleanCargoSource ./.;
+        src = let
+          xmlFilter = path: _type: builtins.match ".*\\.xml$" path != null;
+          srcFilter = path: type:
+            (xmlFilter path type) || (craneLib.filterCargoSources path type);
+        in lib.cleanSourceWith {
+          src = ./.;
+          filter = srcFilter;
+        };
         strictDeps = true;
 
         nativeBuildInputs = with pkgs;

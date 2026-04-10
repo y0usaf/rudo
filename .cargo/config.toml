@@ -1,0 +1,13 @@
+[build]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "force-frame-pointers=no",
+    "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "force-frame-pointers=no",
+    "-C", "link-arg=-Wl,-z,relro,-z,now,-z,noexecstack",
+]

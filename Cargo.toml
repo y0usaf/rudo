@@ -30,10 +30,23 @@ debug = 1            # line tables only (faster builds + linking)
 opt-level = 0        # don't optimize deps - faster compile
 
 [profile.release]
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+debug = 0
+debug-assertions = false
+overflow-checks = false
+incremental = false
+split-debuginfo = "off"
+rpath = false
+
+[profile.release.build-override]
+opt-level = 3
 
 [profile.maxperf]
 inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
