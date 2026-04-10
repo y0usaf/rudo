@@ -13,12 +13,14 @@ pub(crate) mod input;
 pub(crate) mod keybindings;
 pub(crate) mod logging;
 pub(crate) mod platform;
+pub(crate) mod protocols;
 pub(crate) mod pty;
 pub(crate) mod renderer_font;
 pub(crate) mod software_renderer;
 pub(crate) mod terminal;
 pub(crate) mod toml_parser;
 pub(crate) mod xkb_ffi;
+
 
 /// Library entry point — parses CLI args, installs signal handlers, and runs
 /// the Wayland event loop. This is the only public API surface.

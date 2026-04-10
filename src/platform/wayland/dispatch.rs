@@ -10,14 +10,14 @@ use wayland_client::{
     },
     Connection, Dispatch, QueueHandle, WEnum,
 };
-use wayland_protocols::wp::fractional_scale::v1::client::{
+use crate::protocols::fractional_scale::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::decoration::zv1::client::{
+use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
+use crate::protocols::xdg_decoration::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::info_log;
 use crate::input::Key;

@@ -11,7 +11,9 @@ categories = ["command-line-utilities", "gui"]
 [dependencies]
 # Wayland-only software frontend
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+bitflags = "2"
 
 # Terminal
 vte = "0.15"
