@@ -1,6 +1,7 @@
 //! TOML-based configuration system for rudo.
 //! Loads from ~/.config/rudo/config.toml, with legacy config-path fallback.
 
+use crate::contracts::CheckInvariant;
 use crate::defaults::{
     APP_NAME, CONFIG_FILE_NAME, DEFAULT_ANSI_HEX, DEFAULT_BACKGROUND_HEX, DEFAULT_BOLD_IS_BRIGHT,
     DEFAULT_COLORTERM, DEFAULT_CURSOR_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_BLINK_ENABLED,
@@ -404,8 +405,30 @@ impl Config {
         self.window.initial_height = self.window.initial_height.max(1);
         self.terminal.cols = self.terminal.cols.max(2);
         self.terminal.rows = self.terminal.rows.max(2);
+
+        ensures!(self.font.size >= 1.0);
+        ensures!(self.terminal.cols >= 2);
+        ensures!(self.terminal.rows >= 2);
+        ensures!(self.window.initial_width >= 1);
+        ensures!(self.window.initial_height >= 1);
+        ensures!(self.cursor.blink_interval > 0.0);
+        debug_check_invariant!(self);
     }
 
+}
+
+impl CheckInvariant for Config {
+    fn check_invariant(&self) {
+        invariant!(self.font.size >= 1.0, "font.size must be >= 1.0");
+        invariant!(self.terminal.cols >= 2, "terminal.cols must be >= 2");
+        invariant!(self.terminal.rows >= 2, "terminal.rows must be >= 2");
+        invariant!(self.window.initial_width >= 1, "window.initial_width must be >= 1");
+        invariant!(self.window.initial_height >= 1, "window.initial_height must be >= 1");
+        invariant!(self.cursor.blink_interval > 0.0, "cursor.blink_interval must be > 0.0");
+    }
+}
+
+impl Config {
     /// Returns the primary and legacy config paths, or None if the config
     /// directory cannot be determined.
     fn config_paths() -> Option<(PathBuf, PathBuf)> {
@@ -422,11 +445,14 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
     {
         return Some(xdg);
     }
 
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".config"))
+        .filter(|p| p.is_absolute())
 }
 
 /// Parse a hex color string in "#rrggbb" or "rrggbb" format into (r, g, b).

@@ -36,6 +36,7 @@ impl CriticallyDampedSpring {
     }
 
     pub fn update(&mut self, dt: f32, animation_length: f32) -> bool {
+        requires!(dt >= 0.0);
         if animation_length <= dt {
             self.reset();
             return false;
@@ -109,6 +110,7 @@ impl Corner {
     }
 
     fn update(&mut self, center_x: f32, center_y: f32, cell_w: f32, cell_h: f32, dt: f32) -> bool {
+        requires!(cell_w > 0.0 && cell_h > 0.0 && dt >= 0.0);
         let dest_x = center_x + self.relative_x * cell_w;
         let dest_y = center_y + self.relative_y * cell_h;
         if (dest_x - self.prev_dest_x).abs() > DESTINATION_CHANGE_EPSILON
@@ -145,6 +147,7 @@ impl Corner {
     }
 
     fn set_shape(&mut self, shape: &CursorShape, idx: usize) {
+        requires!(idx < 4);
         let (sx, sy) = STANDARD_CORNERS[idx];
         match shape {
             CursorShape::Block => {
@@ -241,11 +244,15 @@ impl CursorRenderer {
     }
 
     pub fn set_animation_length(&mut self, animation_length: f32) {
+        requires!(animation_length.is_finite());
         self.settings.animation_length = animation_length.max(0.0);
+        ensures!(self.settings.animation_length >= 0.0);
     }
 
     pub fn set_short_animation_length(&mut self, animation_length: f32) {
+        requires!(animation_length.is_finite());
         self.settings.short_animation_length = animation_length.max(0.0);
+        ensures!(self.settings.short_animation_length >= 0.0);
     }
 
     pub fn set_trail_size(&mut self, trail_size: f32) {
@@ -259,8 +266,10 @@ impl CursorRenderer {
     }
 
     pub fn set_blink_interval(&mut self, blink_interval: f32) {
+        requires!(blink_interval.is_finite());
         self.settings.blink_interval = blink_interval.max(0.0);
         self.blink_timer = 0.0;
+        ensures!(self.settings.blink_interval >= 0.0);
     }
 
     pub fn is_visible(&self) -> bool {
@@ -268,6 +277,7 @@ impl CursorRenderer {
     }
 
     pub fn animate(&mut self, cursor_pos: (f32, f32), dt: f32) -> CursorTick {
+        requires!(dt >= 0.0);
         let (col, row) = cursor_pos;
         let moved = (col - self.prev_col).abs() > POSITION_CHANGE_EPSILON
             || (row - self.prev_row).abs() > POSITION_CHANGE_EPSILON;

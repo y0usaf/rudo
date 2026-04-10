@@ -48,3 +48,5 @@ pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
 pub const DEFAULT_CLIPBOARD_COPY_COMMAND: &str = "wl-copy";
 pub const DEFAULT_CLIPBOARD_PASTE_COMMAND: &str = "wl-paste";
+pub const DEFAULT_PRIMARY_COPY_COMMAND: &str = "wl-copy";
+pub const DEFAULT_PRIMARY_PASTE_COMMAND: &str = "wl-paste";

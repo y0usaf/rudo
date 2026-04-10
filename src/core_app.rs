@@ -7,7 +7,10 @@ use crate::{
     cli::CliArgs,
     config::Config,
     cursor::{CursorRenderer, CursorTick},
-    defaults::{DEFAULT_CLIPBOARD_COPY_COMMAND, DEFAULT_CLIPBOARD_PASTE_COMMAND},
+    defaults::{
+        DEFAULT_CLIPBOARD_COPY_COMMAND, DEFAULT_CLIPBOARD_PASTE_COMMAND,
+        DEFAULT_PRIMARY_COPY_COMMAND, DEFAULT_PRIMARY_PASTE_COMMAND,
+    },
     input::{Key, KeyEvent, Modifiers, MouseButton},
     keybindings::LocalAction,
     pty::{Pty, PtySpawnConfig},
@@ -22,7 +25,7 @@ use crate::{
 };
 
 /// Number of bytes to read from PTY per iteration
-const PTY_READ_BUFFER_SIZE: usize = 65536;
+const PTY_READ_BUFFER_SIZE: usize = 131072;
 /// Maximum PTY bytes parsed per frame to keep input/render latency bounded.
 const MAX_PTY_BYTES_PER_TICK: usize = PTY_READ_BUFFER_SIZE * 8;
 
@@ -165,6 +168,18 @@ impl CoreApp {
         }
     }
 
+    /// Write text to the PTY, wrapping in bracketed-paste markers when the
+    /// child application has enabled DECSET 2004.
+    fn paste_text(&self, text: &str) {
+        if self.parser.bracketed_paste() {
+            self.write_pty(b"\x1b[200~");
+            self.write_pty(text.as_bytes());
+            self.write_pty(b"\x1b[201~");
+        } else {
+            self.write_pty(text.as_bytes());
+        }
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -208,6 +223,7 @@ impl CoreApp {
     }
 
     pub fn set_cell_size(&mut self, cw: f32, ch: f32) {
+        requires!(cw > 0.0 && ch > 0.0);
         self.cell_size = (cw, ch);
     }
 
@@ -287,7 +303,7 @@ impl CoreApp {
             .matches(LocalAction::Paste, event, self.modifiers)
         {
             if let Some(text) = clipboard_get() {
-                self.write_pty(text.as_bytes());
+                self.paste_text(&text);
             }
             return;
         }
@@ -384,10 +400,20 @@ impl CoreApp {
                 self.mouse_pressed = false;
                 self.mouse_button = None;
                 self.selection.finish_selection();
+                // Copy-on-select to primary selection
+                if self.selection.has_selection() {
+                    let text = self.selection.selected_text(&self.grid);
+                    primary_set(&text);
+                }
             }
             let after = self.selection.snapshot();
             self.mark_selection_change(before, after);
             self.needs_redraw = true;
+        } else if button == MouseButton::Middle && pressed {
+            // Middle-click paste from primary selection
+            if let Some(text) = primary_get() {
+                self.paste_text(&text);
+            }
         }
     }
 
@@ -477,12 +503,31 @@ impl CoreApp {
             self.grid.scroll_view_down(scroll_lines)
         };
         if changed {
+            // Clear selection when viewport scrolls — selection coords are
+            // viewport-relative so they'd highlight the wrong rows otherwise.
+            if self.selection.has_selection() {
+                let before = self.selection.snapshot();
+                self.selection.clear();
+                let after = self.selection.snapshot();
+                self.mark_selection_change(before, after);
+            }
             self.damage.mark_all();
             self.needs_redraw = true;
         }
     }
 
+    pub fn handle_focus_change(&mut self, focused: bool) {
+        if self.parser.focus_reporting() {
+            if focused {
+                self.write_pty(b"\x1b[I");
+            } else {
+                self.write_pty(b"\x1b[O");
+            }
+        }
+    }
+
     pub fn handle_resize(&mut self, cols: usize, rows: usize) {
+        requires!(cols > 0 && rows > 0);
         let (cols, rows) = clamp_grid_size(cols, rows);
         if cols != self.grid.cols() || rows != self.grid.rows() {
             self.grid.resize(cols, rows);
@@ -504,8 +549,13 @@ impl CoreApp {
             needs_redraw: cursor_redraw,
             animating,
         } = self.cursor_renderer.animate(cursor_pos, dt);
-        let redraw_requested =
-            self.needs_redraw || self.damage.has_damage() || cursor_redraw || self.theme_changed;
+        // Synchronized output (mode 2026): suppress rendering while active.
+        let sync_active = self.parser.synchronized_output();
+        let redraw_requested = if sync_active {
+            false
+        } else {
+            self.needs_redraw || self.damage.has_damage() || cursor_redraw || self.theme_changed
+        };
         self.needs_redraw = false;
         TickResult {
             redraw_requested,
@@ -565,6 +615,23 @@ impl CoreApp {
             self.damage.mark_all();
             self.needs_redraw = true;
         }
+        if let Some(shape) = self.parser.take_cursor_shape_request() {
+            // DECSCUSR: 0=default, 1=blinking block, 2=steady block,
+            //           3=blinking underline, 4=steady underline,
+            //           5=blinking beam, 6=steady beam
+            let (cursor_shape, blink) = match shape {
+                0 | 1 => (crate::cursor::CursorShape::Block, true),
+                2 => (crate::cursor::CursorShape::Block, false),
+                3 => (crate::cursor::CursorShape::Underline, true),
+                4 => (crate::cursor::CursorShape::Underline, false),
+                5 => (crate::cursor::CursorShape::Beam, true),
+                6 => (crate::cursor::CursorShape::Beam, false),
+                _ => (crate::cursor::CursorShape::Block, true),
+            };
+            self.cursor_renderer.set_shape(cursor_shape);
+            self.cursor_renderer.set_blink_enabled(blink);
+            self.needs_redraw = true;
+        }
         let title = self.parser.title();
         if title != self.last_title.as_deref() {
             self.last_title = title.map(str::to_string);
@@ -613,7 +680,9 @@ impl CoreApp {
 }
 
 fn clamp_grid_size(cols: usize, rows: usize) -> (usize, usize) {
-    (cols.max(2), rows.max(2))
+    let result = (cols.max(2), rows.max(2));
+    ensures!(result.0 >= 2 && result.1 >= 2);
+    result
 }
 
 fn sanitized_cell_size((cw, ch): (f32, f32)) -> (f32, f32) {
@@ -627,34 +696,91 @@ fn sanitized_cell_size((cw, ch): (f32, f32)) -> (f32, f32) {
     } else {
         DEFAULT_CELL_SIZE.1
     };
-    (cw, ch)
+    let result = (cw, ch);
+    ensures!(result.0 > 0.0 && result.1 > 0.0);
+    result
 }
 
-fn clipboard_set(text: &str) {
-    if let Ok(mut child) = Command::new(DEFAULT_CLIPBOARD_COPY_COMMAND)
+/// Max clipboard payload size (16 MiB).
+const CLIPBOARD_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Timeout for clipboard helper processes.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Pipe `text` into a clipboard helper command and wait (with timeout).
+fn clipboard_pipe(cmd: &str, args: &[&str], text: &str) {
+    let text = &text[..text.len().min(CLIPBOARD_MAX_BYTES)];
+    if let Ok(mut child) = Command::new(cmd)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        if let Some(stdin) = child.stdin.as_mut() {
+        if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
+            drop(stdin);
+        }
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if start.elapsed() >= CLIPBOARD_TIMEOUT => {
+                    let _ = child.kill();
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
         }
     }
 }
 
-fn clipboard_get() -> Option<String> {
-    if let Ok(out) = Command::new(DEFAULT_CLIPBOARD_PASTE_COMMAND)
-        .arg("--no-newline")
+/// Read text from a clipboard helper command (with timeout).
+fn clipboard_read(cmd: &str, args: &[&str]) -> Option<String> {
+    let mut child = Command::new(cmd)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8(out.stdout).ok();
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut buf = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = stdout.read_to_end(&mut buf);
+                }
+                return String::from_utf8(buf)
+                    .ok()
+                    .filter(|s| s.len() <= CLIPBOARD_MAX_BYTES);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if start.elapsed() >= CLIPBOARD_TIMEOUT => {
+                let _ = child.kill();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(_) => return None,
         }
     }
-    None
+}
+
+fn clipboard_set(text: &str) {
+    clipboard_pipe(DEFAULT_CLIPBOARD_COPY_COMMAND, &[], text);
+}
+
+fn clipboard_get() -> Option<String> {
+    clipboard_read(DEFAULT_CLIPBOARD_PASTE_COMMAND, &["--no-newline"])
+}
+
+fn primary_set(text: &str) {
+    clipboard_pipe(DEFAULT_PRIMARY_COPY_COMMAND, &["--primary"], text);
+}
+
+fn primary_get() -> Option<String> {
+    clipboard_read(DEFAULT_PRIMARY_PASTE_COMMAND, &["--primary", "--no-newline"])
 }
 
 #[cfg(test)]
@@ -707,5 +833,35 @@ mod tests {
                 GridPoint::new(6, 4),
             )
         );
+    }
+
+    #[test]
+    fn scroll_clears_selection() {
+        let mut app = test_app();
+        // Fill enough lines to create scrollback history
+        for _ in 0..30 {
+            app.grid.linefeed();
+        }
+        // Create a selection
+        app.handle_mouse_move(10.0, 20.0);
+        app.handle_mouse_button(true, MouseButton::Left);
+        app.handle_mouse_move(50.0, 60.0);
+        assert!(app.selection().has_selection());
+
+        // Scrolling into scrollback should clear selection
+        app.handle_scroll_lines(1.0);
+        assert!(!app.selection().has_selection());
+    }
+
+    #[test]
+    fn selection_finish_releases_with_content() {
+        let mut app = test_app();
+        app.handle_mouse_move(10.0, 20.0);
+        app.handle_mouse_button(true, MouseButton::Left);
+        app.handle_mouse_move(50.0, 60.0);
+        app.handle_mouse_button(false, MouseButton::Left);
+
+        // Selection should be finalized (start != end)
+        assert_eq!(app.selection().state(), SelectionState::Selected);
     }
 }
