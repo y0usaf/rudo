@@ -1,3 +1,5 @@
+#[macro_use]
+pub(crate) mod contracts;
 pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod core_app;
