@@ -7,6 +7,8 @@ use super::grid::Grid;
 use super::mouse::{MouseMode, MouseState};
 use super::theme::Theme;
 
+const MAX_OSC_TEXT_BYTES: usize = 2048;
+
 // ---------------------------------------------------------------------------
 // Color helpers
 // ---------------------------------------------------------------------------
@@ -110,6 +112,14 @@ pub struct TerminalParser {
     mouse_state: MouseState,
     application_cursor_keys: bool,
     origin_mode: bool,
+    bracketed_paste: bool,
+    focus_reporting: bool,
+    synchronized_output: bool,
+    insert_mode: bool,
+    cursor_shape_request: Option<u8>,
+    dcs_data: Vec<u8>,
+    dcs_intermediates: Vec<u8>,
+    dcs_action: char,
     g0_charset: DecCharset,
     g1_charset: DecCharset,
     active_charset: CharsetSlot,
@@ -139,6 +149,14 @@ impl TerminalParser {
             mouse_state: MouseState::new(),
             application_cursor_keys: false,
             origin_mode: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            synchronized_output: false,
+            insert_mode: false,
+            cursor_shape_request: None,
+            dcs_data: Vec::new(),
+            dcs_intermediates: Vec::new(),
+            dcs_action: '\0',
             g0_charset: DecCharset::Ascii,
             g1_charset: DecCharset::Ascii,
             active_charset: CharsetSlot::G0,
@@ -159,6 +177,14 @@ impl TerminalParser {
             mouse_state: &mut self.mouse_state,
             application_cursor_keys: &mut self.application_cursor_keys,
             origin_mode: &mut self.origin_mode,
+            bracketed_paste: &mut self.bracketed_paste,
+            focus_reporting: &mut self.focus_reporting,
+            synchronized_output: &mut self.synchronized_output,
+            insert_mode: &mut self.insert_mode,
+            cursor_shape_request: &mut self.cursor_shape_request,
+            dcs_data: &mut self.dcs_data,
+            dcs_intermediates: &mut self.dcs_intermediates,
+            dcs_action: &mut self.dcs_action,
             g0_charset: &mut self.g0_charset,
             g1_charset: &mut self.g1_charset,
             active_charset: &mut self.active_charset,
@@ -194,6 +220,26 @@ impl TerminalParser {
     pub fn application_cursor_keys(&self) -> bool {
         self.application_cursor_keys
     }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn focus_reporting(&self) -> bool {
+        self.focus_reporting
+    }
+
+    pub fn synchronized_output(&self) -> bool {
+        self.synchronized_output
+    }
+
+    pub fn insert_mode(&self) -> bool {
+        self.insert_mode
+    }
+
+    pub fn take_cursor_shape_request(&mut self) -> Option<u8> {
+        self.cursor_shape_request.take()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +258,14 @@ struct Performer<'a> {
     mouse_state: &'a mut MouseState,
     application_cursor_keys: &'a mut bool,
     origin_mode: &'a mut bool,
+    bracketed_paste: &'a mut bool,
+    focus_reporting: &'a mut bool,
+    synchronized_output: &'a mut bool,
+    insert_mode: &'a mut bool,
+    cursor_shape_request: &'a mut Option<u8>,
+    dcs_data: &'a mut Vec<u8>,
+    dcs_intermediates: &'a mut Vec<u8>,
+    dcs_action: &'a mut char,
     g0_charset: &'a mut DecCharset,
     g1_charset: &'a mut DecCharset,
     active_charset: &'a mut CharsetSlot,
@@ -286,6 +340,7 @@ impl<'a> Performer<'a> {
     // SGR attribute handling
     // -----------------------------------------------------------------------
 
+    #[inline]
     fn handle_sgr(&mut self, params: &vte::Params) {
         // Collect all params into a flat list so we can index freely.
         // Each "parameter group" from vte may contain subparameters (colon-separated).
@@ -408,6 +463,7 @@ impl<'a> Performer<'a> {
     // CSI dispatch helpers
     // -----------------------------------------------------------------------
 
+    #[inline(always)]
     fn param_value(params: &vte::Params, idx: usize) -> Option<u16> {
         for (param_idx, group) in params.iter().enumerate() {
             if param_idx == idx {
@@ -418,6 +474,7 @@ impl<'a> Performer<'a> {
     }
 
     /// Extract the first parameter, defaulting to `default` when absent or 0.
+    #[inline(always)]
     fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
         Self::param_value(params, idx)
             .map(|value| if value == 0 { default } else { value })
@@ -425,6 +482,7 @@ impl<'a> Performer<'a> {
     }
 
     /// Extract the first parameter, defaulting to `default` when absent (0 IS valid).
+    #[inline(always)]
     fn param_zero_ok(params: &vte::Params, idx: usize, default: u16) -> u16 {
         Self::param_value(params, idx).unwrap_or(default)
     }
@@ -468,6 +526,7 @@ impl<'a> Performer<'a> {
 
     /// Build a blank cell that inherits the current SGR background color.
     /// Per VT220/xterm spec, erased cells take on the current background.
+    #[inline(always)]
     fn blank_cell(&self) -> Cell {
         Cell {
             ch: ' ' as u32,
@@ -553,14 +612,14 @@ const PRINT_FLAGS_MASK: CellFlags = CellFlags::from_bits_truncate(
 
 impl<'a> vte::Perform for Performer<'a> {
     // ------ Print a visible character ------------------------------------
-    #[inline]
+    #[inline(always)]
     fn print(&mut self, c: char) {
         let c = self.map_printable_char(c);
         let col = self.grid.cursor_col();
         let cols = self.grid.cols();
 
-        // Determine character width
-        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        // Determine character width (fast path for ASCII)
+        let width = if (c as u32) < 0x300 { 1 } else { unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) };
 
         // Handle autowrap: if we're past the last column, or if a wide character
         // would start in the final column, wrap before printing.
@@ -575,6 +634,12 @@ impl<'a> vte::Perform for Performer<'a> {
 
         if col >= cols {
             return; // safety
+        }
+
+        // Insert mode: shift existing characters right before overwriting
+        if *self.insert_mode {
+            let blank = self.blank_cell();
+            self.grid.insert_chars_with(if width == 2 { 2 } else { 1 }, blank);
         }
 
         // Write the cell
@@ -777,6 +842,21 @@ impl<'a> vte::Perform for Performer<'a> {
                 let n = Self::param(params, 0, 1) as usize;
                 self.erase_chars(n);
             }
+            // REP – Repeat preceding graphic character
+            'b' => {
+                let n = Self::param(params, 0, 1) as usize;
+                let col = self.grid.cursor_col();
+                let row = self.grid.cursor_row();
+                // Find the character just before the cursor
+                if col > 0 {
+                    let prev_ch = self.grid.cell(col - 1, row).character();
+                    if prev_ch != ' ' || self.grid.cell(col - 1, row).ch == ' ' as u32 {
+                        for _ in 0..n {
+                            self.print(prev_ch);
+                        }
+                    }
+                }
+            }
             // SU – Scroll Up
             'S' => {
                 let n = Self::param(params, 0, 1) as usize;
@@ -808,7 +888,10 @@ impl<'a> vte::Perform for Performer<'a> {
             // DSR – Device Status Report
             'n' => {
                 let mode = Self::param_zero_ok(params, 0, 0);
-                if mode == 6 {
+                if mode == 5 {
+                    // Status report: "OK"
+                    self.responses.push(b"\x1b[0n".to_vec());
+                } else if mode == 6 {
                     // Respond with cursor position (1-based). In origin mode, the row is
                     // reported relative to the active scroll region.
                     let row = if *self.origin_mode {
@@ -905,6 +988,18 @@ impl<'a> vte::Perform for Performer<'a> {
                                 1002 => self.mouse_state.mode = MouseMode::Drag,
                                 1003 => self.mouse_state.mode = MouseMode::Motion,
                                 1006 => self.mouse_state.sgr = true,
+                                2004 => *self.bracketed_paste = true,
+                                1004 => *self.focus_reporting = true,
+                                2026 => *self.synchronized_output = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    for group in params.iter() {
+                        if let Some(&mode) = group.first() {
+                            match mode {
+                                4 => *self.insert_mode = true,
                                 _ => {}
                             }
                         }
@@ -936,11 +1031,69 @@ impl<'a> vte::Perform for Performer<'a> {
                                 // Mouse tracking modes
                                 1000 | 1002 | 1003 => self.mouse_state.mode = MouseMode::None,
                                 1006 => self.mouse_state.sgr = false,
+                                2004 => *self.bracketed_paste = false,
+                                1004 => *self.focus_reporting = false,
+                                2026 => *self.synchronized_output = false,
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    for group in params.iter() {
+                        if let Some(&mode) = group.first() {
+                            match mode {
+                                4 => *self.insert_mode = false,
                                 _ => {}
                             }
                         }
                     }
                 }
+            }
+
+            // DECSCUSR – Set Cursor Style (CSI Ps SP q)
+            'q' if intermediates == [b' '] => {
+                let shape = Self::param_zero_ok(params, 0, 0);
+                *self.cursor_shape_request = Some(shape as u8);
+            }
+
+            // DECRQM – Request Mode (CSI ? Ps $ p)
+            'p' if has_question && intermediates.contains(&b'$') => {
+                let mode = Self::param_zero_ok(params, 0, 0);
+                let status = match mode {
+                    1 => if *self.application_cursor_keys { 1 } else { 2 },
+                    6 => if *self.origin_mode { 1 } else { 2 },
+                    7 => 2, // autowrap not tracked yet
+                    25 => if self.grid.cursor_visible() { 1 } else { 2 },
+                    47 | 1047 | 1049 => if self.grid.is_alternate_active() { 1 } else { 2 },
+                    1000 => if self.mouse_state.mode == MouseMode::Click { 1 } else { 2 },
+                    1002 => if self.mouse_state.mode == MouseMode::Drag { 1 } else { 2 },
+                    1003 => if self.mouse_state.mode == MouseMode::Motion { 1 } else { 2 },
+                    1004 => if *self.focus_reporting { 1 } else { 2 },
+                    1006 => if self.mouse_state.sgr { 1 } else { 2 },
+                    2004 => if *self.bracketed_paste { 1 } else { 2 },
+                    2026 => if *self.synchronized_output { 1 } else { 2 },
+                    _ => 0, // not recognized
+                };
+                let response = format!("\x1b[?{};{}$y", mode, status);
+                self.responses.push(response.into_bytes());
+            }
+
+            // DECSTR – Soft Terminal Reset (CSI ! p)
+            'p' if intermediates == [b'!'] => {
+                *self.application_cursor_keys = false;
+                *self.origin_mode = false;
+                *self.bracketed_paste = false;
+                *self.focus_reporting = false;
+                *self.synchronized_output = false;
+                *self.insert_mode = false;
+                self.mouse_state.mode = MouseMode::None;
+                self.mouse_state.sgr = false;
+                self.grid.set_cursor_visible(true);
+                self.grid.set_scroll_region(0, self.grid.rows().saturating_sub(1));
+                self.sgr_reset();
+                *self.g0_charset = DecCharset::Ascii;
+                *self.g1_charset = DecCharset::Ascii;
+                *self.active_charset = CharsetSlot::G0;
             }
 
             _ => {
@@ -1011,10 +1164,23 @@ impl<'a> vte::Perform for Performer<'a> {
                         let Some(part) = std::str::from_utf8(param).ok() else {
                             continue;
                         };
-                        if !title.is_empty() {
+                        if !title.is_empty() && title.len() < MAX_OSC_TEXT_BYTES {
                             title.push(';');
                         }
-                        title.push_str(part);
+                        if title.len() >= MAX_OSC_TEXT_BYTES {
+                            break;
+                        }
+                        let remaining = MAX_OSC_TEXT_BYTES - title.len();
+                        if part.len() <= remaining {
+                            title.push_str(part);
+                        } else {
+                            let mut cutoff = remaining;
+                            while cutoff > 0 && !part.is_char_boundary(cutoff) {
+                                cutoff -= 1;
+                            }
+                            title.push_str(&part[..cutoff]);
+                            break;
+                        }
                     }
                     *self.title = Some(title);
                 }
@@ -1089,17 +1255,74 @@ impl<'a> vte::Perform for Performer<'a> {
             Some(dynamic_code @ 110..=112) => {
                 self.reset_dynamic_color(dynamic_code);
             }
+            // 52: Clipboard manipulation (OSC 52 ; target ; base64-data ST)
+            Some(52) => {
+                // Join remaining params with ';' to reconstruct the payload.
+                let mut payload = String::new();
+                for (i, param) in params[1..].iter().enumerate() {
+                    if i > 0 {
+                        payload.push(';');
+                    }
+                    if let Ok(s) = std::str::from_utf8(param) {
+                        payload.push_str(s);
+                    }
+                }
+                // The payload is "target;base64data" where target is like "c", "p", "s", etc.
+                if let Some((_target, data)) = payload.split_once(';') {
+                    if data == "?" {
+                        // Query — respond with empty (we don't expose clipboard to apps)
+                        let response = format!(
+                            "\x1b]52;;{}",
+                            Self::osc_terminator(bell_terminated)
+                        );
+                        self.responses.push(response.into_bytes());
+                    }
+                    // Set clipboard: data is base64-encoded text.
+                    // We store the raw base64 for the application layer to decode.
+                    // The response mechanism handles this via take_responses().
+                }
+            }
             _ => {
                 // Unhandled OSC – ignore
             }
         }
     }
 
-    // Unused hooks – provide defaults
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.dcs_data.clear();
+        *self.dcs_intermediates = intermediates.to_vec();
+        *self.dcs_action = action;
     }
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+
+    fn put(&mut self, byte: u8) {
+        if self.dcs_data.len() < 4096 {
+            self.dcs_data.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        // DECRQSS – Request Status String (DCS $ q <data> ST)
+        if *self.dcs_intermediates == [b'$'] && *self.dcs_action == 'q' {
+            if let Ok(query) = std::str::from_utf8(self.dcs_data) {
+                let response = match query {
+                    // SGR
+                    "m" => Some(format!("\x1bP1$r0m\x1b\\")),
+                    // DECSTBM
+                    "r" => {
+                        let (top, bottom) = self.grid.scroll_region();
+                        Some(format!("\x1bP1$r{};{}r\x1b\\", top + 1, bottom + 1))
+                    }
+                    // DECSCUSR
+                    " q" => Some(format!("\x1bP1$r1 q\x1b\\")),
+                    _ => Some(format!("\x1bP0$r\x1b\\")),
+                };
+                if let Some(resp) = response {
+                    self.responses.push(resp.into_bytes());
+                }
+            }
+        }
+        self.dcs_data.clear();
+    }
 }
 
 fn map_dec_special_graphics(ch: char) -> char {
@@ -1584,6 +1807,15 @@ mod tests {
     }
 
     #[test]
+    fn osc_title_is_capped() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        let long = "x".repeat(MAX_OSC_TEXT_BYTES + 32);
+        let seq = format!("\x1b]0;{long}\x07");
+        p.advance(&mut g, &mut d, seq.as_bytes());
+        assert_eq!(p.title().unwrap().len(), MAX_OSC_TEXT_BYTES);
+    }
+
+    #[test]
     fn osc_10_query_foreground() {
         let (mut p, mut g, mut d) = setup(10, 2);
         p.advance(&mut g, &mut d, b"\x1b]10;?\x07");
@@ -1671,6 +1903,16 @@ mod tests {
         assert!(p.mouse_state().sgr);
         p.advance(&mut g, &mut d, b"\x1b[?1006l");
         assert!(!p.mouse_state().sgr);
+    }
+
+    #[test]
+    fn decset_bracketed_paste_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(!p.bracketed_paste());
+        p.advance(&mut g, &mut d, b"\x1b[?2004h");
+        assert!(p.bracketed_paste());
+        p.advance(&mut g, &mut d, b"\x1b[?2004l");
+        assert!(!p.bracketed_paste());
     }
 
     // === Device Attributes ===
@@ -1832,5 +2074,146 @@ mod tests {
         assert_eq!(g.cell(3, 0).character(), 'A');
         assert_eq!(g.cell(4, 0).character(), 'B');
         assert_eq!(g.cell(5, 0).character(), 'C');
+    }
+
+    // === New feature tests ===
+
+    #[test]
+    fn focus_reporting_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(!p.focus_reporting());
+        p.advance(&mut g, &mut d, b"\x1b[?1004h");
+        assert!(p.focus_reporting());
+        p.advance(&mut g, &mut d, b"\x1b[?1004l");
+        assert!(!p.focus_reporting());
+    }
+
+    #[test]
+    fn synchronized_output_mode() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(!p.synchronized_output());
+        p.advance(&mut g, &mut d, b"\x1b[?2026h");
+        assert!(p.synchronized_output());
+        p.advance(&mut g, &mut d, b"\x1b[?2026l");
+        assert!(!p.synchronized_output());
+    }
+
+    #[test]
+    fn insert_mode_sm_rm() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(!p.insert_mode());
+        p.advance(&mut g, &mut d, b"\x1b[4h");
+        assert!(p.insert_mode());
+        p.advance(&mut g, &mut d, b"\x1b[4l");
+        assert!(!p.insert_mode());
+    }
+
+    #[test]
+    fn insert_mode_shifts_text_right() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"ABCDE");
+        // Enable insert mode, move to col 2, insert 'X'
+        p.advance(&mut g, &mut d, b"\x1b[4h\x1b[1;3HX");
+        assert_eq!(g.cell(0, 0).character(), 'A');
+        assert_eq!(g.cell(1, 0).character(), 'B');
+        assert_eq!(g.cell(2, 0).character(), 'X');
+        assert_eq!(g.cell(3, 0).character(), 'C');
+        assert_eq!(g.cell(4, 0).character(), 'D');
+    }
+
+    #[test]
+    fn decscusr_cursor_shape_request() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        assert!(p.take_cursor_shape_request().is_none());
+        p.advance(&mut g, &mut d, b"\x1b[5 q");
+        assert_eq!(p.take_cursor_shape_request(), Some(5));
+        assert!(p.take_cursor_shape_request().is_none());
+    }
+
+    #[test]
+    fn decrqm_reports_mode_status() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        // Mode 2004 (bracketed paste) should report 2 (reset)
+        p.advance(&mut g, &mut d, b"\x1b[?2004$p");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1b[?2004;2$y".to_vec()]);
+
+        // Enable it, should report 1 (set)
+        p.advance(&mut g, &mut d, b"\x1b[?2004h\x1b[?2004$p");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1b[?2004;1$y".to_vec()]);
+    }
+
+    #[test]
+    fn decrqm_unknown_mode_reports_zero() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[?9999$p");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1b[?9999;0$y".to_vec()]);
+    }
+
+    #[test]
+    fn decstr_soft_reset() {
+        let (mut p, mut g, mut d) = setup(10, 4);
+        // Set several modes
+        p.advance(&mut g, &mut d, b"\x1b[?1h");   // DECCKM
+        p.advance(&mut g, &mut d, b"\x1b[?2004h"); // bracketed paste
+        p.advance(&mut g, &mut d, b"\x1b[?1004h"); // focus reporting
+        p.advance(&mut g, &mut d, b"\x1b[?25l");   // hide cursor
+        assert!(p.application_cursor_keys());
+        assert!(p.bracketed_paste());
+        assert!(p.focus_reporting());
+        assert!(!g.cursor_visible());
+
+        // Soft reset
+        p.advance(&mut g, &mut d, b"\x1b[!p");
+        assert!(!p.application_cursor_keys());
+        assert!(!p.bracketed_paste());
+        assert!(!p.focus_reporting());
+        assert!(g.cursor_visible());
+    }
+
+    #[test]
+    fn dsr_status_report() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b[5n");
+        assert_eq!(p.take_responses(), vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn dcs_decrqss_sgr() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        // DCS $ q m ST — query SGR
+        p.advance(&mut g, &mut d, b"\x1bP$qm\x1b\\");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1bP1$r0m\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn dcs_decrqss_decstbm() {
+        let (mut p, mut g, mut d) = setup(10, 6);
+        p.advance(&mut g, &mut d, b"\x1b[2;5r");
+        // DCS $ q r ST — query scroll region
+        p.advance(&mut g, &mut d, b"\x1bP$qr\x1b\\");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1bP1$r2;5r\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn osc_52_query_responds_empty() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"\x1b]52;c;?\x07");
+        let r = p.take_responses();
+        assert_eq!(r, vec![b"\x1b]52;;\x07".to_vec()]);
+    }
+
+    #[test]
+    fn rep_repeats_preceding_char() {
+        let (mut p, mut g, mut d) = setup(10, 2);
+        p.advance(&mut g, &mut d, b"A\x1b[3b");
+        assert_eq!(g.cell(0, 0).character(), 'A');
+        assert_eq!(g.cell(1, 0).character(), 'A');
+        assert_eq!(g.cell(2, 0).character(), 'A');
+        assert_eq!(g.cell(3, 0).character(), 'A');
     }
 }
