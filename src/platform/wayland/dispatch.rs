@@ -578,6 +578,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
+                state.app.handle_focus_change(false);
                 state.repeat.stop(None);
                 state.fallback_mods = crate::input::Modifiers::empty();
                 if let Some(xkb) = &mut state.xkb {
@@ -586,6 +587,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                 } else {
                     state.app.set_modifiers(state.fallback_mods);
                 }
+            }
+            wl_keyboard::Event::Enter { .. } => {
+                state.app.handle_focus_change(true);
             }
             _ => {}
         }

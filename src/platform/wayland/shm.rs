@@ -6,7 +6,42 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use wayland_client::protocol::{wl_buffer, wl_shm, wl_shm_pool};
 use wayland_client::QueueHandle;
 
+use crate::contracts::CheckInvariant;
 use crate::defaults::APP_NAME;
+
+const BYTES_PER_PIXEL: u32 = 4;
+const MAX_SHM_DIMENSION: u32 = 16_384;
+const MAX_SHM_BYTES: usize = 512 * 1024 * 1024;
+
+fn shm_layout(width: u32, height: u32) -> Result<(u32, usize), Box<dyn Error>> {
+    if width == 0 || height == 0 {
+        return Err("zero-sized shm buffer".into());
+    }
+    if width > MAX_SHM_DIMENSION || height > MAX_SHM_DIMENSION {
+        return Err("shm buffer dimensions exceed safe limit".into());
+    }
+
+    let stride = width
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or("shm stride overflow")?;
+    let len_u64 = u64::from(stride)
+        .checked_mul(u64::from(height))
+        .ok_or("shm buffer length overflow")?;
+    let len = usize::try_from(len_u64).map_err(|_| "shm buffer length overflow")?;
+
+    if width > i32::MAX as u32
+        || height > i32::MAX as u32
+        || stride > i32::MAX as u32
+        || len > i32::MAX as usize
+    {
+        return Err("shm buffer exceeds Wayland protocol limits".into());
+    }
+    if len > MAX_SHM_BYTES {
+        return Err("shm buffer exceeds maximum size".into());
+    }
+
+    Ok((stride, len))
+}
 
 pub(super) struct ShmBuffer {
     pub width: u32,
@@ -29,8 +64,8 @@ impl ShmBuffer {
         qh: &QueueHandle<super::WaylandState>,
         idx: usize,
     ) -> Result<Self, Box<dyn Error>> {
-        let stride = width * 4;
-        let len = (stride * height) as usize;
+        requires!(width > 0 && height > 0);
+        let (stride, len) = shm_layout(width, height)?;
         let file = create_shm_file(len)?;
         let pool = shm.create_pool(file.as_fd(), len as i32, qh, ());
         let buffer = pool.create_buffer(
@@ -73,12 +108,14 @@ impl ShmBuffer {
     }
 
     pub fn pixels(&self) -> &[u8] {
+        requires!(!self.map.is_null());
         // SAFETY: self.map is a valid pointer from mmap with length self.len.
         // The backing file (_file) is kept alive for the lifetime of ShmBuffer.
         unsafe { std::slice::from_raw_parts(self.map, self.len) }
     }
 
     pub fn pixels_mut(&mut self) -> &mut [u8] {
+        requires!(!self.map.is_null() && !self.busy);
         // SAFETY: self.map is a valid pointer from mmap with length self.len.
         // The backing file (_file) is kept alive for the lifetime of ShmBuffer.
         // The caller must ensure the Wayland compositor has released the buffer
@@ -100,6 +137,7 @@ impl Drop for ShmBuffer {
 }
 
 fn create_shm_file(size: usize) -> Result<File, Box<dyn Error>> {
+    requires!(size > 0);
     let name = CString::new(format!("{APP_NAME}-{}", std::process::id()))?;
     // SAFETY: memfd_create with MFD_CLOEXEC creates an anonymous file.
     // We check fd < 0 for failure.
@@ -119,4 +157,29 @@ fn create_shm_file(size: usize) -> Result<File, Box<dyn Error>> {
     // successfully ftruncated. File takes ownership.
     let file = unsafe { File::from_raw_fd(fd) };
     Ok(file)
+}
+
+impl CheckInvariant for ShmBuffer {
+    fn check_invariant(&self) {
+        invariant!(!self.map.is_null() && self.width > 0 && self.height > 0 && self.len > 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shm_layout;
+
+    #[test]
+    fn shm_layout_rejects_zero_and_overflowing_sizes() {
+        assert!(shm_layout(0, 1).is_err());
+        assert!(shm_layout(1, 0).is_err());
+        assert!(shm_layout(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn shm_layout_accepts_reasonable_sizes() {
+        let (stride, len) = shm_layout(1920, 1080).unwrap();
+        assert_eq!(stride, 1920 * 4);
+        assert_eq!(len, 1920 * 1080 * 4);
+    }
 }

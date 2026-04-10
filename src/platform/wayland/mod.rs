@@ -34,6 +34,12 @@ use shm::ShmBuffer;
 
 const BUFFER_COUNT: usize = 3;
 const PTY_RENDER_COALESCE_MS: u64 = 5;
+const MAX_WINDOW_DIMENSION: u32 = 16_384;
+
+#[inline]
+fn clamp_window_dimension(size: u32) -> u32 {
+    size.clamp(1, MAX_WINDOW_DIMENSION)
+}
 
 type CursorCorners = [(f32, f32); 4];
 type CursorRowRange = (usize, usize);
@@ -207,9 +213,9 @@ impl WaylandState {
 
     /// Physical (buffer) dimensions = logical × scale.
     fn physical_size(&self) -> (u32, u32) {
-        let w = (self.width as f32 * self.scale).round() as u32;
-        let h = (self.height as f32 * self.scale).round() as u32;
-        (w.max(1), h.max(1))
+        let w = clamp_window_dimension((self.width as f32 * self.scale).round() as u32);
+        let h = clamp_window_dimension((self.height as f32 * self.scale).round() as u32);
+        (w, h)
     }
 
     /// Returns true when fractional scaling path should be used
@@ -250,14 +256,16 @@ impl WaylandState {
     fn apply_pending_configure(&mut self) {
         let mut changed = false;
 
-        if self.pending_width > 0 && self.pending_width != self.width {
-            self.width = self.pending_width;
+        let pending_width = clamp_window_dimension(self.pending_width);
+        if self.pending_width > 0 && pending_width != self.width {
+            self.width = pending_width;
             self.window_geometry_dirty = true;
             self.opaque_region_dirty = true;
             changed = true;
         }
-        if self.pending_height > 0 && self.pending_height != self.height {
-            self.height = self.pending_height;
+        let pending_height = clamp_window_dimension(self.pending_height);
+        if self.pending_height > 0 && pending_height != self.height {
+            self.height = pending_height;
             self.window_geometry_dirty = true;
             self.opaque_region_dirty = true;
             changed = true;
@@ -554,7 +562,7 @@ impl WaylandState {
             );
         }
 
-        let damage_ranges = current_damage.clone();
+        let damage_ranges = current_damage;
         self.app.clear_damage();
         self.last_cursor_rows = current_cursor_rows;
         self.last_cursor_corners = current_cursor_corners;
@@ -604,10 +612,13 @@ impl WaylandState {
         surface.commit();
         self.last_presented_buffer = Some(target_idx);
         self.recent_damage_history.push_back(damage_ranges);
-        while self.recent_damage_history.len() > BUFFER_COUNT.saturating_sub(1) {
-            self.recent_damage_history.pop_front();
-        }
-        self.damage_ranges_scratch = current_damage;
+        let mut scratch = if self.recent_damage_history.len() > BUFFER_COUNT.saturating_sub(1) {
+            self.recent_damage_history.pop_front().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        scratch.clear();
+        self.damage_ranges_scratch = scratch;
     }
 
     fn apply_zoom_action(&mut self, action: ZoomAction) {
@@ -753,16 +764,16 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         renderer.window_size_for_grid(configured_cols as usize, configured_rows as usize);
     let using_default_window_size = configured_width == DEFAULT_WINDOW_INITIAL_WIDTH
         && configured_height == DEFAULT_WINDOW_INITIAL_HEIGHT;
-    let initial_width = if using_default_window_size {
+    let initial_width = clamp_window_dimension(if using_default_window_size {
         fit_width
     } else {
         configured_width
-    };
-    let initial_height = if using_default_window_size {
+    });
+    let initial_height = clamp_window_dimension(if using_default_window_size {
         fit_height
     } else {
         configured_height
-    };
+    });
     app.set_cell_size(cw, ch);
     let (cols, rows) = renderer.grid_size_for_window(initial_width, initial_height);
     let (ox, oy) = renderer.grid_offset();
