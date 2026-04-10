@@ -1,6 +1,7 @@
 //! Software framebuffer renderer scaffold for Wayland shm backend.
 //! Pixels are BGRA8 little-endian.
 
+use crate::contracts::CheckInvariant;
 use crate::cursor::CursorRenderer;
 use crate::font::FontAtlas;
 use crate::terminal::cell::{CellFlags, ColorSource, PackedColor};
@@ -10,6 +11,7 @@ use crate::terminal::theme::Theme;
 
 /// Distance threshold for edge-strip rendering (cursor outline)
 const EDGE_STRIP_DISTANCE_SQ: f32 = 0.8;
+const EDGE_STRIP_RADIUS: f32 = 0.894_427_2;
 const FLOAT_CHANGE_EPSILON: f32 = 0.001;
 const AXIS_ALIGNED_QUAD_EPSILON: f32 = 0.01;
 const BT709_LUMA_RED: f32 = 0.2126;
@@ -148,21 +150,27 @@ impl SoftwareRenderer {
     }
 
     pub fn set_scale(&mut self, scale: f32) {
+        requires!(scale > 0.0);
         let scale = scale.max(1.0);
         if (self.scale - scale).abs() < FLOAT_CHANGE_EPSILON {
+            ensures!(self.scale >= 1.0);
             return;
         }
         self.scale = scale;
         self.rebuild_font();
+        ensures!(self.scale >= 1.0);
     }
 
     pub fn set_font_size(&mut self, size: f32) {
+        requires!(size > 0.0);
         let size = size.max(1.0);
         if (self.font_size - size).abs() < f32::EPSILON {
+            ensures!(self.font_size >= 1.0);
             return;
         }
         self.font_size = size;
         self.rebuild_font();
+        ensures!(self.font_size >= 1.0);
     }
 
     pub fn increase_font_size(&mut self, delta: f32) {
@@ -230,12 +238,14 @@ impl SoftwareRenderer {
         start_row: usize,
         end_row_inclusive: usize,
     ) -> (u32, u32) {
+        requires!(start_row <= end_row_inclusive);
         let y0 = self.row_boundary(start_row);
         let y1 = self.row_boundary(end_row_inclusive.saturating_add(1));
         (y0, y1.max(y0))
     }
 
     pub fn window_size_for_grid(&self, cols: usize, rows: usize) -> (u32, u32) {
+        requires!(cols > 0 && rows > 0);
         let phys_pad = self.padding as f32 * self.scale;
         let width = Self::pixel_boundary(phys_pad, self.cell_width, cols)
             .saturating_add(phys_pad.round().max(0.0) as u32);
@@ -322,7 +332,6 @@ impl SoftwareRenderer {
         let background = self.theme.background;
         let background_rgb = Rgb::from_packed(background);
         let selection_bg = self.theme.selection;
-        let normalized_selection = selection.has_selection().then(|| selection.normalized());
         let top_pad = self
             .row_boundaries
             .first()
@@ -336,20 +345,7 @@ impl SoftwareRenderer {
 
         let grid_rows = grid.rows();
         let mut render_row = |row: usize| {
-            let (selected_start, selected_end) = normalized_selection
-                .and_then(|(start, end)| {
-                    if row < start.row || row > end.row {
-                        None
-                    } else if start.row == end.row {
-                        Some((start.col, end.col))
-                    } else if row == start.row {
-                        Some((start.col, usize::MAX))
-                    } else if row == end.row {
-                        Some((0, end.col))
-                    } else {
-                        Some((0, usize::MAX))
-                    }
-                })
+            let (selected_start, selected_end) = selection.row_range(row)
                 .unwrap_or((usize::MAX, usize::MIN));
             let y0 = self.row_boundaries[row].min(fb.height);
             let y1 = self.row_boundaries[row + 1].min(fb.height);
@@ -360,7 +356,7 @@ impl SoftwareRenderer {
             let row_state = grid.view_row_mut(row);
             {
                 let row_cells = row_state.cells();
-                for (col, cell) in row_cells.iter().copied().enumerate() {
+                for (col, cell) in row_cells.iter().enumerate() {
                     let mut fg = if cell.fg_src == ColorSource::Default {
                         self.theme.foreground
                     } else {
@@ -374,6 +370,10 @@ impl SoftwareRenderer {
 
                     if cell.flags.contains(CellFlags::REVERSE) {
                         std::mem::swap(&mut fg, &mut bg);
+                    }
+                    // DIM: halve foreground brightness
+                    if cell.flags.contains(CellFlags::DIM) {
+                        fg = PackedColor::new(fg.r() / 2, fg.g() / 2, fg.b() / 2);
                     }
                     if col >= selected_start && col <= selected_end {
                         bg = selection_bg;
@@ -404,6 +404,17 @@ impl SoftwareRenderer {
                                 cell.flags.contains(CellFlags::ITALIC),
                             ),
                         );
+                    }
+
+                    // Decorations: underline, strikethrough
+                    let fg_rgb = Rgb::from_packed(fg);
+                    if cell.flags.contains(CellFlags::UNDERLINE) {
+                        let underline_y = y0 + cell_h.saturating_sub(1);
+                        self.fill_rect(fb, Rect::new(x0, underline_y, cell_w, 1), fg_rgb);
+                    }
+                    if cell.flags.contains(CellFlags::STRIKETHROUGH) {
+                        let strike_y = y0 + cell_h / 2;
+                        self.fill_rect(fb, Rect::new(x0, strike_y, cell_w, 1), fg_rgb);
                     }
                 }
             }
@@ -579,24 +590,52 @@ impl SoftwareRenderer {
         end: (f32, f32),
         color: Rgb,
     ) {
-        let min_x = start.0.min(end.0).floor().max(0.0) as i32 - 1;
-        let max_x = start.0.max(end.0).ceil().min(fb.width as f32) as i32 + 1;
-        let min_y = start.1.min(end.1).floor().max(0.0) as i32 - 1;
-        let max_y = start.1.max(end.1).ceil().min(fb.height as f32) as i32 + 1;
         let delta_x = end.0 - start.0;
         let delta_y = end.1 - start.1;
         let length_sq = delta_x * delta_x + delta_y * delta_y;
         if length_sq <= DEGENERATE_EDGE_EPSILON_SQ {
             return;
         }
+
+        // Fast path for axis-aligned edges (stationary / near-stationary cursor).
+        if delta_x.abs() < AXIS_ALIGNED_QUAD_EPSILON {
+            let cx = (start.0 + end.0) * 0.5;
+            let x0 = (cx - EDGE_STRIP_RADIUS).floor().max(0.0) as u32;
+            let x1 = (cx + EDGE_STRIP_RADIUS).ceil().max(0.0).min(fb.width as f32) as u32;
+            let y0 = start.1.min(end.1).floor().max(0.0) as u32;
+            let y1 = start.1.max(end.1).ceil().max(0.0).min(fb.height as f32) as u32;
+            if x1 > x0 && y1 > y0 {
+                fill_rect_raw(fb, Rect::new(x0, y0, x1 - x0, y1 - y0), color);
+            }
+            return;
+        }
+        if delta_y.abs() < AXIS_ALIGNED_QUAD_EPSILON {
+            let cy = (start.1 + end.1) * 0.5;
+            let x0 = start.0.min(end.0).floor().max(0.0) as u32;
+            let x1 = start.0.max(end.0).ceil().max(0.0).min(fb.width as f32) as u32;
+            let y0 = (cy - EDGE_STRIP_RADIUS).floor().max(0.0) as u32;
+            let y1 = (cy + EDGE_STRIP_RADIUS).ceil().max(0.0).min(fb.height as f32) as u32;
+            if x1 > x0 && y1 > y0 {
+                fill_rect_raw(fb, Rect::new(x0, y0, x1 - x0, y1 - y0), color);
+            }
+            return;
+        }
+
+        // General case with per-scanline hoisted Y computations.
+        let min_x = start.0.min(end.0).floor().max(0.0) as i32 - 1;
+        let max_x = start.0.max(end.0).ceil().min(fb.width as f32) as i32 + 1;
+        let min_y = start.1.min(end.1).floor().max(0.0) as i32 - 1;
+        let max_y = start.1.max(end.1).ceil().min(fb.height as f32) as i32 + 1;
+        let inv_length_sq = 1.0 / length_sq;
         for y in min_y.max(0) as u32..(max_y.max(0) as u32).min(fb.height) {
+            let py = y as f32 + 0.5;
+            let from_start_y = py - start.1;
+            let y_dot = from_start_y * delta_y;
             for x in min_x.max(0) as u32..(max_x.max(0) as u32).min(fb.width) {
                 let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
                 let from_start_x = px - start.0;
-                let from_start_y = py - start.1;
                 let along =
-                    ((from_start_x * delta_x + from_start_y * delta_y) / length_sq).clamp(0.0, 1.0);
+                    ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
                 let closest_x = start.0 + along * delta_x;
                 let closest_y = start.1 + along * delta_y;
                 let dist_x = px - closest_x;
@@ -704,26 +743,39 @@ impl SoftwareRenderer {
         let dst_y = (dst_top + skip_top as i32) as u32;
         let src_row_stride = atlas_w as usize;
 
-        for row in 0..draw_h {
-            let src_row = (src_y + row) as usize * src_row_stride + src_x as usize;
-            let dst_row = dst_y + row;
-            for col in 0..draw_w {
-                let alpha = atlas[src_row + col as usize];
-                if alpha == 0 {
-                    continue;
-                }
-                let dst_col = dst_x + col;
-                if let Some(quad) = clip_quad {
+        if let Some(quad) = clip_quad {
+            for row in 0..draw_h {
+                let src_row = (src_y + row) as usize * src_row_stride + src_x as usize;
+                let dst_row = dst_y + row;
+                for col in 0..draw_w {
+                    let alpha = atlas[src_row + col as usize];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let dst_col = dst_x + col;
                     let p = (dst_col as f32 + 0.5, dst_row as f32 + 0.5);
                     if !point_in_triangle(p, quad[0], quad[1], quad[2])
                         && !point_in_triangle(p, quad[0], quad[2], quad[3])
                     {
                         continue;
                     }
+                    blend_bgra(fb, dst_col, dst_row, style.color, alpha);
                 }
-                blend_bgra(fb, dst_col, dst_row, style.color, alpha);
             }
+        } else {
+            blit_glyph_fast(
+                fb, atlas, src_x, src_y, src_row_stride, dst_x, dst_y, draw_w, draw_h, style.color,
+            );
         }
+    }
+}
+
+impl CheckInvariant for SoftwareRenderer {
+    fn check_invariant(&self) {
+        invariant!(self.cell_width >= 1.0, "cell_width must be >= 1.0, got {}", self.cell_width);
+        invariant!(self.cell_height >= 1.0, "cell_height must be >= 1.0, got {}", self.cell_height);
+        invariant!(self.font_size >= 1.0, "font_size must be >= 1.0, got {}", self.font_size);
+        invariant!(self.scale >= 1.0, "scale must be >= 1.0, got {}", self.scale);
     }
 }
 
@@ -761,6 +813,7 @@ fn axis_aligned_fill_span(start: f32, end: f32, limit: u32) -> Option<(u32, u32)
     (pixel_end > pixel_start).then_some((pixel_start, pixel_end))
 }
 
+#[inline(always)]
 fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
     let s1 = (p.0 - c.0) * (a.1 - c.1) - (a.0 - c.0) * (p.1 - c.1);
     let s2 = (p.0 - a.0) * (b.1 - a.1) - (b.0 - a.0) * (p.1 - a.1);
@@ -1247,10 +1300,12 @@ fn contrasting_cursor_text_color(color: Rgb) -> Rgb {
 
 /// 8-bit premultiply — used only for glyph texel compositing where the
 /// source alpha is already 8-bit from the font atlas.
+#[inline(always)]
 fn premultiply_8(channel: u8, alpha: u8) -> u8 {
     ((channel as u16 * alpha as u16 + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8) as u8
 }
 
+#[inline(always)]
 fn premultiplied_bgra_8(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [
         premultiply_8(b, a),
@@ -1260,81 +1315,133 @@ fn premultiplied_bgra_8(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     ]
 }
 
+#[inline(always)]
 fn fill_rect_raw(fb: &mut FrameBuffer<'_>, rect: Rect, color: Rgb) {
     let max_x = rect.x.saturating_add(rect.width).min(fb.width);
     let max_y = rect.y.saturating_add(rect.height).min(fb.height);
     if rect.x >= max_x || rect.y >= max_y {
         return;
     }
-
     let pixel = premultiplied_bgra_8(color.red, color.green, color.blue, 255);
+    let word = u32::from_ne_bytes(pixel);
     let start_x = rect.x as usize * 4;
     let row_bytes = (max_x - rect.x) as usize * 4;
     let stride = fb.stride as usize;
-
-    for py in rect.y as usize..max_y as usize {
-        let row_start = py * stride + start_x;
-        let row_end = row_start.saturating_add(row_bytes).min(fb.pixels.len());
-        let row = &mut fb.pixels[row_start..row_end];
-        if row.len() < 4 {
-            continue;
-        }
-
-        row[..4].copy_from_slice(&pixel);
-        let mut filled = 4;
-        while filled < row.len() {
-            let copy_len = (row.len() - filled).min(filled);
-            let (left, right) = row.split_at_mut(filled);
-            right[..copy_len].copy_from_slice(&left[..copy_len]);
-            filled += copy_len;
+    let first_row_start = rect.y as usize * stride + start_x;
+    if first_row_start + row_bytes > fb.pixels.len() { return; }
+    unsafe {
+        let base = fb.pixels.as_mut_ptr();
+        let first = base.add(first_row_start);
+        let mut p = first as *mut u32;
+        let end = first.add(row_bytes) as *mut u32;
+        while p < end { p.write_unaligned(word); p = p.add(1); }
+        for py in (rect.y + 1) as usize..max_y as usize {
+            let dst = base.add(py * stride + start_x);
+            std::ptr::copy_nonoverlapping(first, dst, row_bytes);
         }
     }
 }
 
+#[inline(always)]
 fn put_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, color: Rgb, alpha: u8) {
     let idx = y as usize * fb.stride as usize + x as usize * 4;
-    if idx + 3 >= fb.pixels.len() {
+    if idx + 4 > fb.pixels.len() {
         return;
     }
     let pixel = premultiplied_bgra_8(color.red, color.green, color.blue, alpha);
-    fb.pixels[idx] = pixel[0];
-    fb.pixels[idx + 1] = pixel[1];
-    fb.pixels[idx + 2] = pixel[2];
-    fb.pixels[idx + 3] = pixel[3];
+    unsafe {
+        let ptr = fb.pixels.as_mut_ptr().add(idx);
+        std::ptr::copy_nonoverlapping(pixel.as_ptr(), ptr, 4);
+    }
 }
 
+#[inline(always)]
 fn blend_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, color: Rgb, alpha: u8) {
-    if alpha == 0 {
-        return;
-    }
-    if alpha == 255 {
-        put_bgra(fb, x, y, color, alpha);
-        return;
-    }
-
+    if alpha == 0 { return; }
     let idx = y as usize * fb.stride as usize + x as usize * 4;
-    if idx + 3 >= fb.pixels.len() {
+    if idx + 4 > fb.pixels.len() { return; }
+    if alpha == 255 {
+        let pixel = premultiplied_bgra_8(color.red, color.green, color.blue, 255);
+        unsafe { std::ptr::copy_nonoverlapping(pixel.as_ptr(), fb.pixels.as_mut_ptr().add(idx), 4); }
+        return;
+    }
+    let src = premultiplied_bgra_8(color.red, color.green, color.blue, alpha);
+    let inv = 255u16 - alpha as u16;
+    unsafe {
+        let p = fb.pixels.as_mut_ptr().add(idx);
+        *p       = (src[0] as u16 + ((*p       as u16 * inv + 127) / 255)).min(255) as u8;
+        *p.add(1)= (src[1] as u16 + ((*p.add(1) as u16 * inv + 127) / 255)).min(255) as u8;
+        *p.add(2)= (src[2] as u16 + ((*p.add(2) as u16 * inv + 127) / 255)).min(255) as u8;
+        *p.add(3)= (src[3] as u16 + ((*p.add(3) as u16 * inv + 127) / 255)).min(255) as u8;
+    }
+}
+
+/// Optimized unclipped glyph blitting. Validates bounds once up front, then
+/// uses raw pointer arithmetic to eliminate per-pixel bounds checks.
+fn blit_glyph_fast(
+    fb: &mut FrameBuffer<'_>,
+    atlas: &[u8],
+    src_x: u32,
+    src_y: u32,
+    src_stride: usize,
+    dst_x: u32,
+    dst_y: u32,
+    draw_w: u32,
+    draw_h: u32,
+    color: Rgb,
+) {
+    if draw_w == 0 || draw_h == 0 {
+        return;
+    }
+    let fb_stride = fb.stride as usize;
+    let fb_len = fb.pixels.len();
+    let atlas_len = atlas.len();
+    let opaque = premultiplied_bgra_8(color.red, color.green, color.blue, 255);
+
+    // Verify bounds once for the entire blit region.
+    let last_src = (src_y + draw_h - 1) as usize * src_stride + (src_x + draw_w - 1) as usize;
+    let last_dst = (dst_y + draw_h - 1) as usize * fb_stride + (dst_x + draw_w - 1) as usize * 4 + 3;
+    if last_src >= atlas_len || last_dst >= fb_len {
         return;
     }
 
-    let src = premultiplied_bgra_8(color.red, color.green, color.blue, alpha);
-    let dst_b = fb.pixels[idx] as u16;
-    let dst_g = fb.pixels[idx + 1] as u16;
-    let dst_r = fb.pixels[idx + 2] as u16;
-    let dst_a = fb.pixels[idx + 3] as u16;
-    let src_a = src[3] as u16;
-    let inv = MAX_COLOR_CHANNEL_U8 - src_a;
+    // SAFETY: All source indices are in [src_y*src_stride+src_x ..
+    //         (src_y+draw_h-1)*src_stride+(src_x+draw_w-1)], verified above.
+    //         All dest indices are in [dst_y*fb_stride+dst_x*4 ..
+    //         (dst_y+draw_h-1)*fb_stride+(dst_x+draw_w-1)*4+3], verified above.
+    unsafe {
+        let fb_ptr = fb.pixels.as_mut_ptr();
+        let atlas_ptr = atlas.as_ptr();
+        let cr = color.red;
+        let cg = color.green;
+        let cb = color.blue;
 
-    fb.pixels[idx] = (src[0] as u16 + ((dst_b * inv + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8))
-        .min(MAX_COLOR_CHANNEL_U8) as u8;
-    fb.pixels[idx + 1] = (src[1] as u16
-        + ((dst_g * inv + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8))
-        .min(MAX_COLOR_CHANNEL_U8) as u8;
-    fb.pixels[idx + 2] = (src[2] as u16
-        + ((dst_r * inv + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8))
-        .min(MAX_COLOR_CHANNEL_U8) as u8;
-    fb.pixels[idx + 3] = (src_a + ((dst_a * inv + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8))
-        .min(MAX_COLOR_CHANNEL_U8) as u8;
+        for row in 0..draw_h as usize {
+            let src_off = (src_y as usize + row) * src_stride + src_x as usize;
+            let dst_off = (dst_y as usize + row) * fb_stride + dst_x as usize * 4;
+
+            for col in 0..draw_w as usize {
+                let alpha = *atlas_ptr.add(src_off + col);
+                if alpha == 0 {
+                    continue;
+                }
+                let p = fb_ptr.add(dst_off + col * 4);
+                if alpha == 255 {
+                    std::ptr::copy_nonoverlapping(opaque.as_ptr(), p, 4);
+                } else {
+                    let inv = 255u16 - alpha as u16;
+                    let sa = alpha as u16;
+                    let sb = (cb as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
+                    let sg = (cg as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
+                    let sr = (cr as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
+                    *p       = (sb + (*p       as u16 * inv + 127) / 255).min(255) as u8;
+                    *p.add(1)= (sg + (*p.add(1) as u16 * inv + 127) / 255).min(255) as u8;
+                    *p.add(2)= (sr + (*p.add(2) as u16 * inv + 127) / 255).min(255) as u8;
+                    *p.add(3)= (sa + (*p.add(3) as u16 * inv + 127) / 255).min(255) as u8;
+                }
+            }
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

@@ -5,7 +5,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+use crate::contracts::CheckInvariant;
 use crate::defaults::{APP_NAME, DEFAULT_FONT_FAMILY};
+
+struct FxHasher(u64);
+impl std::hash::Hasher for FxHasher {
+    #[inline] fn finish(&self) -> u64 { self.0 }
+    #[inline] fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes { self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517cc1b727220a95); }
+    }
+}
+impl std::hash::BuildHasher for FxHasher {
+    type Hasher = FxHasher;
+    #[inline] fn build_hasher(&self) -> FxHasher { FxHasher(0) }
+}
+type FxHashMap<K, V> = HashMap<K, V, FxHasher>;
 use crate::fontconfig_ffi as fc;
 use crate::freetype_ffi as ft;
 use crate::{error_log, info_log, warn_log};
@@ -41,6 +55,7 @@ const FONT_PLAN_STYLE_BOLD_ITALIC: &str = "bold-italic";
 
 #[inline]
 fn ascii_cache_idx(ch: u8, bold: bool, italic: bool) -> usize {
+    requires!((32..=126).contains(&ch), "ascii_cache_idx: ch ({}) not in printable ASCII range 32..=126", ch);
     let style = (bold as usize) * 2 + (italic as usize);
     style * ASCII_RANGE + (ch as usize - 32)
 }
@@ -71,6 +86,7 @@ unsafe impl Send for FtFont {}
 
 impl FtFont {
     fn from_bytes(lib: ft::FT_Library, data: Vec<u8>) -> Result<Self, String> {
+        requires!(!data.is_empty());
         let fth = ft::ft();
         let mut face: ft::FT_Face = std::ptr::null_mut();
         let err = unsafe {
@@ -83,6 +99,7 @@ impl FtFont {
     }
 
     fn set_size_px(&self, size_px: f32) {
+        requires!(size_px > 0.0);
         let fth = ft::ft();
         let size_px = size_px.max(1.0);
         let size_26_6 = (size_px * FREETYPE_FIXED_POINT_SCALE).round() as ft::FT_F26Dot6;
@@ -183,7 +200,7 @@ pub struct FontAtlas {
     cell_width: f32,
     cell_height: f32,
     atlas_data: Vec<u8>,
-    cache: HashMap<(char, bool, bool), GlyphInfo>,
+    cache: FxHashMap<(char, bool, bool), GlyphInfo>,
     current_x: u32,
     current_y: u32,
     row_height: u32,
@@ -194,6 +211,7 @@ pub struct FontAtlas {
 
 impl FontAtlas {
     pub fn new(font_size: f32, preferred_family: &str) -> Self {
+        requires!(font_size > 0.0);
         let font_plan = load_or_build_font_plan(preferred_family);
         let font_regular = load_primary_font(&font_plan, font_size);
         let cell_width = compute_cell_width(&font_regular);
@@ -217,7 +235,7 @@ impl FontAtlas {
             cell_width,
             cell_height,
             atlas_data,
-            cache: HashMap::new(),
+            cache: HashMap::with_hasher(FxHasher(0)),
             current_x: 0,
             current_y: 0,
             row_height: 0,
@@ -265,7 +283,9 @@ impl FontAtlas {
     }
 
     fn reset_atlas(&mut self) {
-        self.atlas_data.fill(0);
+        // Glyph bitmaps fully overwrite their atlas regions when rasterized
+        // and the renderer only reads within each glyph's UV rect, so zeroing
+        // the 1MB atlas buffer is unnecessary. Just reset placement state.
         self.cache.clear();
         self.ascii_populated.fill(false);
         self.current_x = 0;
@@ -891,6 +911,14 @@ fn read_bitmap_rows(buffer: *const u8, width: u32, rows: u32, pitch: i32) -> Vec
     }
 
     pixels
+}
+
+impl CheckInvariant for FontAtlas {
+    fn check_invariant(&self) {
+        invariant!(self.cell_width >= 1.0, "FontAtlas: cell_width ({}) < 1.0", self.cell_width);
+        invariant!(self.cell_height >= 1.0, "FontAtlas: cell_height ({}) < 1.0", self.cell_height);
+        invariant!(self.font_size >= 1.0, "FontAtlas: font_size ({}) < 1.0", self.font_size);
+    }
 }
 
 #[cfg(test)]
