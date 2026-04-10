@@ -5,14 +5,50 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
+use crate::contracts::CheckInvariant;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const PTY_OPEN_FLAGS: libc::c_int = libc::O_RDWR | libc::O_NOCTTY;
+const PTY_OPEN_FLAGS: libc::c_int = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
 const PTY_NAME_BUFFER_SIZE: usize = 512;
 
 const TERM_ENV_VAR: &str = "TERM";
 const COLORTERM_ENV_VAR: &str = "COLORTERM";
 const SHELL_ENV_VAR: &str = "SHELL";
+const CHILD_STDIO_FD_CEILING: libc::c_int = 3;
+
+#[inline]
+unsafe fn close_child_fds_from(first_fd: libc::c_int) {
+    // Try close_range(2) syscall first — single syscall to close all fds
+    // in [first_fd, u32::MAX]. Available on Linux 5.9+.
+    #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first_fd as libc::c_uint,
+                libc::c_uint::MAX,
+                0 as libc::c_uint,
+            )
+        };
+        if ret == 0 {
+            return;
+        }
+    }
+
+    // Fallback: iterate up to sysconf(_SC_OPEN_MAX).
+    let max_fd = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+        v if v > first_fd as libc::c_long => v as libc::c_int,
+        _ => 1024,
+    };
+    let mut fd = first_fd;
+    while fd < max_fd {
+        unsafe {
+            libc::close(fd);
+        }
+        fd += 1;
+    }
+}
 
 #[derive(Debug)]
 struct PtyError(String);
@@ -41,6 +77,7 @@ pub struct Pty {
 impl Pty {
     /// Spawn a new PTY with a shell process.
     pub fn spawn(cols: u16, rows: u16, config: &PtySpawnConfig<'_>) -> Result<Self> {
+        requires!(cols > 0 && rows > 0);
         // SAFETY: posix_openpt returns a valid fd or -1. We check < 0 before use.
         let master_raw = unsafe { libc::posix_openpt(PTY_OPEN_FLAGS) };
         if master_raw < 0 {
@@ -92,6 +129,46 @@ impl Pty {
             ws_ypixel: 0,
         };
 
+        let slave_cstr = CString::new(slave_name).map_err(|_| {
+            Box::new(PtyError("slave PTY path contained NUL byte".into()))
+                as Box<dyn std::error::Error>
+        })?;
+        let term = CString::new(config.term).map_err(|_| {
+            Box::new(PtyError("TERM contained NUL byte".into())) as Box<dyn std::error::Error>
+        })?;
+        let term_key = CString::new(TERM_ENV_VAR).map_err(|_| {
+            Box::new(PtyError("TERM key contained NUL byte".into())) as Box<dyn std::error::Error>
+        })?;
+        let colorterm = CString::new(config.colorterm).map_err(|_| {
+            Box::new(PtyError("COLORTERM contained NUL byte".into())) as Box<dyn std::error::Error>
+        })?;
+        let colorterm_key = CString::new(COLORTERM_ENV_VAR).map_err(|_| {
+            Box::new(PtyError("COLORTERM key contained NUL byte".into()))
+                as Box<dyn std::error::Error>
+        })?;
+        let command_cstrs: Vec<CString> = if config.command.is_empty() {
+            let shell =
+                std::env::var(SHELL_ENV_VAR).unwrap_or_else(|_| config.shell_fallback.to_string());
+            vec![CString::new(shell).map_err(|_| {
+                Box::new(PtyError("shell path contained NUL byte".into()))
+                    as Box<dyn std::error::Error>
+            })?]
+        } else {
+            config
+                .command
+                .iter()
+                .map(|s| {
+                    CString::new(s.as_str()).map_err(|_| {
+                        Box::new(PtyError("command contained NUL byte".into()))
+                            as Box<dyn std::error::Error>
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut command_argv: Vec<*const libc::c_char> =
+            command_cstrs.iter().map(|c| c.as_ptr()).collect();
+        command_argv.push(std::ptr::null());
+
         // SAFETY: fork() is safe to call; we handle both parent (pid > 0) and child (pid == 0).
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -103,17 +180,18 @@ impl Pty {
 
         if pid == 0 {
             // Child process
-            // SAFETY: Child process after fork. We call setsid, open slave PTY,
-            // dup2 to stdio fds, set environment, and execvp into the shell.
-            // If any step fails, _exit(1) ensures no undefined behavior.
+            // SAFETY: Child process after fork. We close the inherited PTY master,
+            // create a fresh session, wire the slave PTY to stdio, set the small
+            // fixed environment overrides, and exec the already-prepared argv.
+            // If any step fails, _exit(1) terminates without running parent-side
+            // destructors in the forked child.
             unsafe {
-                libc::setsid();
+                libc::close(master.as_raw_fd());
+                if libc::setsid() < 0 {
+                    libc::_exit(1);
+                }
 
-                let slave_cstr = match CString::new(slave_name.clone()) {
-                    Ok(value) => value,
-                    Err(_) => libc::_exit(1),
-                };
-                let slave_fd = libc::open(slave_cstr.as_ptr(), libc::O_RDWR);
+                let slave_fd = libc::open(slave_cstr.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
                 if slave_fd < 0 {
                     libc::_exit(1);
                 }
@@ -141,57 +219,19 @@ impl Pty {
                 if slave_fd > 2 {
                     libc::close(slave_fd);
                 }
+                close_child_fds_from(CHILD_STDIO_FD_CEILING);
 
-                let term = match CString::new(config.term) {
-                    Ok(value) => value,
-                    Err(_) => libc::_exit(1),
-                };
-                let term_key = match CString::new(TERM_ENV_VAR) {
-                    Ok(value) => value,
-                    Err(_) => libc::_exit(1),
-                };
                 if libc::setenv(term_key.as_ptr(), term.as_ptr(), 1) != 0 {
                     libc::_exit(1);
                 }
-
-                let colorterm = match CString::new(config.colorterm) {
-                    Ok(value) => value,
-                    Err(_) => libc::_exit(1),
-                };
-                let colorterm_key = match CString::new(COLORTERM_ENV_VAR) {
-                    Ok(value) => value,
-                    Err(_) => libc::_exit(1),
-                };
                 if libc::setenv(colorterm_key.as_ptr(), colorterm.as_ptr(), 1) != 0 {
                     libc::_exit(1);
                 }
 
-                if config.command.is_empty() {
-                    let shell = std::env::var(SHELL_ENV_VAR)
-                        .unwrap_or_else(|_| config.shell_fallback.to_string());
-                    let shell_cstr = match CString::new(shell) {
-                        Ok(value) => value,
-                        Err(_) => libc::_exit(1),
-                    };
-                    libc::execvp(
-                        shell_cstr.as_ptr(),
-                        [shell_cstr.as_ptr(), std::ptr::null()].as_ptr(),
-                    );
-                } else {
-                    let cmd_cstrs: Vec<CString> = match config
-                        .command
-                        .iter()
-                        .map(|s| CString::new(s.as_str()))
-                        .collect()
-                    {
-                        Ok(values) => values,
-                        Err(_) => libc::_exit(1),
-                    };
-                    let mut argv: Vec<*const libc::c_char> =
-                        cmd_cstrs.iter().map(|c| c.as_ptr()).collect();
-                    argv.push(std::ptr::null());
-                    libc::execvp(cmd_cstrs[0].as_ptr(), argv.as_ptr());
-                }
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP, 0, 0, 0);
+
+                libc::execvp(command_cstrs[0].as_ptr(), command_argv.as_ptr());
                 libc::_exit(1);
             }
         }
@@ -216,11 +256,15 @@ impl Pty {
             }
         }
 
-        Ok(Self { master, child_pid })
+        let result = Self { master, child_pid };
+        debug_check_invariant!(result);
+        Ok(result)
     }
 
     /// Try to read from the PTY (non-blocking).
+    #[inline]
     pub fn try_read(&self, buf: &mut [u8]) -> Result<usize> {
+        requires!(!buf.is_empty());
         loop {
             // SAFETY: buf is a valid mutable slice; read writes at most buf.len() bytes.
             // The fd is the PTY master owned by self.
@@ -250,6 +294,7 @@ impl Pty {
         let mut written = 0;
 
         while written < buf.len() {
+            invariant!(written <= buf.len());
             // SAFETY: buf[written..] is a valid slice; write reads at most the remaining bytes.
             // The fd is the PTY master owned by self.
             let n = unsafe {
@@ -323,6 +368,7 @@ impl Pty {
 
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        requires!(cols > 0 && rows > 0);
         let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -377,6 +423,21 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
                 break;
             }
         }
+    }
+}
+
+impl CheckInvariant for Pty {
+    fn check_invariant(&self) {
+        invariant!(
+            self.master.as_raw_fd() >= 0,
+            "Pty master fd must be non-negative, got {}",
+            self.master.as_raw_fd()
+        );
+        invariant!(
+            self.child_pid > 0,
+            "Pty child_pid must be positive, got {}",
+            self.child_pid
+        );
     }
 }
 
