@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,6 +134,13 @@ impl FtFont {
     fn has_glyph(&self, ch: char) -> bool {
         let fth = ft::ft();
         unsafe { (fth.get_char_index)(self.face, ch as ft::FT_ULong) != 0 }
+    }
+
+    fn glyph_advance(&self, ch: char) -> f32 {
+        let fth = ft::ft();
+        let err = unsafe { (fth.load_char)(self.face, ch as ft::FT_ULong, ft::FT_LOAD_DEFAULT) };
+        if err != 0 { return 0.0; }
+        unsafe { (*(*self.face).glyph).metrics.horiAdvance as f32 / FREETYPE_FIXED_POINT_SCALE }
     }
 
     /// Returns (ascender, descender, line_height) in pixels.
@@ -821,8 +828,14 @@ unsafe fn fontconfig_pattern_file(
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
-    let mut seen = HashSet::with_capacity(paths.len());
-    paths.retain(|path| seen.insert(path.clone()));
+    let mut i = 0;
+    while i < paths.len() {
+        if paths[..i].contains(&paths[i]) {
+            paths.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
@@ -859,8 +872,7 @@ fn compute_cell_width(font: &FtFont) -> f32 {
     let samples = ['M', 'W', '@', '0'];
     let mut width = 0.0f32;
     for ch in samples {
-        let (bw, _, _, _, advance, _) = font.rasterize(ch);
-        width = width.max(advance.max(bw as f32));
+        width = width.max(font.glyph_advance(ch));
     }
     width.max(1.0)
 }

@@ -124,6 +124,7 @@ pub struct FT_Size_Metrics {
     pub max_advance: FT_Pos,
 }
 
+pub const FT_LOAD_DEFAULT: FT_Int32 = 0;
 pub const FT_LOAD_RENDER: FT_Int32 = 1 << 2;
 
 pub struct FtHandle {
