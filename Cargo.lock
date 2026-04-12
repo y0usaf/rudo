@@ -102,6 +102,7 @@ name = "rudo"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "cc",
  "libc",
  "unicode-width",
  "vte",

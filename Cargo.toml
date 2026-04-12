@@ -24,6 +24,9 @@ libc = "0.2"
 # Utils
 unicode-width = "0.2"
 
+[build-dependencies]
+cc = "1"
+
 [profile.dev]
 opt-level = 1        # basic optimizations even in debug (much faster runtime)
 debug = 1            # line tables only (faster builds + linking)
