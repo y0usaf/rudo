@@ -150,6 +150,18 @@ impl CoreApp {
         cursor_renderer.set_trail_size(config.cursor.trail_size);
         cursor_renderer.set_blink_enabled(config.cursor.blink);
         cursor_renderer.set_blink_interval(config.cursor.blink_interval);
+        cursor_renderer.set_vfx_settings(crate::cursor_vfx::VfxSettings {
+            mode: crate::cursor_vfx::parse_vfx_modes(&config.cursor.vfx_mode),
+            opacity: config.cursor.vfx_opacity,
+            particle_lifetime: config.cursor.vfx_particle_lifetime,
+            particle_highlight_lifetime: config.cursor.vfx_particle_highlight_lifetime,
+            particle_density: config.cursor.vfx_particle_density,
+            particle_speed: config.cursor.vfx_particle_speed,
+            particle_phase: config.cursor.vfx_particle_phase,
+            particle_curl: config.cursor.vfx_particle_curl,
+        });
+        cursor_renderer.set_smooth_blink(config.cursor.smooth_blink);
+        cursor_renderer.set_unfocused_outline_width(config.cursor.unfocused_outline_width);
         match config.cursor.style.as_str() {
             "beam" | "bar" | "vertical" => {
                 cursor_renderer.set_shape(crate::cursor::CursorShape::Beam)
@@ -517,6 +529,7 @@ impl CoreApp {
     }
 
     pub fn handle_focus_change(&mut self, focused: bool) {
+        self.cursor_renderer.set_unfocused(!focused);
         if self.parser.focus_reporting() {
             if focused {
                 self.write_pty(b"\x1b[I");
@@ -728,7 +741,7 @@ fn clipboard_pipe(cmd: &str, args: &[&str], text: &str) {
                     let _ = child.kill();
                     break;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
         }
@@ -761,7 +774,7 @@ fn clipboard_read(cmd: &str, args: &[&str]) -> Option<String> {
                 let _ = child.kill();
                 return None;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(_) => return None,
         }
     }

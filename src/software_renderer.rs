@@ -3,6 +3,7 @@
 
 use crate::contracts::CheckInvariant;
 use crate::cursor::CursorRenderer;
+use crate::cursor_vfx::ParticleShape;
 use crate::font::FontAtlas;
 use crate::terminal::cell::{CellFlags, ColorSource, PackedColor};
 use crate::terminal::grid::Grid;
@@ -19,9 +20,13 @@ const BT709_LUMA_GREEN: f32 = 0.7152;
 const BT709_LUMA_BLUE: f32 = 0.0722;
 const LUMA_CONTRAST_THRESHOLD: f32 = 0.5;
 const MAX_COLOR_CHANNEL: f32 = 255.0;
-const MAX_COLOR_CHANNEL_U8: u16 = 255;
-const ALPHA_ROUND_BIAS_U8: u16 = 127;
+
+
 const DEGENERATE_EDGE_EPSILON_SQ: f32 = 0.0001;
+
+/// Fast division by 255.
+#[inline(always)]
+fn div255(v: u16) -> u16 { let t = v + 128; (t + (t >> 8)) >> 8 }
 const DEFAULT_FONT_DPI: f32 = 96.0;
 const POINTS_PER_INCH: f32 = 72.0;
 pub(crate) const CURSOR_GEOMETRY_EPSILON: f32 = 0.001;
@@ -444,12 +449,11 @@ impl SoftwareRenderer {
             );
         }
 
-        if draw_cursor
-            && grid.cursor_visible()
-            && cursor.is_visible()
-            && !grid.is_viewing_scrollback()
-        {
-            self.draw_animated_cursor(fb, grid, cursor);
+        if draw_cursor && !grid.is_viewing_scrollback() {
+            if grid.cursor_visible() && cursor.is_visible() {
+                self.draw_animated_cursor(fb, grid, cursor);
+            }
+            self.draw_vfx_particles(fb, cursor);
         }
     }
 
@@ -491,38 +495,239 @@ impl SoftwareRenderer {
             ),
         ];
 
-        let cursor_color = Rgb::from_packed(self.theme.cursor);
+        let base_cursor_color = Rgb::from_packed(self.theme.cursor);
+        // Apply smooth blink opacity to cursor color alpha
+        let blink_alpha = cursor.blink_opacity();
+        let cursor_alpha = (blink_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+
         match cursor.shape {
             crate::cursor::CursorShape::Block => {
-                self.fill_quad(fb, corners_px, cursor_color);
-                let cursor_col = grid.cursor_col().min(grid.cols().saturating_sub(1));
-                let cursor_row = grid.cursor_row().min(grid.rows().saturating_sub(1));
-                let cell = grid.cell(cursor_col, cursor_row);
-                let cell_x = self.col_boundary(cursor_col);
-                let cell_y = self.row_boundary(cursor_row);
-                let cell_w = self
-                    .col_boundary(cursor_col.saturating_add(1))
-                    .saturating_sub(cell_x);
-                let cell_h = self
-                    .row_boundary(cursor_row.saturating_add(1))
-                    .saturating_sub(cell_y);
-                self.draw_cell_glyph_clipped(
-                    fb,
-                    cell_x,
-                    cell_y,
-                    cell_w,
-                    cell_h,
-                    cell.character(),
-                    GlyphStyle {
-                        color: contrasting_cursor_text_color(cursor_color),
-                        bold: cell.flags.contains(CellFlags::BOLD),
-                        italic: cell.flags.contains(CellFlags::ITALIC),
-                    },
-                    corners_px,
-                );
+                if cursor.is_unfocused() {
+                    // Draw only the outline when unfocused
+                    let outline_w = cursor.unfocused_outline_width();
+                    let stroke_px = (outline_w * self.cell_width.min(self.cell_height)).max(1.0);
+                    self.draw_unfocused_outline(fb, corners_px, base_cursor_color, cursor_alpha, stroke_px);
+                } else if cursor_alpha == 255 {
+                    self.fill_quad(fb, corners_px, base_cursor_color);
+                    let cursor_col = grid.cursor_col().min(grid.cols().saturating_sub(1));
+                    let cursor_row = grid.cursor_row().min(grid.rows().saturating_sub(1));
+                    let cell = grid.cell(cursor_col, cursor_row);
+                    let cell_x = self.col_boundary(cursor_col);
+                    let cell_y = self.row_boundary(cursor_row);
+                    let cell_w = self
+                        .col_boundary(cursor_col.saturating_add(1))
+                        .saturating_sub(cell_x);
+                    let cell_h = self
+                        .row_boundary(cursor_row.saturating_add(1))
+                        .saturating_sub(cell_y);
+                    self.draw_cell_glyph_clipped(
+                        fb,
+                        cell_x,
+                        cell_y,
+                        cell_w,
+                        cell_h,
+                        cell.character(),
+                        GlyphStyle {
+                            color: contrasting_cursor_text_color(base_cursor_color),
+                            bold: cell.flags.contains(CellFlags::BOLD),
+                            italic: cell.flags.contains(CellFlags::ITALIC),
+                        },
+                        corners_px,
+                    );
+                } else if cursor_alpha > 0 {
+                    self.fill_quad_alpha(fb, corners_px, base_cursor_color, cursor_alpha);
+                }
             }
             crate::cursor::CursorShape::Beam | crate::cursor::CursorShape::Underline => {
-                self.stroke_quad_edges(fb, corners_px, cursor_color);
+                if cursor_alpha == 255 {
+                    self.stroke_quad_edges(fb, corners_px, base_cursor_color);
+                } else if cursor_alpha > 0 {
+                    self.stroke_quad_edges_alpha(fb, corners_px, base_cursor_color, cursor_alpha);
+                }
+            }
+        }
+    }
+
+    fn fill_quad_alpha(&self, fb: &mut FrameBuffer<'_>, quad: [(f32, f32); 4], color: Rgb, alpha: u8) {
+        if alpha == 0 { return; }
+        let (min_x, min_y, max_x, max_y) = quad_aabb(&quad);
+        for y in min_y..max_y.min(fb.height) {
+            for x in min_x..max_x.min(fb.width) {
+                let p = (x as f32 + 0.5, y as f32 + 0.5);
+                if point_in_triangle(p, quad[0], quad[1], quad[2])
+                    || point_in_triangle(p, quad[0], quad[2], quad[3])
+                {
+                    blend_bgra(fb, x, y, color, alpha);
+                }
+            }
+        }
+    }
+
+    fn stroke_quad_edges_alpha(&self, fb: &mut FrameBuffer<'_>, quad: [(f32, f32); 4], color: Rgb, alpha: u8) {
+        if alpha == 0 { return; }
+        let edges = [
+            (quad[0], quad[1]),
+            (quad[1], quad[2]),
+            (quad[2], quad[3]),
+            (quad[3], quad[0]),
+        ];
+        for &(a, c) in &edges {
+            self.fill_edge_strip_alpha(fb, a, c, color, alpha);
+        }
+    }
+
+    fn fill_edge_strip_alpha(
+        &self,
+        fb: &mut FrameBuffer<'_>,
+        start: (f32, f32),
+        end: (f32, f32),
+        color: Rgb,
+        alpha: u8,
+    ) {
+        let delta_x = end.0 - start.0;
+        let delta_y = end.1 - start.1;
+        let length_sq = delta_x * delta_x + delta_y * delta_y;
+        if length_sq <= DEGENERATE_EDGE_EPSILON_SQ {
+            return;
+        }
+        let min_x = start.0.min(end.0).floor().max(0.0) as i32 - 1;
+        let max_x = start.0.max(end.0).ceil().min(fb.width as f32) as i32 + 1;
+        let min_y = start.1.min(end.1).floor().max(0.0) as i32 - 1;
+        let max_y = start.1.max(end.1).ceil().min(fb.height as f32) as i32 + 1;
+        let inv_length_sq = 1.0 / length_sq;
+        for y in min_y.max(0) as u32..(max_y.max(0) as u32).min(fb.height) {
+            let py = y as f32 + 0.5;
+            let from_start_y = py - start.1;
+            let y_dot = from_start_y * delta_y;
+            for x in min_x.max(0) as u32..(max_x.max(0) as u32).min(fb.width) {
+                let px = x as f32 + 0.5;
+                let from_start_x = px - start.0;
+                let along =
+                    ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
+                let closest_x = start.0 + along * delta_x;
+                let closest_y = start.1 + along * delta_y;
+                let dist_x = px - closest_x;
+                let dist_y = py - closest_y;
+                if dist_x * dist_x + dist_y * dist_y <= EDGE_STRIP_DISTANCE_SQ {
+                    blend_bgra(fb, x, y, color, alpha);
+                }
+            }
+        }
+    }
+
+    fn draw_unfocused_outline(
+        &self,
+        fb: &mut FrameBuffer<'_>,
+        quad: [(f32, f32); 4],
+        color: Rgb,
+        alpha: u8,
+        stroke_px: f32,
+    ) {
+        if alpha == 0 { return; }
+        // Draw outline by rendering four edge strips with the given stroke width
+        let edges = [
+            (quad[0], quad[1]),
+            (quad[1], quad[2]),
+            (quad[2], quad[3]),
+            (quad[3], quad[0]),
+        ];
+        let half = stroke_px * 0.5;
+        let dist_sq = half * half;
+        for &(start, end) in &edges {
+            let delta_x = end.0 - start.0;
+            let delta_y = end.1 - start.1;
+            let length_sq = delta_x * delta_x + delta_y * delta_y;
+            if length_sq <= DEGENERATE_EDGE_EPSILON_SQ {
+                continue;
+            }
+            let min_x = (start.0.min(end.0) - half).floor().max(0.0) as u32;
+            let max_x = (start.0.max(end.0) + half).ceil().min(fb.width as f32) as u32;
+            let min_y = (start.1.min(end.1) - half).floor().max(0.0) as u32;
+            let max_y = (start.1.max(end.1) + half).ceil().min(fb.height as f32) as u32;
+            let inv_length_sq = 1.0 / length_sq;
+            for y in min_y..max_y.min(fb.height) {
+                let py = y as f32 + 0.5;
+                let from_start_y = py - start.1;
+                let y_dot = from_start_y * delta_y;
+                for x in min_x..max_x.min(fb.width) {
+                    let px = x as f32 + 0.5;
+                    let from_start_x = px - start.0;
+                    let along = ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
+                    let closest_x = start.0 + along * delta_x;
+                    let closest_y = start.1 + along * delta_y;
+                    let dx = px - closest_x;
+                    let dy = py - closest_y;
+                    if dx * dx + dy * dy <= dist_sq {
+                        blend_bgra(fb, x, y, color, alpha);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_vfx_particles(
+        &self,
+        fb: &mut FrameBuffer<'_>,
+        cursor: &CursorRenderer,
+    ) {
+        let particles = cursor.vfx_particles();
+        if particles.is_empty() {
+            return;
+        }
+        let cursor_color = Rgb::from_packed(self.theme.cursor);
+        let ox = self.offset_x;
+        let oy = self.offset_y;
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+
+        for p in &particles {
+            let px = ox + p.x * cw;
+            let py = oy + p.y * ch;
+            let rx = p.radius * cw * 0.5;
+            let ry = p.radius * ch * 0.5;
+
+            match p.shape {
+                ParticleShape::FilledOval => {
+                    draw_filled_oval(fb, px, py, rx, ry, cursor_color, p.alpha);
+                }
+                ParticleShape::StrokedOval => {
+                    let sw = p.stroke_width * ch;
+                    draw_stroked_oval(fb, px, py, rx, ry, sw, cursor_color, p.alpha);
+                }
+                ParticleShape::FilledRect => {
+                    let x0 = (px - rx).round().max(0.0) as u32;
+                    let y0 = (py - ry).round().max(0.0) as u32;
+                    let x1 = (px + rx).round().min(fb.width as f32) as u32;
+                    let y1 = (py + ry).round().min(fb.height as f32) as u32;
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            blend_bgra(fb, x, y, cursor_color, p.alpha);
+                        }
+                    }
+                }
+                ParticleShape::StrokedRect => {
+                    let sw = (p.stroke_width * ch).max(1.0) as u32;
+                    let x0 = (px - rx).round().max(0.0) as u32;
+                    let y0 = (py - ry).round().max(0.0) as u32;
+                    let x1 = (px + rx).round().min(fb.width as f32) as u32;
+                    let y1 = (py + ry).round().min(fb.height as f32) as u32;
+                    // Top edge
+                    for y in y0..y0.saturating_add(sw).min(y1) {
+                        for x in x0..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                    }
+                    // Bottom edge
+                    for y in y1.saturating_sub(sw).max(y0)..y1 {
+                        for x in x0..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                    }
+                    // Left edge
+                    for y in y0..y1 {
+                        for x in x0..x0.saturating_add(sw).min(x1) { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                    }
+                    // Right edge
+                    for y in y0..y1 {
+                        for x in x1.saturating_sub(sw).max(x0)..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                    }
+                }
             }
         }
     }
@@ -535,30 +740,7 @@ impl SoftwareRenderer {
             return;
         }
 
-        let min_x = quad
-            .iter()
-            .map(|p| p.0)
-            .fold(f32::INFINITY, f32::min)
-            .floor()
-            .max(0.0) as u32;
-        let min_y = quad
-            .iter()
-            .map(|p| p.1)
-            .fold(f32::INFINITY, f32::min)
-            .floor()
-            .max(0.0) as u32;
-        let max_x = quad
-            .iter()
-            .map(|p| p.0)
-            .fold(f32::NEG_INFINITY, f32::max)
-            .ceil()
-            .max(0.0) as u32;
-        let max_y = quad
-            .iter()
-            .map(|p| p.1)
-            .fold(f32::NEG_INFINITY, f32::max)
-            .ceil()
-            .max(0.0) as u32;
+        let (min_x, min_y, max_x, max_y) = quad_aabb(&quad);
         for y in min_y..max_y.min(fb.height) {
             for x in min_x..max_x.min(fb.width) {
                 let p = (x as f32 + 0.5, y as f32 + 0.5);
@@ -811,6 +993,20 @@ fn axis_aligned_fill_span(start: f32, end: f32, limit: u32) -> Option<(u32, u32)
     let pixel_start = (start - 0.5).ceil().max(0.0).min(limit as f32) as u32;
     let pixel_end = ((end - 0.5).floor() + 1.0).max(0.0).min(limit as f32) as u32;
     (pixel_end > pixel_start).then_some((pixel_start, pixel_end))
+}
+
+
+/// Compute axis-aligned bounding box of a quad as pixel coordinates.
+#[inline(always)]
+fn quad_aabb(quad: &[(f32, f32); 4]) -> (u32, u32, u32, u32) {
+    let (mut lo_x, mut lo_y) = (quad[0].0, quad[0].1);
+    let (mut hi_x, mut hi_y) = (lo_x, lo_y);
+    for &(x, y) in &quad[1..] {
+        if x < lo_x { lo_x = x; } else if x > hi_x { hi_x = x; }
+        if y < lo_y { lo_y = y; } else if y > hi_y { hi_y = y; }
+    }
+    (lo_x.floor().max(0.0) as u32, lo_y.floor().max(0.0) as u32,
+     hi_x.ceil().max(0.0) as u32, hi_y.ceil().max(0.0) as u32)
 }
 
 #[inline(always)]
@@ -1302,7 +1498,7 @@ fn contrasting_cursor_text_color(color: Rgb) -> Rgb {
 /// source alpha is already 8-bit from the font atlas.
 #[inline(always)]
 fn premultiply_8(channel: u8, alpha: u8) -> u8 {
-    ((channel as u16 * alpha as u16 + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8) as u8
+    div255(channel as u16 * alpha as u16) as u8
 }
 
 #[inline(always)]
@@ -1369,10 +1565,10 @@ fn blend_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, color: Rgb, alpha: u8) {
     let inv = 255u16 - alpha as u16;
     unsafe {
         let p = fb.pixels.as_mut_ptr().add(idx);
-        *p       = (src[0] as u16 + ((*p       as u16 * inv + 127) / 255)).min(255) as u8;
-        *p.add(1)= (src[1] as u16 + ((*p.add(1) as u16 * inv + 127) / 255)).min(255) as u8;
-        *p.add(2)= (src[2] as u16 + ((*p.add(2) as u16 * inv + 127) / 255)).min(255) as u8;
-        *p.add(3)= (src[3] as u16 + ((*p.add(3) as u16 * inv + 127) / 255)).min(255) as u8;
+        *p       = (src[0] as u16 + ((*p       as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(1)= (src[1] as u16 + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(2)= (src[2] as u16 + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(3)= (src[3] as u16 + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
     }
 }
 
@@ -1431,13 +1627,13 @@ fn blit_glyph_fast(
                 } else {
                     let inv = 255u16 - alpha as u16;
                     let sa = alpha as u16;
-                    let sb = (cb as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
-                    let sg = (cg as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
-                    let sr = (cr as u16 * sa + ALPHA_ROUND_BIAS_U8) / MAX_COLOR_CHANNEL_U8;
-                    *p       = (sb + (*p       as u16 * inv + 127) / 255).min(255) as u8;
-                    *p.add(1)= (sg + (*p.add(1) as u16 * inv + 127) / 255).min(255) as u8;
-                    *p.add(2)= (sr + (*p.add(2) as u16 * inv + 127) / 255).min(255) as u8;
-                    *p.add(3)= (sa + (*p.add(3) as u16 * inv + 127) / 255).min(255) as u8;
+                    let sb = div255(cb as u16 * sa);
+                    let sg = div255(cg as u16 * sa);
+                    let sr = div255(cr as u16 * sa);
+                    *p       = (sb + ((*p       as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(1)= (sg + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(2)= (sr + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(3)= (sa + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
                 }
             }
         }
@@ -1445,6 +1641,95 @@ fn blit_glyph_fast(
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+fn draw_filled_oval(
+    fb: &mut FrameBuffer<'_>,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    color: Rgb,
+    alpha: u8,
+) {
+    if rx < 0.5 || ry < 0.5 || alpha == 0 {
+        return;
+    }
+    let y0 = (cy - ry).floor().max(0.0) as u32;
+    let y1 = (cy + ry).ceil().min(fb.height as f32) as u32;
+    let inv_ry_sq = 1.0 / (ry * ry);
+    for y in y0..y1 {
+        let dy = y as f32 + 0.5 - cy;
+        let t = 1.0 - dy * dy * inv_ry_sq;
+        if t <= 0.0 {
+            continue;
+        }
+        let half_w = rx * t.sqrt();
+        let x0 = (cx - half_w).floor().max(0.0) as u32;
+        let x1 = (cx + half_w).ceil().min(fb.width as f32) as u32;
+        for x in x0..x1 {
+            blend_bgra(fb, x, y, color, alpha);
+        }
+    }
+}
+
+fn draw_stroked_oval(
+    fb: &mut FrameBuffer<'_>,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    stroke_width: f32,
+    color: Rgb,
+    alpha: u8,
+) {
+    if rx < 0.5 || ry < 0.5 || alpha == 0 {
+        return;
+    }
+    let outer_rx = rx + stroke_width * 0.5;
+    let outer_ry = ry + stroke_width * 0.5;
+    let inner_rx = (rx - stroke_width * 0.5).max(0.0);
+    let inner_ry = (ry - stroke_width * 0.5).max(0.0);
+    let y0 = (cy - outer_ry).floor().max(0.0) as u32;
+    let y1 = (cy + outer_ry).ceil().min(fb.height as f32) as u32;
+    let inv_outer_ry_sq = 1.0 / (outer_ry * outer_ry).max(1e-6);
+    let has_inner = inner_rx > 0.5 && inner_ry > 0.5;
+    let inv_inner_ry_sq = if has_inner { 1.0 / (inner_ry * inner_ry) } else { 0.0 };
+    for y in y0..y1 {
+        let dy = y as f32 + 0.5 - cy;
+        let outer_t = 1.0 - dy * dy * inv_outer_ry_sq;
+        if outer_t <= 0.0 {
+            continue;
+        }
+        let outer_hw = outer_rx * outer_t.sqrt();
+        let ox0 = (cx - outer_hw).floor().max(0.0) as u32;
+        let ox1 = (cx + outer_hw).ceil().min(fb.width as f32) as u32;
+
+        if has_inner {
+            let inner_t = 1.0 - dy * dy * inv_inner_ry_sq;
+            if inner_t > 0.0 {
+                let inner_hw = inner_rx * inner_t.sqrt();
+                let ix0 = (cx - inner_hw).ceil() as u32;
+                let ix1 = (cx + inner_hw).floor() as u32;
+                // Left arc
+                for x in ox0..ix0.min(ox1) {
+                    blend_bgra(fb, x, y, color, alpha);
+                }
+                // Right arc
+                for x in ix1.max(ox0)..ox1 {
+                    blend_bgra(fb, x, y, color, alpha);
+                }
+            } else {
+                for x in ox0..ox1 {
+                    blend_bgra(fb, x, y, color, alpha);
+                }
+            }
+        } else {
+            for x in ox0..ox1 {
+                blend_bgra(fb, x, y, color, alpha);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
