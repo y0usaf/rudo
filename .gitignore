@@ -1,4 +1,6 @@
-/target
-/result
-/ref
-/*.rlib
+build/
+build-*/
+*.o
+/core
+/core.*
+/tmp/

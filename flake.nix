@@ -1,140 +1,94 @@
 {
-  description = "rudo - a Wayland-native terminal emulator with animated cursor rendering";
+  description = "rudo-c - C11 Wayland terminal emulator";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    crane,
-  }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
-    forAllSystems = nixpkgs.lib.genAttrs systems;
-    pkgsFor = forAllSystems (system: import nixpkgs {inherit system;});
-    runtimeLibsFor = system:
-      with pkgsFor.${system}; [
-        freetype
-        libGL
-        libxkbcommon
-        wayland
-      ];
-    runtimePackagesFor = system:
-      with pkgsFor.${system}; [
-        fontconfig
-        dejavu_fonts
-        liberation_ttf
-      ];
-    mkApp = program: {
-      type = "app";
-      inherit program;
-    };
-    nixosModule = import ./nix/modules/nixos.nix {inherit self;};
-    homeManagerModule = import ./nix/modules/home-manager.nix {inherit self;};
-  in {
-    packages = forAllSystems (system: let
-      pkgs = pkgsFor.${system};
-      lib = pkgs.lib;
-      craneLib = crane.mkLib pkgs;
-      runtimeLibs = runtimeLibsFor system;
-      runtimePackages = runtimePackagesFor system;
-
-      useMold = pkgs.stdenv.isLinux;
-
-      commonArgs = {
-        src = let
-          xmlFilter = path: _type: builtins.match ".*\\.xml$" path != null;
-          srcFilter = path: type:
-            (xmlFilter path type) || (craneLib.filterCargoSources path type);
-        in lib.cleanSourceWith {
-          src = ./.;
-          filter = srcFilter;
-        };
-        strictDeps = true;
-
-        nativeBuildInputs = with pkgs;
-          [
-            pkg-config
-            makeWrapper
-          ]
-          ++ lib.optionals useMold [clang mold];
-
-        buildInputs = runtimeLibs ++ runtimePackages;
-
-        LD_LIBRARY_PATH = lib.makeLibraryPath runtimeLibs;
-      }
-      // lib.optionalAttrs useMold {
-        CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
-      };
-
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-      rudo = craneLib.buildPackage (commonArgs // {
-        inherit cargoArtifacts;
-        # `cargo test` passes locally, but currently exits non-zero when invoked
-        # from the Nix builder even though the produced test binary succeeds when
-        # run directly in the kept build directory. Disable package-time checks so
-        # `nix run`/`nix build` remain usable until the Nix test harness issue is
-        # resolved.
-        doCheck = false;
-
-        postFixup = ''
-          wrapProgram $out/bin/rudo \
-            --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
-            --prefix PATH : ${lib.makeBinPath runtimePackages} \
-            --prefix XDG_DATA_DIRS : ${lib.concatStringsSep ":" (map (pkg: "${pkg}/share") runtimePackages)}
-        '';
-      });
-    in rec {
-      default = rudo;
-      inherit rudo;
-    });
-
-    apps = forAllSystems (system: let
-      program = "${self.packages.${system}.rudo}/bin/rudo";
-      app = mkApp program;
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
-      default = app;
-      rudo = app;
-    });
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          lib = pkgs.lib;
+          runtimeLibs = with pkgs; [ wayland libxkbcommon fontconfig freetype ];
+          runtimeBins = with pkgs; [ wl-clipboard ];
+        in rec {
+          default = rudo;
+          rudo = pkgs.stdenv.mkDerivation {
+            pname = "rudo-c";
+            version = "0.1.0";
+            src = lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                let
+                  base = builtins.baseNameOf path;
+                in
+                  !(lib.elem base [ ".git" "build" "build-full" "build-rel" "build-asan" "build-bench" ])
+                  && !(lib.hasSuffix ".o" base)
+                  && base != "core"
+                  && base != "core.0";
+            };
 
-    nixosModules = {
-      default = nixosModule;
-      rudo = nixosModule;
-    };
+            nativeBuildInputs = with pkgs; [ meson ninja pkg-config wayland-scanner makeWrapper ];
+            buildInputs = runtimeLibs;
 
-    homeManagerModules = {
-      default = homeManagerModule;
-      rudo = homeManagerModule;
-    };
+            configurePhase = ''
+              runHook preConfigure
+              meson setup build --buildtype=release --prefix=$out
+              runHook postConfigure
+            '';
 
-    devShells = forAllSystems (system: let
-      pkgs = pkgsFor.${system};
-      lib = pkgs.lib;
-      runtimeLibs = runtimeLibsFor system;
-      runtimePackages = runtimePackagesFor system;
+            buildPhase = ''
+              runHook preBuild
+              meson compile -C build
+              runHook postBuild
+            '';
 
-      useMold = pkgs.stdenv.isLinux;
-    in {
-      default = pkgs.mkShell ({
-          packages = with pkgs;
-            [cargo rustc rustfmt clippy pkg-config]
-            ++ lib.optionals useMold [clang mold]
-            ++ runtimeLibs
-            ++ runtimePackages;
-
-          shellHook = ''
-            export LD_LIBRARY_PATH="${lib.makeLibraryPath runtimeLibs}:''${LD_LIBRARY_PATH:-}"
-            export PATH="${lib.makeBinPath runtimePackages}:''${PATH:-}"
-            export XDG_DATA_DIRS="${lib.concatStringsSep ":" (map (pkg: "${pkg}/share") runtimePackages)}:''${XDG_DATA_DIRS:-}"
-            echo "rudo dev shell"
-          '';
-        }
-        // lib.optionalAttrs useMold {
-          CARGO_BUILD_RUSTFLAGS = "-C linker=clang -C link-arg=-fuse-ld=${pkgs.mold}/bin/mold";
+            installPhase = ''
+              runHook preInstall
+              meson install -C build --destdir "$TMPDIR/dest"
+              mkdir -p $out
+              cp -a "$TMPDIR/dest/$out"/. "$out/"
+              chmod +x $out/bin/rudo
+              wrapProgram $out/bin/rudo \
+                --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
+                --prefix PATH : ${lib.makeBinPath runtimeBins}
+              runHook postInstall
+            '';
+          };
         });
-    });
-  };
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.rudo}/bin/rudo";
+        };
+        rudo = {
+          type = "app";
+          program = "${self.packages.${system}.rudo}/bin/rudo";
+        };
+      });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          libs = with pkgs; [ wayland libxkbcommon fontconfig freetype ];
+        in {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              meson ninja pkg-config gcc wayland-scanner
+              wayland wayland-protocols libxkbcommon fontconfig freetype
+            ];
+            shellHook = ''
+              export PATH="${pkgs.lib.makeBinPath [ pkgs.meson pkgs.ninja pkgs.pkg-config pkgs.gcc pkgs.wayland-scanner pkgs.wayland pkgs.wayland-protocols pkgs.libxkbcommon pkgs.fontconfig pkgs.freetype ]}:$PATH"
+              export PKG_CONFIG_PATH="${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" libs}:${pkgs.lib.makeSearchPath "share/pkgconfig" [ pkgs.wayland-protocols ]}:$PKG_CONFIG_PATH"
+              echo "rudo-c dev shell"
+            '';
+          };
+        });
+    };
 }
