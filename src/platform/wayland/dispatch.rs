@@ -1,4 +1,5 @@
 //! Wayland protocol dispatch implementations.
+#![allow(irrefutable_let_patterns)]
 
 use std::os::fd::AsRawFd;
 
@@ -207,13 +208,12 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WaylandState 
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            // Wire format: scale × 120 (e.g. 180 = 1.5×, 240 = 2.0×)
-            let new_scale = scale as f32 / FRACTIONAL_SCALE_DIVISOR;
-            state.fractional_scale_value = Some(new_scale);
-            if state.update_scale() {
-                state.frame_ready = true;
-            }
+        let wp_fractional_scale_v1::Event::PreferredScale { scale } = event;
+        // Wire format: scale × 120 (e.g. 180 = 1.5×, 240 = 2.0×)
+        let new_scale = scale as f32 / FRACTIONAL_SCALE_DIVISOR;
+        state.fractional_scale_value = Some(new_scale);
+        if state.update_scale() {
+            state.frame_ready = true;
         }
     }
 }
@@ -286,9 +286,8 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm_base.pong(serial);
-        }
+        let xdg_wm_base::Event::Ping { serial } = event;
+        wm_base.pong(serial);
     }
 }
 
@@ -301,16 +300,15 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            // Like foot, only apply the pending toplevel configure after we've
-            // acked the matching xdg_surface.configure. Rendering/attaching a
-            // buffer for the new logical size before that can trip protocol
-            // errors during fast fullscreen/resize transitions.
-            xdg_surface.ack_configure(serial);
-            state.configured = true;
-            state.apply_pending_configure();
-            state.frame_ready = true;
-        }
+        let xdg_surface::Event::Configure { serial } = event;
+        // Like foot, only apply the pending toplevel configure after we've
+        // acked the matching xdg_surface.configure. Rendering/attaching a
+        // buffer for the new logical size before that can trip protocol
+        // errors during fast fullscreen/resize transitions.
+        xdg_surface.ack_configure(serial);
+        state.configured = true;
+        state.apply_pending_configure();
+        state.frame_ready = true;
     }
 }
 
@@ -347,7 +345,7 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for Way
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zxdg_toplevel_decoration_v1::Event::Configure { mode: _mode } = event {}
+        let zxdg_toplevel_decoration_v1::Event::Configure { mode: _mode } = event;
     }
 }
 
