@@ -56,6 +56,8 @@ pub const DEFAULT_SHELL_FALLBACK: &str = "/bin/sh";
 
 pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 
+pub const DEFAULT_WINDOW_OPACITY: f32 = 1.0;
+
 pub const DEFAULT_CLIPBOARD_COPY_COMMAND: &str = "wl-copy";
 pub const DEFAULT_CLIPBOARD_PASTE_COMMAND: &str = "wl-paste";
 pub const DEFAULT_PRIMARY_COPY_COMMAND: &str = "wl-copy";

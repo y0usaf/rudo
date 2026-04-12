@@ -7,19 +7,15 @@ use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
+use crate::protocols::fractional_scale::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1};
+use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
+use crate::protocols::xdg_decoration::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
+use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use libc::{POLLERR, POLLHUP, POLLIN};
 use wayland_client::protocol::{
     wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, QueueHandle};
-use crate::protocols::fractional_scale::{
-    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
-};
-use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
-use crate::protocols::xdg_decoration::{
-    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
-};
-use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use crate::cli::CliArgs;
 use crate::core_app::CoreApp;
@@ -39,6 +35,21 @@ const MAX_WINDOW_DIMENSION: u32 = 16_384;
 #[inline]
 fn clamp_window_dimension(size: u32) -> u32 {
     size.clamp(1, MAX_WINDOW_DIMENSION)
+}
+
+#[inline]
+fn window_background_alpha(opacity: f32) -> u8 {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (opacity * 255.0) as u8
+}
+
+#[inline]
+fn window_surface_is_opaque(opacity: f32) -> bool {
+    window_background_alpha(opacity) == u8::MAX
 }
 
 type CursorCorners = [(f32, f32); 4];
@@ -161,12 +172,18 @@ impl WaylandState {
             return;
         };
 
-        let region: wl_region::WlRegion = compositor.create_region(qh, ());
-        // Use i32::MAX so the opaque hint covers the surface regardless of
-        // in-flight resizes, matching foot's wl_region_add(0, 0, INT32_MAX, INT32_MAX).
-        region.add(0, 0, i32::MAX, i32::MAX);
-        surface.set_opaque_region(Some(&region));
-        region.destroy();
+        if !window_surface_is_opaque(self.app.config().window.opacity) {
+            // Transparent: clear the opaque region so the compositor
+            // alpha-blends the entire surface.
+            surface.set_opaque_region(None);
+        } else {
+            let region: wl_region::WlRegion = compositor.create_region(qh, ());
+            // Use i32::MAX so the opaque hint covers the surface regardless of
+            // in-flight resizes, matching foot's wl_region_add(0, 0, INT32_MAX, INT32_MAX).
+            region.add(0, 0, i32::MAX, i32::MAX);
+            surface.set_opaque_region(Some(&region));
+            region.destroy();
+        }
         self.opaque_region_dirty = false;
     }
 
@@ -490,6 +507,7 @@ impl WaylandState {
             return;
         }
         self.update_window_geometry();
+        self.update_opaque_region(qh);
         self.ensure_buffers(qh);
 
         let Some(target_idx) = self.buffers.iter().position(|b| !b.busy) else {
@@ -759,6 +777,9 @@ pub fn run(cli: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         app.theme().clone(),
         padding,
     );
+    let opacity = app.config().window.opacity;
+    let bg_alpha = window_background_alpha(opacity);
+    renderer.set_background_alpha(bg_alpha);
     let (cw, ch) = renderer.cell_size();
     let (fit_width, fit_height) =
         renderer.window_size_for_grid(configured_cols as usize, configured_rows as usize);
@@ -935,5 +956,15 @@ mod tests {
         assert_eq!(merge_timeout_ms(-1, Some(Duration::from_millis(10))), 10);
         assert_eq!(merge_timeout_ms(50, Some(Duration::from_millis(10))), 10);
         assert_eq!(merge_timeout_ms(5, Some(Duration::from_millis(10))), 5);
+    }
+
+    #[test]
+    fn window_background_alpha_preserves_subopaque_values() {
+        assert_eq!(window_background_alpha(1.0), 255);
+        assert_eq!(window_background_alpha(0.999), 254);
+        assert_eq!(window_background_alpha(0.5), 127);
+        assert_eq!(window_background_alpha(f32::NAN), 255);
+        assert!(window_surface_is_opaque(1.0));
+        assert!(!window_surface_is_opaque(0.999));
     }
 }

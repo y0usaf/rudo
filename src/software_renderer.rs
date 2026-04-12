@@ -21,12 +21,14 @@ const BT709_LUMA_BLUE: f32 = 0.0722;
 const LUMA_CONTRAST_THRESHOLD: f32 = 0.5;
 const MAX_COLOR_CHANNEL: f32 = 255.0;
 
-
 const DEGENERATE_EDGE_EPSILON_SQ: f32 = 0.0001;
 
 /// Fast division by 255.
 #[inline(always)]
-fn div255(v: u16) -> u16 { let t = v + 128; (t + (t >> 8)) >> 8 }
+fn div255(v: u16) -> u16 {
+    let t = v + 128;
+    (t + (t >> 8)) >> 8
+}
 const DEFAULT_FONT_DPI: f32 = 96.0;
 const POINTS_PER_INCH: f32 = 72.0;
 pub(crate) const CURSOR_GEOMETRY_EPSILON: f32 = 0.001;
@@ -121,6 +123,7 @@ pub struct SoftwareRenderer {
     offset_y: f32,
     col_boundaries: Vec<u32>,
     row_boundaries: Vec<u32>,
+    background_alpha: u8,
 }
 
 #[allow(dead_code)]
@@ -147,11 +150,16 @@ impl SoftwareRenderer {
             offset_y: 0.0,
             col_boundaries: Vec::new(),
             row_boundaries: Vec::new(),
+            background_alpha: 255,
         }
     }
 
     pub fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
+    }
+
+    pub fn set_background_alpha(&mut self, alpha: u8) {
+        self.background_alpha = alpha;
     }
 
     pub fn set_scale(&mut self, scale: f32) {
@@ -344,19 +352,31 @@ impl SoftwareRenderer {
             .unwrap_or_default()
             .min(fb.height);
 
+        let bg_alpha = self.background_alpha;
+
         if full_redraw && top_pad > 0 {
-            self.fill_rect(fb, Rect::new(0, 0, fb.width, top_pad), background_rgb);
+            self.fill_rect_alpha(
+                fb,
+                Rect::new(0, 0, fb.width, top_pad),
+                background_rgb,
+                bg_alpha,
+            );
         }
 
         let grid_rows = grid.rows();
         let mut render_row = |row: usize| {
-            let (selected_start, selected_end) = selection.row_range(row)
-                .unwrap_or((usize::MAX, usize::MIN));
+            let (selected_start, selected_end) =
+                selection.row_range(row).unwrap_or((usize::MAX, usize::MIN));
             let y0 = self.row_boundaries[row].min(fb.height);
             let y1 = self.row_boundaries[row + 1].min(fb.height);
             let cell_h = y1.saturating_sub(y0);
 
-            self.fill_rect(fb, Rect::new(0, y0, fb.width, cell_h), background_rgb);
+            self.fill_rect_alpha(
+                fb,
+                Rect::new(0, y0, fb.width, cell_h),
+                background_rgb,
+                bg_alpha,
+            );
 
             let row_state = grid.view_row_mut(row);
             {
@@ -388,7 +408,12 @@ impl SoftwareRenderer {
                     let x1 = self.col_boundaries[col + 1].min(fb.width);
                     let cell_w = x1.saturating_sub(x0);
                     if bg != background {
-                        self.fill_rect(fb, Rect::new(x0, y0, cell_w, cell_h), Rgb::from_packed(bg));
+                        self.fill_rect_alpha(
+                            fb,
+                            Rect::new(x0, y0, cell_w, cell_h),
+                            Rgb::from_packed(bg),
+                            bg_alpha,
+                        );
                     }
 
                     let ch = cell.character();
@@ -442,10 +467,11 @@ impl SoftwareRenderer {
 
         let grid_bottom = self.row_boundaries[grid.rows()].min(fb.height);
         if full_redraw && grid_bottom < fb.height {
-            self.fill_rect(
+            self.fill_rect_alpha(
                 fb,
                 Rect::new(0, grid_bottom, fb.width, fb.height - grid_bottom),
                 background_rgb,
+                bg_alpha,
             );
         }
 
@@ -465,6 +491,19 @@ impl SoftwareRenderer {
         }
 
         fill_rect_raw(fb, rect, color);
+    }
+
+    fn fill_rect_alpha(&self, fb: &mut FrameBuffer<'_>, rect: Rect, color: Rgb, alpha: u8) {
+        if alpha == 255 {
+            self.fill_rect(fb, rect, color);
+            return;
+        }
+        if alpha == 0 {
+            // Clear to fully transparent
+            fill_rect_raw_alpha(fb, rect, color, 0);
+            return;
+        }
+        fill_rect_raw_alpha(fb, rect, color, alpha);
     }
 
     fn draw_animated_cursor(
@@ -506,7 +545,13 @@ impl SoftwareRenderer {
                     // Draw only the outline when unfocused
                     let outline_w = cursor.unfocused_outline_width();
                     let stroke_px = (outline_w * self.cell_width.min(self.cell_height)).max(1.0);
-                    self.draw_unfocused_outline(fb, corners_px, base_cursor_color, cursor_alpha, stroke_px);
+                    self.draw_unfocused_outline(
+                        fb,
+                        corners_px,
+                        base_cursor_color,
+                        cursor_alpha,
+                        stroke_px,
+                    );
                 } else if cursor_alpha == 255 {
                     self.fill_quad(fb, corners_px, base_cursor_color);
                     let cursor_col = grid.cursor_col().min(grid.cols().saturating_sub(1));
@@ -548,8 +593,16 @@ impl SoftwareRenderer {
         }
     }
 
-    fn fill_quad_alpha(&self, fb: &mut FrameBuffer<'_>, quad: [(f32, f32); 4], color: Rgb, alpha: u8) {
-        if alpha == 0 { return; }
+    fn fill_quad_alpha(
+        &self,
+        fb: &mut FrameBuffer<'_>,
+        quad: [(f32, f32); 4],
+        color: Rgb,
+        alpha: u8,
+    ) {
+        if alpha == 0 {
+            return;
+        }
         let (min_x, min_y, max_x, max_y) = quad_aabb(&quad);
         for y in min_y..max_y.min(fb.height) {
             for x in min_x..max_x.min(fb.width) {
@@ -563,8 +616,16 @@ impl SoftwareRenderer {
         }
     }
 
-    fn stroke_quad_edges_alpha(&self, fb: &mut FrameBuffer<'_>, quad: [(f32, f32); 4], color: Rgb, alpha: u8) {
-        if alpha == 0 { return; }
+    fn stroke_quad_edges_alpha(
+        &self,
+        fb: &mut FrameBuffer<'_>,
+        quad: [(f32, f32); 4],
+        color: Rgb,
+        alpha: u8,
+    ) {
+        if alpha == 0 {
+            return;
+        }
         let edges = [
             (quad[0], quad[1]),
             (quad[1], quad[2]),
@@ -602,8 +663,7 @@ impl SoftwareRenderer {
             for x in min_x.max(0) as u32..(max_x.max(0) as u32).min(fb.width) {
                 let px = x as f32 + 0.5;
                 let from_start_x = px - start.0;
-                let along =
-                    ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
+                let along = ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
                 let closest_x = start.0 + along * delta_x;
                 let closest_y = start.1 + along * delta_y;
                 let dist_x = px - closest_x;
@@ -623,7 +683,9 @@ impl SoftwareRenderer {
         alpha: u8,
         stroke_px: f32,
     ) {
-        if alpha == 0 { return; }
+        if alpha == 0 {
+            return;
+        }
         // Draw outline by rendering four edge strips with the given stroke width
         let edges = [
             (quad[0], quad[1]),
@@ -665,11 +727,7 @@ impl SoftwareRenderer {
         }
     }
 
-    fn draw_vfx_particles(
-        &self,
-        fb: &mut FrameBuffer<'_>,
-        cursor: &CursorRenderer,
-    ) {
+    fn draw_vfx_particles(&self, fb: &mut FrameBuffer<'_>, cursor: &CursorRenderer) {
         let particles = cursor.vfx_particles();
         if particles.is_empty() {
             return;
@@ -713,19 +771,27 @@ impl SoftwareRenderer {
                     let y1 = (py + ry).round().min(fb.height as f32) as u32;
                     // Top edge
                     for y in y0..y0.saturating_add(sw).min(y1) {
-                        for x in x0..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                        for x in x0..x1 {
+                            blend_bgra(fb, x, y, cursor_color, p.alpha);
+                        }
                     }
                     // Bottom edge
                     for y in y1.saturating_sub(sw).max(y0)..y1 {
-                        for x in x0..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                        for x in x0..x1 {
+                            blend_bgra(fb, x, y, cursor_color, p.alpha);
+                        }
                     }
                     // Left edge
                     for y in y0..y1 {
-                        for x in x0..x0.saturating_add(sw).min(x1) { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                        for x in x0..x0.saturating_add(sw).min(x1) {
+                            blend_bgra(fb, x, y, cursor_color, p.alpha);
+                        }
                     }
                     // Right edge
                     for y in y0..y1 {
-                        for x in x1.saturating_sub(sw).max(x0)..x1 { blend_bgra(fb, x, y, cursor_color, p.alpha); }
+                        for x in x1.saturating_sub(sw).max(x0)..x1 {
+                            blend_bgra(fb, x, y, cursor_color, p.alpha);
+                        }
                     }
                 }
             }
@@ -783,7 +849,10 @@ impl SoftwareRenderer {
         if delta_x.abs() < AXIS_ALIGNED_QUAD_EPSILON {
             let cx = (start.0 + end.0) * 0.5;
             let x0 = (cx - EDGE_STRIP_RADIUS).floor().max(0.0) as u32;
-            let x1 = (cx + EDGE_STRIP_RADIUS).ceil().max(0.0).min(fb.width as f32) as u32;
+            let x1 = (cx + EDGE_STRIP_RADIUS)
+                .ceil()
+                .max(0.0)
+                .min(fb.width as f32) as u32;
             let y0 = start.1.min(end.1).floor().max(0.0) as u32;
             let y1 = start.1.max(end.1).ceil().max(0.0).min(fb.height as f32) as u32;
             if x1 > x0 && y1 > y0 {
@@ -796,7 +865,10 @@ impl SoftwareRenderer {
             let x0 = start.0.min(end.0).floor().max(0.0) as u32;
             let x1 = start.0.max(end.0).ceil().max(0.0).min(fb.width as f32) as u32;
             let y0 = (cy - EDGE_STRIP_RADIUS).floor().max(0.0) as u32;
-            let y1 = (cy + EDGE_STRIP_RADIUS).ceil().max(0.0).min(fb.height as f32) as u32;
+            let y1 = (cy + EDGE_STRIP_RADIUS)
+                .ceil()
+                .max(0.0)
+                .min(fb.height as f32) as u32;
             if x1 > x0 && y1 > y0 {
                 fill_rect_raw(fb, Rect::new(x0, y0, x1 - x0, y1 - y0), color);
             }
@@ -816,8 +888,7 @@ impl SoftwareRenderer {
             for x in min_x.max(0) as u32..(max_x.max(0) as u32).min(fb.width) {
                 let px = x as f32 + 0.5;
                 let from_start_x = px - start.0;
-                let along =
-                    ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
+                let along = ((from_start_x * delta_x + y_dot) * inv_length_sq).clamp(0.0, 1.0);
                 let closest_x = start.0 + along * delta_x;
                 let closest_y = start.1 + along * delta_y;
                 let dist_x = px - closest_x;
@@ -946,7 +1017,16 @@ impl SoftwareRenderer {
             }
         } else {
             blit_glyph_fast(
-                fb, atlas, src_x, src_y, src_row_stride, dst_x, dst_y, draw_w, draw_h, style.color,
+                fb,
+                atlas,
+                src_x,
+                src_y,
+                src_row_stride,
+                dst_x,
+                dst_y,
+                draw_w,
+                draw_h,
+                style.color,
             );
         }
     }
@@ -954,10 +1034,26 @@ impl SoftwareRenderer {
 
 impl CheckInvariant for SoftwareRenderer {
     fn check_invariant(&self) {
-        invariant!(self.cell_width >= 1.0, "cell_width must be >= 1.0, got {}", self.cell_width);
-        invariant!(self.cell_height >= 1.0, "cell_height must be >= 1.0, got {}", self.cell_height);
-        invariant!(self.font_size >= 1.0, "font_size must be >= 1.0, got {}", self.font_size);
-        invariant!(self.scale >= 1.0, "scale must be >= 1.0, got {}", self.scale);
+        invariant!(
+            self.cell_width >= 1.0,
+            "cell_width must be >= 1.0, got {}",
+            self.cell_width
+        );
+        invariant!(
+            self.cell_height >= 1.0,
+            "cell_height must be >= 1.0, got {}",
+            self.cell_height
+        );
+        invariant!(
+            self.font_size >= 1.0,
+            "font_size must be >= 1.0, got {}",
+            self.font_size
+        );
+        invariant!(
+            self.scale >= 1.0,
+            "scale must be >= 1.0, got {}",
+            self.scale
+        );
     }
 }
 
@@ -995,18 +1091,29 @@ fn axis_aligned_fill_span(start: f32, end: f32, limit: u32) -> Option<(u32, u32)
     (pixel_end > pixel_start).then_some((pixel_start, pixel_end))
 }
 
-
 /// Compute axis-aligned bounding box of a quad as pixel coordinates.
 #[inline(always)]
 fn quad_aabb(quad: &[(f32, f32); 4]) -> (u32, u32, u32, u32) {
     let (mut lo_x, mut lo_y) = (quad[0].0, quad[0].1);
     let (mut hi_x, mut hi_y) = (lo_x, lo_y);
     for &(x, y) in &quad[1..] {
-        if x < lo_x { lo_x = x; } else if x > hi_x { hi_x = x; }
-        if y < lo_y { lo_y = y; } else if y > hi_y { hi_y = y; }
+        if x < lo_x {
+            lo_x = x;
+        } else if x > hi_x {
+            hi_x = x;
+        }
+        if y < lo_y {
+            lo_y = y;
+        } else if y > hi_y {
+            hi_y = y;
+        }
     }
-    (lo_x.floor().max(0.0) as u32, lo_y.floor().max(0.0) as u32,
-     hi_x.ceil().max(0.0) as u32, hi_y.ceil().max(0.0) as u32)
+    (
+        lo_x.floor().max(0.0) as u32,
+        lo_y.floor().max(0.0) as u32,
+        hi_x.ceil().max(0.0) as u32,
+        hi_y.ceil().max(0.0) as u32,
+    )
 }
 
 #[inline(always)]
@@ -1512,6 +1619,38 @@ fn premultiplied_bgra_8(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
 }
 
 #[inline(always)]
+fn fill_rect_raw_alpha(fb: &mut FrameBuffer<'_>, rect: Rect, color: Rgb, alpha: u8) {
+    let max_x = rect.x.saturating_add(rect.width).min(fb.width);
+    let max_y = rect.y.saturating_add(rect.height).min(fb.height);
+    if rect.x >= max_x || rect.y >= max_y {
+        return;
+    }
+    let pixel = premultiplied_bgra_8(color.red, color.green, color.blue, alpha);
+    let word = u32::from_ne_bytes(pixel);
+    let start_x = rect.x as usize * 4;
+    let row_bytes = (max_x - rect.x) as usize * 4;
+    let stride = fb.stride as usize;
+    let first_row_start = rect.y as usize * stride + start_x;
+    if first_row_start + row_bytes > fb.pixels.len() {
+        return;
+    }
+    unsafe {
+        let base = fb.pixels.as_mut_ptr();
+        let first = base.add(first_row_start);
+        let mut p = first as *mut u32;
+        let end = first.add(row_bytes) as *mut u32;
+        while p < end {
+            p.write_unaligned(word);
+            p = p.add(1);
+        }
+        for py in (rect.y + 1) as usize..max_y as usize {
+            let dst = base.add(py * stride + start_x);
+            std::ptr::copy_nonoverlapping(first, dst, row_bytes);
+        }
+    }
+}
+
+#[inline(always)]
 fn fill_rect_raw(fb: &mut FrameBuffer<'_>, rect: Rect, color: Rgb) {
     let max_x = rect.x.saturating_add(rect.width).min(fb.width);
     let max_y = rect.y.saturating_add(rect.height).min(fb.height);
@@ -1524,13 +1663,18 @@ fn fill_rect_raw(fb: &mut FrameBuffer<'_>, rect: Rect, color: Rgb) {
     let row_bytes = (max_x - rect.x) as usize * 4;
     let stride = fb.stride as usize;
     let first_row_start = rect.y as usize * stride + start_x;
-    if first_row_start + row_bytes > fb.pixels.len() { return; }
+    if first_row_start + row_bytes > fb.pixels.len() {
+        return;
+    }
     unsafe {
         let base = fb.pixels.as_mut_ptr();
         let first = base.add(first_row_start);
         let mut p = first as *mut u32;
         let end = first.add(row_bytes) as *mut u32;
-        while p < end { p.write_unaligned(word); p = p.add(1); }
+        while p < end {
+            p.write_unaligned(word);
+            p = p.add(1);
+        }
         for py in (rect.y + 1) as usize..max_y as usize {
             let dst = base.add(py * stride + start_x);
             std::ptr::copy_nonoverlapping(first, dst, row_bytes);
@@ -1553,22 +1697,28 @@ fn put_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, color: Rgb, alpha: u8) {
 
 #[inline(always)]
 fn blend_bgra(fb: &mut FrameBuffer<'_>, x: u32, y: u32, color: Rgb, alpha: u8) {
-    if alpha == 0 { return; }
+    if alpha == 0 {
+        return;
+    }
     let idx = y as usize * fb.stride as usize + x as usize * 4;
-    if idx + 4 > fb.pixels.len() { return; }
+    if idx + 4 > fb.pixels.len() {
+        return;
+    }
     if alpha == 255 {
         let pixel = premultiplied_bgra_8(color.red, color.green, color.blue, 255);
-        unsafe { std::ptr::copy_nonoverlapping(pixel.as_ptr(), fb.pixels.as_mut_ptr().add(idx), 4); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixel.as_ptr(), fb.pixels.as_mut_ptr().add(idx), 4);
+        }
         return;
     }
     let src = premultiplied_bgra_8(color.red, color.green, color.blue, alpha);
     let inv = 255u16 - alpha as u16;
     unsafe {
         let p = fb.pixels.as_mut_ptr().add(idx);
-        *p       = (src[0] as u16 + ((*p       as u16 * inv + 128) >> 8)).min(255) as u8;
-        *p.add(1)= (src[1] as u16 + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
-        *p.add(2)= (src[2] as u16 + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
-        *p.add(3)= (src[3] as u16 + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p = (src[0] as u16 + ((*p as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(1) = (src[1] as u16 + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(2) = (src[2] as u16 + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
+        *p.add(3) = (src[3] as u16 + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
     }
 }
 
@@ -1596,7 +1746,8 @@ fn blit_glyph_fast(
 
     // Verify bounds once for the entire blit region.
     let last_src = (src_y + draw_h - 1) as usize * src_stride + (src_x + draw_w - 1) as usize;
-    let last_dst = (dst_y + draw_h - 1) as usize * fb_stride + (dst_x + draw_w - 1) as usize * 4 + 3;
+    let last_dst =
+        (dst_y + draw_h - 1) as usize * fb_stride + (dst_x + draw_w - 1) as usize * 4 + 3;
     if last_src >= atlas_len || last_dst >= fb_len {
         return;
     }
@@ -1630,10 +1781,10 @@ fn blit_glyph_fast(
                     let sb = div255(cb as u16 * sa);
                     let sg = div255(cg as u16 * sa);
                     let sr = div255(cr as u16 * sa);
-                    *p       = (sb + ((*p       as u16 * inv + 128) >> 8)).min(255) as u8;
-                    *p.add(1)= (sg + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
-                    *p.add(2)= (sr + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
-                    *p.add(3)= (sa + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p = (sb + ((*p as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(1) = (sg + ((*p.add(1) as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(2) = (sr + ((*p.add(2) as u16 * inv + 128) >> 8)).min(255) as u8;
+                    *p.add(3) = (sa + ((*p.add(3) as u16 * inv + 128) >> 8)).min(255) as u8;
                 }
             }
         }
@@ -1693,7 +1844,11 @@ fn draw_stroked_oval(
     let y1 = (cy + outer_ry).ceil().min(fb.height as f32) as u32;
     let inv_outer_ry_sq = 1.0 / (outer_ry * outer_ry).max(1e-6);
     let has_inner = inner_rx > 0.5 && inner_ry > 0.5;
-    let inv_inner_ry_sq = if has_inner { 1.0 / (inner_ry * inner_ry) } else { 0.0 };
+    let inv_inner_ry_sq = if has_inner {
+        1.0 / (inner_ry * inner_ry)
+    } else {
+        0.0
+    };
     for y in y0..y1 {
         let dy = y as f32 + 0.5 - cy;
         let outer_t = 1.0 - dy * dy * inv_outer_ry_sq;
@@ -2068,6 +2223,60 @@ mod tests {
             [(dirty_y1 as usize * stride as usize)..(clean_y1 as usize * stride as usize)]
             .iter()
             .all(|&byte| byte == 0x7b));
+    }
+
+    #[test]
+    fn explicit_cell_background_uses_window_background_alpha() {
+        if std::panic::catch_unwind(crate::freetype_ffi::ft).is_err() {
+            return;
+        }
+
+        let theme = Theme::default();
+        let mut renderer = SoftwareRenderer::new(14.0, "monospace".to_string(), theme, 0);
+        renderer.set_background_alpha(128);
+
+        let mut grid = Grid::new(1, 1);
+        let cell = grid.cell_mut(0, 0);
+        cell.bg_src = ColorSource::Rgb;
+        cell.bg = PackedColor::new(0x12, 0x34, 0x56);
+
+        let (fb_width, fb_height) = renderer.window_size_for_grid(1, 1);
+        let (mut px, stride) = make_fb(fb_width, fb_height);
+        let mut fb = FrameBuffer {
+            width: fb_width,
+            height: fb_height,
+            stride,
+            pixels: &mut px,
+        };
+
+        let cursor = CursorRenderer::new();
+        let selection = Selection::new();
+        renderer.render(
+            &mut fb,
+            RenderState {
+                grid: &mut grid,
+                cursor: &cursor,
+                selection: &selection,
+                dirty_rows: &[(0, 0)],
+            },
+            RenderOptions {
+                full_redraw: true,
+                draw_cursor: false,
+            },
+        );
+
+        let x0 = renderer.col_boundary(0);
+        let x1 = renderer.col_boundary(1);
+        let y0 = renderer.row_boundary(0);
+        let y1 = renderer.row_boundary(1);
+        let x = x0 + (x1.saturating_sub(x0) / 2);
+        let y = y0 + (y1.saturating_sub(y0) / 2);
+        let idx = y as usize * stride as usize + x as usize * 4;
+
+        assert_eq!(
+            &fb.pixels[idx..idx + 4],
+            &premultiplied_bgra_8(0x12, 0x34, 0x56, 128),
+        );
     }
 
     #[test]

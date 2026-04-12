@@ -6,16 +6,16 @@ use crate::defaults::{
     APP_NAME, CONFIG_FILE_NAME, DEFAULT_ANSI_HEX, DEFAULT_BACKGROUND_HEX, DEFAULT_BOLD_IS_BRIGHT,
     DEFAULT_COLORTERM, DEFAULT_CURSOR_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_BLINK_ENABLED,
     DEFAULT_CURSOR_BLINK_INTERVAL_SECS, DEFAULT_CURSOR_HEX,
-    DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_STYLE, DEFAULT_CURSOR_TRAIL_SIZE,
-    DEFAULT_CURSOR_VFX_MODE, DEFAULT_CURSOR_VFX_OPACITY, DEFAULT_CURSOR_VFX_PARTICLE_LIFETIME,
-    DEFAULT_CURSOR_VFX_PARTICLE_HIGHLIGHT_LIFETIME, DEFAULT_CURSOR_VFX_PARTICLE_DENSITY,
-    DEFAULT_CURSOR_VFX_PARTICLE_SPEED, DEFAULT_CURSOR_VFX_PARTICLE_PHASE,
-    DEFAULT_CURSOR_VFX_PARTICLE_CURL,
-    DEFAULT_CURSOR_SMOOTH_BLINK, DEFAULT_CURSOR_UNFOCUSED_OUTLINE_WIDTH,
-    DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, DEFAULT_FONT_SIZE_ADJUSTMENT, DEFAULT_FOREGROUND_HEX,
-    DEFAULT_SCROLLBACK_LINES, DEFAULT_SELECTION_HEX, DEFAULT_SHELL_FALLBACK, DEFAULT_TERM,
-    DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS, DEFAULT_WINDOW_INITIAL_HEIGHT,
-    DEFAULT_WINDOW_INITIAL_WIDTH, DEFAULT_WINDOW_PADDING_PX, LEGACY_CONFIG_DIR_NAME,
+    DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_SMOOTH_BLINK, DEFAULT_CURSOR_STYLE,
+    DEFAULT_CURSOR_TRAIL_SIZE, DEFAULT_CURSOR_UNFOCUSED_OUTLINE_WIDTH, DEFAULT_CURSOR_VFX_MODE,
+    DEFAULT_CURSOR_VFX_OPACITY, DEFAULT_CURSOR_VFX_PARTICLE_CURL,
+    DEFAULT_CURSOR_VFX_PARTICLE_DENSITY, DEFAULT_CURSOR_VFX_PARTICLE_HIGHLIGHT_LIFETIME,
+    DEFAULT_CURSOR_VFX_PARTICLE_LIFETIME, DEFAULT_CURSOR_VFX_PARTICLE_PHASE,
+    DEFAULT_CURSOR_VFX_PARTICLE_SPEED, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE,
+    DEFAULT_FONT_SIZE_ADJUSTMENT, DEFAULT_FOREGROUND_HEX, DEFAULT_SCROLLBACK_LINES,
+    DEFAULT_SELECTION_HEX, DEFAULT_SHELL_FALLBACK, DEFAULT_TERM, DEFAULT_TERMINAL_COLS,
+    DEFAULT_TERMINAL_ROWS, DEFAULT_WINDOW_INITIAL_HEIGHT, DEFAULT_WINDOW_INITIAL_WIDTH,
+    DEFAULT_WINDOW_OPACITY, DEFAULT_WINDOW_PADDING_PX, LEGACY_CONFIG_DIR_NAME,
 };
 use crate::info_log;
 use crate::keybindings::{parse_binding_list, KeybindingsConfig};
@@ -90,13 +90,14 @@ pub struct CursorConfig {
     pub unfocused_outline_width: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowConfig {
     pub padding: u32,
     pub title: String,
     pub app_id: String,
     pub initial_width: u32,
     pub initial_height: u32,
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +185,7 @@ impl Default for WindowConfig {
             app_id: APP_NAME.to_string(),
             initial_width: DEFAULT_WINDOW_INITIAL_WIDTH,
             initial_height: DEFAULT_WINDOW_INITIAL_HEIGHT,
+            opacity: DEFAULT_WINDOW_OPACITY,
         }
     }
 }
@@ -363,15 +365,33 @@ impl Config {
                     .get_f32("cursor", "blink_interval")
                     .unwrap_or(def.cursor.blink_interval),
                 vfx_mode: string_field(t, "cursor", "vfx_mode", &def.cursor.vfx_mode),
-                vfx_opacity: t.get_f32("cursor", "vfx_opacity").unwrap_or(def.cursor.vfx_opacity),
-                vfx_particle_lifetime: t.get_f32("cursor", "vfx_particle_lifetime").unwrap_or(def.cursor.vfx_particle_lifetime),
-                vfx_particle_highlight_lifetime: t.get_f32("cursor", "vfx_particle_highlight_lifetime").unwrap_or(def.cursor.vfx_particle_highlight_lifetime),
-                vfx_particle_density: t.get_f32("cursor", "vfx_particle_density").unwrap_or(def.cursor.vfx_particle_density),
-                vfx_particle_speed: t.get_f32("cursor", "vfx_particle_speed").unwrap_or(def.cursor.vfx_particle_speed),
-                vfx_particle_phase: t.get_f32("cursor", "vfx_particle_phase").unwrap_or(def.cursor.vfx_particle_phase),
-                vfx_particle_curl: t.get_f32("cursor", "vfx_particle_curl").unwrap_or(def.cursor.vfx_particle_curl),
-                smooth_blink: t.get_bool("cursor", "smooth_blink").unwrap_or(def.cursor.smooth_blink),
-                unfocused_outline_width: t.get_f32("cursor", "unfocused_outline_width").unwrap_or(def.cursor.unfocused_outline_width),
+                vfx_opacity: t
+                    .get_f32("cursor", "vfx_opacity")
+                    .unwrap_or(def.cursor.vfx_opacity),
+                vfx_particle_lifetime: t
+                    .get_f32("cursor", "vfx_particle_lifetime")
+                    .unwrap_or(def.cursor.vfx_particle_lifetime),
+                vfx_particle_highlight_lifetime: t
+                    .get_f32("cursor", "vfx_particle_highlight_lifetime")
+                    .unwrap_or(def.cursor.vfx_particle_highlight_lifetime),
+                vfx_particle_density: t
+                    .get_f32("cursor", "vfx_particle_density")
+                    .unwrap_or(def.cursor.vfx_particle_density),
+                vfx_particle_speed: t
+                    .get_f32("cursor", "vfx_particle_speed")
+                    .unwrap_or(def.cursor.vfx_particle_speed),
+                vfx_particle_phase: t
+                    .get_f32("cursor", "vfx_particle_phase")
+                    .unwrap_or(def.cursor.vfx_particle_phase),
+                vfx_particle_curl: t
+                    .get_f32("cursor", "vfx_particle_curl")
+                    .unwrap_or(def.cursor.vfx_particle_curl),
+                smooth_blink: t
+                    .get_bool("cursor", "smooth_blink")
+                    .unwrap_or(def.cursor.smooth_blink),
+                unfocused_outline_width: t
+                    .get_f32("cursor", "unfocused_outline_width")
+                    .unwrap_or(def.cursor.unfocused_outline_width),
             },
             window: WindowConfig {
                 padding: u32_field(t, "window", "padding", def.window.padding),
@@ -379,6 +399,7 @@ impl Config {
                 app_id: string_field(t, "window", "app_id", &def.window.app_id),
                 initial_width: u32_field(t, "window", "initial_width", def.window.initial_width),
                 initial_height: u32_field(t, "window", "initial_height", def.window.initial_height),
+                opacity: t.get_f32("window", "opacity").unwrap_or(def.window.opacity),
             },
             terminal: TerminalConfig {
                 cols: t.get_usize("terminal", "cols").unwrap_or(def.terminal.cols),
@@ -438,16 +459,50 @@ impl Config {
             f32::EPSILON,
             DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
         );
-        self.cursor.vfx_opacity = Self::sanitize_f32(self.cursor.vfx_opacity, 0.0, DEFAULT_CURSOR_VFX_OPACITY);
-        self.cursor.vfx_particle_lifetime = Self::sanitize_f32(self.cursor.vfx_particle_lifetime, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_LIFETIME);
-        self.cursor.vfx_particle_highlight_lifetime = Self::sanitize_f32(self.cursor.vfx_particle_highlight_lifetime, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_HIGHLIGHT_LIFETIME);
-        self.cursor.vfx_particle_density = Self::sanitize_f32(self.cursor.vfx_particle_density, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_DENSITY);
-        self.cursor.vfx_particle_speed = Self::sanitize_f32(self.cursor.vfx_particle_speed, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_SPEED);
-        self.cursor.vfx_particle_phase = Self::sanitize_f32(self.cursor.vfx_particle_phase, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_PHASE);
-        self.cursor.vfx_particle_curl = Self::sanitize_f32(self.cursor.vfx_particle_curl, 0.0, DEFAULT_CURSOR_VFX_PARTICLE_CURL);
-        self.cursor.unfocused_outline_width = Self::sanitize_f32(self.cursor.unfocused_outline_width, 0.0, DEFAULT_CURSOR_UNFOCUSED_OUTLINE_WIDTH);
+        self.cursor.vfx_opacity =
+            Self::sanitize_f32(self.cursor.vfx_opacity, 0.0, DEFAULT_CURSOR_VFX_OPACITY);
+        self.cursor.vfx_particle_lifetime = Self::sanitize_f32(
+            self.cursor.vfx_particle_lifetime,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_LIFETIME,
+        );
+        self.cursor.vfx_particle_highlight_lifetime = Self::sanitize_f32(
+            self.cursor.vfx_particle_highlight_lifetime,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_HIGHLIGHT_LIFETIME,
+        );
+        self.cursor.vfx_particle_density = Self::sanitize_f32(
+            self.cursor.vfx_particle_density,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_DENSITY,
+        );
+        self.cursor.vfx_particle_speed = Self::sanitize_f32(
+            self.cursor.vfx_particle_speed,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_SPEED,
+        );
+        self.cursor.vfx_particle_phase = Self::sanitize_f32(
+            self.cursor.vfx_particle_phase,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_PHASE,
+        );
+        self.cursor.vfx_particle_curl = Self::sanitize_f32(
+            self.cursor.vfx_particle_curl,
+            0.0,
+            DEFAULT_CURSOR_VFX_PARTICLE_CURL,
+        );
+        self.cursor.unfocused_outline_width = Self::sanitize_f32(
+            self.cursor.unfocused_outline_width,
+            0.0,
+            DEFAULT_CURSOR_UNFOCUSED_OUTLINE_WIDTH,
+        );
         self.window.initial_width = self.window.initial_width.max(1);
         self.window.initial_height = self.window.initial_height.max(1);
+        self.window.opacity = if self.window.opacity.is_finite() {
+            self.window.opacity.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_WINDOW_OPACITY
+        };
         self.terminal.cols = self.terminal.cols.max(2);
         self.terminal.rows = self.terminal.rows.max(2);
 
@@ -456,10 +511,10 @@ impl Config {
         ensures!(self.terminal.rows >= 2);
         ensures!(self.window.initial_width >= 1);
         ensures!(self.window.initial_height >= 1);
+        ensures!((0.0..=1.0).contains(&self.window.opacity));
         ensures!(self.cursor.blink_interval > 0.0);
         debug_check_invariant!(self);
     }
-
 }
 
 impl CheckInvariant for Config {
@@ -467,9 +522,22 @@ impl CheckInvariant for Config {
         invariant!(self.font.size >= 1.0, "font.size must be >= 1.0");
         invariant!(self.terminal.cols >= 2, "terminal.cols must be >= 2");
         invariant!(self.terminal.rows >= 2, "terminal.rows must be >= 2");
-        invariant!(self.window.initial_width >= 1, "window.initial_width must be >= 1");
-        invariant!(self.window.initial_height >= 1, "window.initial_height must be >= 1");
-        invariant!(self.cursor.blink_interval > 0.0, "cursor.blink_interval must be > 0.0");
+        invariant!(
+            self.window.initial_width >= 1,
+            "window.initial_width must be >= 1"
+        );
+        invariant!(
+            self.window.initial_height >= 1,
+            "window.initial_height must be >= 1"
+        );
+        invariant!(
+            (0.0..=1.0).contains(&self.window.opacity),
+            "window.opacity must be in [0, 1]"
+        );
+        invariant!(
+            self.cursor.blink_interval > 0.0,
+            "cursor.blink_interval must be > 0.0"
+        );
     }
 }
 
@@ -578,6 +646,7 @@ mod tests {
         assert_eq!(config.window.title, APP_NAME);
         assert_eq!(config.window.initial_width, DEFAULT_WINDOW_INITIAL_WIDTH);
         assert_eq!(config.window.initial_height, DEFAULT_WINDOW_INITIAL_HEIGHT);
+        assert_eq!(config.window.opacity, DEFAULT_WINDOW_OPACITY);
         assert_eq!(config.terminal.cols, DEFAULT_TERMINAL_COLS);
         assert_eq!(config.terminal.rows, DEFAULT_TERMINAL_ROWS);
         assert_eq!(config.terminal.term, DEFAULT_TERM);
@@ -611,6 +680,7 @@ blink_interval = 0.7
 [window]
 initial_width = 1024
 initial_height = 768
+opacity = 0.5
 
 [terminal]
 cols = 132
@@ -625,6 +695,7 @@ shell_fallback = "/usr/bin/zsh"
         assert_eq!(config.cursor.blink_interval, 0.7);
         assert_eq!(config.window.initial_width, 1024);
         assert_eq!(config.window.initial_height, 768);
+        assert_eq!(config.window.opacity, 0.5);
         assert_eq!(config.terminal.cols, 132);
         assert_eq!(config.terminal.rows, 43);
         assert_eq!(config.terminal.term, "foot");
@@ -697,6 +768,23 @@ lines = 0
         assert_eq!(config.terminal.cols, 2);
         assert_eq!(config.terminal.rows, 2);
         assert_eq!(config.scrollback.lines, 0);
+    }
+
+    #[test]
+    fn test_window_opacity_is_normalized() {
+        let mut config = Config::default();
+
+        config.window.opacity = 1.5;
+        config.normalize();
+        assert_eq!(config.window.opacity, 1.0);
+
+        config.window.opacity = -0.5;
+        config.normalize();
+        assert_eq!(config.window.opacity, 0.0);
+
+        config.window.opacity = f32::NAN;
+        config.normalize();
+        assert_eq!(config.window.opacity, DEFAULT_WINDOW_OPACITY);
     }
 
     #[test]
