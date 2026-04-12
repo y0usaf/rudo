@@ -31,6 +31,16 @@ pub const DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS: f32 = 0.04;
 pub const DEFAULT_CURSOR_TRAIL_SIZE: f32 = 1.0;
 pub const DEFAULT_CURSOR_BLINK_ENABLED: bool = false;
 pub const DEFAULT_CURSOR_BLINK_INTERVAL_SECS: f32 = 0.6;
+pub const DEFAULT_CURSOR_VFX_MODE: &str = "";
+pub const DEFAULT_CURSOR_VFX_OPACITY: f32 = 200.0;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_LIFETIME: f32 = 0.5;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_HIGHLIGHT_LIFETIME: f32 = 0.2;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_DENSITY: f32 = 0.7;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_SPEED: f32 = 10.0;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_PHASE: f32 = 1.5;
+pub const DEFAULT_CURSOR_VFX_PARTICLE_CURL: f32 = 1.0;
+pub const DEFAULT_CURSOR_SMOOTH_BLINK: bool = false;
+pub const DEFAULT_CURSOR_UNFOCUSED_OUTLINE_WIDTH: f32 = 0.125;
 
 // Match foot's default padding: 0px. This also avoids exposing compositor
 // focus rings/borders through edge padding on compositors like Niri.

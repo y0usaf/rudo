@@ -121,6 +121,7 @@ impl TomlTable {
     }
 
     /// Get string from flat (no section / root) table.
+    #[allow(dead_code)]
     pub fn get_str_flat(&self, key: &str) -> Option<&str> {
         self.get_str("", key)
     }
