@@ -121,6 +121,7 @@ impl DamageTracker {
             if base_row >= self.num_rows {
                 break;
             }
+            if word == 0 { continue; }
 
             let mut bits = word & Self::valid_mask((self.num_rows - base_row).min(64));
             while bits != 0 {

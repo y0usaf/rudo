@@ -140,13 +140,15 @@ fn copy_row_prefix(dst: &mut Row, src: &Row, copy_cols: usize) {
 }
 
 fn mark_rows_dirty(rows: &mut [Row], top: usize, bottom: usize, offset: usize, num_rows: usize) {
-    if top > bottom {
-        return;
-    }
-
-    for r in top..=bottom {
-        let idx = (offset + r) & (num_rows - 1);
-        rows[idx].dirty = true;
+    if top > bottom { return; }
+    let mask = num_rows - 1;
+    let start = (offset + top) & mask;
+    let end = (offset + bottom) & mask;
+    if start <= end {
+        for row in &mut rows[start..=end] { row.dirty = true; }
+    } else {
+        for row in &mut rows[start..] { row.dirty = true; }
+        for row in &mut rows[..=end] { row.dirty = true; }
     }
 }
 

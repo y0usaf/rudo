@@ -506,6 +506,7 @@ impl<'a> Performer<'a> {
         }
     }
 
+    #[inline(always)]
     fn current_charset(&self) -> DecCharset {
         match *self.active_charset {
             CharsetSlot::G0 => *self.g0_charset,
@@ -513,6 +514,7 @@ impl<'a> Performer<'a> {
         }
     }
 
+    #[inline(always)]
     fn map_printable_char(&self, ch: char) -> char {
         match self.current_charset() {
             DecCharset::Ascii => ch,

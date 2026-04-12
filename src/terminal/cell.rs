@@ -134,8 +134,13 @@ impl Default for Cell {
 }
 
 impl Cell {
+    #[inline]
     pub fn character(&self) -> char {
-        char::from_u32(self.ch).unwrap_or(' ')
+        if self.ch < 128 {
+            unsafe { char::from_u32_unchecked(self.ch) }
+        } else {
+            char::from_u32(self.ch).unwrap_or(' ')
+        }
     }
 
     pub fn mark_dirty(&mut self) {
