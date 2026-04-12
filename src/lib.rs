@@ -4,6 +4,7 @@ pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod core_app;
 pub(crate) mod cursor;
+pub(crate) mod cursor_vfx;
 pub(crate) mod defaults;
 pub(crate) mod dlopen;
 pub(crate) mod font;

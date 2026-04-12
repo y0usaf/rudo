@@ -7,6 +7,7 @@ use crate::defaults::{
     DEFAULT_CURSOR_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_BLINK_INTERVAL_SECS,
     DEFAULT_CURSOR_SHORT_ANIMATION_LENGTH_SECS, DEFAULT_CURSOR_TRAIL_SIZE,
 };
+use crate::cursor_vfx::{CursorVfx, VfxParticle, VfxSettings};
 
 const CRITICAL_DAMPING_RATIO: f32 = 1.0;
 const SPRING_DAMPING_FACTOR: f32 = 4.0;
@@ -213,6 +214,10 @@ pub struct CursorRenderer {
     blink_enabled: bool,
     blink_timer: f32,
     animating: bool,
+    smooth_blink: bool,
+    unfocused: bool,
+    unfocused_outline_width: f32,
+    vfx: CursorVfx,
 }
 
 impl CursorRenderer {
@@ -233,6 +238,10 @@ impl CursorRenderer {
             blink_enabled: false,
             blink_timer: 0.0,
             animating: false,
+            smooth_blink: false,
+            unfocused: false,
+            unfocused_outline_width: 0.125,
+            vfx: CursorVfx::new(VfxSettings::default()),
         }
     }
 
@@ -273,7 +282,57 @@ impl CursorRenderer {
     }
 
     pub fn is_visible(&self) -> bool {
+        if self.smooth_blink {
+            return true;
+        }
         !self.blink_enabled || self.blink_on
+    }
+
+    /// Returns a smooth blink opacity value (0.0–1.0).
+    /// When smooth_blink is disabled, returns 1.0 if blink_on, 0.0 otherwise.
+    /// When smooth_blink is enabled, uses cosine interpolation for a fade effect.
+    pub fn blink_opacity(&self) -> f32 {
+        if !self.blink_enabled || self.settings.blink_interval <= 0.0 {
+            return 1.0;
+        }
+        if self.smooth_blink {
+            // Use cosine interpolation over a full blink cycle (two intervals).
+            // Progress within the current half-cycle:
+            let progress = self.blink_timer / self.settings.blink_interval;
+            // blink_on=true means we're in the visible half, transitioning toward off.
+            // blink_on=false means we're in the invisible half, transitioning toward on.
+            let phase = if self.blink_on {
+                // Fade from 1.0 → 0.0 over this half-cycle
+                progress
+            } else {
+                // Fade from 0.0 → 1.0 over this half-cycle
+                1.0 + progress
+            };
+            // Cosine goes from 1 → -1 → 1 over 0 → 1 → 2
+            (std::f32::consts::PI * phase).cos() * 0.5 + 0.5
+        } else {
+            if self.blink_on { 1.0 } else { 0.0 }
+        }
+    }
+
+    pub fn set_smooth_blink(&mut self, enabled: bool) {
+        self.smooth_blink = enabled;
+    }
+
+    pub fn set_unfocused(&mut self, unfocused: bool) {
+        self.unfocused = unfocused;
+    }
+
+    pub fn set_unfocused_outline_width(&mut self, width: f32) {
+        self.unfocused_outline_width = width.max(0.0);
+    }
+
+    pub fn is_unfocused(&self) -> bool {
+        self.unfocused
+    }
+
+    pub fn unfocused_outline_width(&self) -> f32 {
+        self.unfocused_outline_width
     }
 
     pub fn animate(&mut self, cursor_pos: (f32, f32), dt: f32) -> CursorTick {
@@ -285,6 +344,7 @@ impl CursorRenderer {
             self.jumped = true;
             self.blink_on = true;
             self.blink_timer = 0.0;
+            self.vfx.cursor_jumped(cursor_pos);
         }
 
         let mut blink_changed = false;
@@ -349,6 +409,9 @@ impl CursorRenderer {
             animating |= corner.update(center_x, center_y, CELL_DIMENSION, CELL_DIMENSION, dt);
         }
         self.jumped = false;
+        // Update VFX
+        let vfx_animating = self.vfx.update(cursor_pos, (CELL_DIMENSION, CELL_DIMENSION), dt);
+        animating |= vfx_animating;
         self.animating = animating;
         CursorTick {
             needs_redraw: moved || blink_changed || animating,
@@ -374,6 +437,14 @@ impl CursorRenderer {
         }
 
         next
+    }
+
+    pub fn set_vfx_settings(&mut self, settings: VfxSettings) {
+        self.vfx.set_settings(settings);
+    }
+
+    pub fn vfx_particles(&self) -> Vec<VfxParticle> {
+        self.vfx.particles()
     }
 
     pub fn corner_positions(&self) -> [(f32, f32); 4] {
