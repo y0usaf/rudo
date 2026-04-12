@@ -473,8 +473,16 @@ fn load_or_build_font_plan(preferred_family: &str) -> FontPlan {
 
     let plan = read_font_plan_cache(&request)
         .or_else(|| resolve_font_plan_via_fontconfig(&request))
+        .or_else(|| {
+            warn_log!("Preferred font not found, trying any monospace font via fontconfig.");
+            resolve_font_plan_via_fontconfig("monospace")
+        })
+        .or_else(|| {
+            warn_log!("Fontconfig failed, scanning common font directories.");
+            scan_filesystem_for_any_font()
+        })
         .unwrap_or_else(|| {
-            error_log!("No usable system monospace font found.");
+            error_log!("No usable system font found.");
             eprintln!(
                 "        Install a monospace font or set [font].family in the config (eg. JetBrains Mono, Fira Code, DejaVu Sans Mono, Liberation Mono)."
             );
@@ -487,6 +495,61 @@ fn load_or_build_font_plan(preferred_family: &str) -> FontPlan {
         .expect("font plan cache poisoned")
         .insert(request, plan.clone());
     plan
+}
+
+/// Last-resort: walk common font directories for any .ttf/.otf file.
+fn scan_filesystem_for_any_font() -> Option<FontPlan> {
+    const SEARCH_DIRS: &[&str] = &[
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/nix/var/nix/profiles/system/sw/share/X11/fonts",
+        "/run/current-system/sw/share/X11/fonts",
+    ];
+
+    // Also check $HOME/.local/share/fonts and $HOME/.fonts
+    let home = std::env::var("HOME").ok();
+    let mut dirs: Vec<PathBuf> = SEARCH_DIRS.iter().map(PathBuf::from).collect();
+    if let Some(ref h) = home {
+        dirs.push(PathBuf::from(format!("{h}/.local/share/fonts")));
+        dirs.push(PathBuf::from(format!("{h}/.fonts")));
+    }
+
+    for dir in &dirs {
+        if let Some(path) = find_first_font_in(dir) {
+            info_log!("Last-resort font: {}", path.display());
+            return Some(FontPlan {
+                regular: path,
+                bold: None,
+                italic: None,
+                bold_italic: None,
+                fallbacks: Vec::new(),
+            });
+        }
+    }
+    None
+}
+
+fn find_first_font_in(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf") {
+                    return Some(path);
+                }
+            }
+        } else if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    for sub in subdirs {
+        if let Some(found) = find_first_font_in(&sub) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn normalize_font_request(preferred_family: &str) -> String {
@@ -839,14 +902,38 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
 }
 
 fn load_primary_font(font_plan: &FontPlan, font_size: f32) -> FtFont {
-    load_font_from_path(&font_plan.regular, font_size).unwrap_or_else(|e| {
-        error_log!(
-            "Failed to load primary font {}: {}",
-            font_plan.regular.display(),
-            e
-        );
-        std::process::exit(1);
-    })
+    match load_font_from_path(&font_plan.regular, font_size) {
+        Ok(font) => return font,
+        Err(e) => {
+            warn_log!(
+                "Failed to load primary font {}: {}",
+                font_plan.regular.display(),
+                e
+            );
+        }
+    }
+
+    // Try fallbacks from the plan itself.
+    for fb in &font_plan.fallbacks {
+        if let Ok(font) = load_font_from_path(fb, font_size) {
+            warn_log!("Using fallback font: {}", fb.display());
+            return font;
+        }
+    }
+
+    // Last resort: scan filesystem.
+    if let Some(last_resort) = scan_filesystem_for_any_font() {
+        if let Ok(font) = load_font_from_path(&last_resort.regular, font_size) {
+            warn_log!("Using last-resort font: {}", last_resort.regular.display());
+            return font;
+        }
+    }
+
+    error_log!("No loadable font found — cannot render text.");
+    eprintln!(
+        "        Install a monospace font or set [font].family in the config (eg. JetBrains Mono, Fira Code, DejaVu Sans Mono, Liberation Mono)."
+    );
+    std::process::exit(1);
 }
 
 fn load_optional_style_font(path: &Path, size_px: f32) -> Option<FtFont> {
