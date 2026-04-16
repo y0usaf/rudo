@@ -1,6 +1,11 @@
 #include "rudo/render.h"
 #include <math.h>
 #include <string.h>
+#include <time.h>
+
+#define NS_PER_SEC 1000000000L
+static float timespec_to_seconds(const struct timespec *ts) { if (!ts) return 0.0f; return (float)ts->tv_sec + (float)ts->tv_nsec / 1e9f; }
+static void seconds_to_timespec(float seconds, struct timespec *out) { long sec; long nsec; if (!out) return; if (seconds <= 0.0f) { out->tv_sec = 0; out->tv_nsec = 0; return; } sec = (long)seconds; nsec = (long)lroundf((seconds - (float)sec) * (float)NS_PER_SEC); if (nsec >= NS_PER_SEC) { sec += 1; nsec -= NS_PER_SEC; } out->tv_sec = sec; out->tv_nsec = nsec; }
 
 #define CRITICAL_DAMPING_RATIO 1.0f
 #define SPRING_DAMPING_FACTOR 4.0f
@@ -15,6 +20,7 @@
 #define CELL_DIMENSION 1.0f
 #define BEAM_WIDTH_CELLS 0.12f
 #define UNDERLINE_HEIGHT_CELLS 0.16f
+#define CURSOR_ANIMATION_FRAME_INTERVAL_SECS (1.0f / 60.0f)
 
 typedef struct { float position, velocity; } spring;
 typedef struct { float current_x, current_y, relative_x, relative_y, prev_dest_x, prev_dest_y; spring spring_x, spring_y; float animation_length; } corner;
@@ -68,3 +74,8 @@ rudo_cursor_tick rudo_cursor_renderer_tick(rudo_cursor_renderer *c, float col, f
 void rudo_cursor_renderer_corner_positions(const rudo_cursor_renderer *c, float out_xy4[8]) { int i; if (!c || !out_xy4) return; for (i = 0; i < 4; ++i) { out_xy4[i * 2] = c->corners[i].current_x; out_xy4[i * 2 + 1] = c->corners[i].current_y; } }
 size_t rudo_cursor_renderer_particle_count(const rudo_cursor_renderer *c) { return (c && c->vfx) ? rudo_cursor_vfx_count(c->vfx) : 0; }
 size_t rudo_cursor_renderer_particles(const rudo_cursor_renderer *c, rudo_cursor_particle *out, size_t cap) { return (c && c->vfx) ? rudo_cursor_vfx_collect(c->vfx, out, cap) : 0; }
+bool rudo_cursor_renderer_next_wakeup(const rudo_cursor_renderer *c, const struct timespec *elapsed_since_frame, struct timespec *out_duration) { float elapsed, remaining = 0.0f, blink_remaining; bool have = false; if (!c || !out_duration) return false; elapsed = timespec_to_seconds(elapsed_since_frame); if (c->animating) { remaining = CURSOR_ANIMATION_FRAME_INTERVAL_SECS - elapsed; if (remaining < 0.0f) remaining = 0.0f; have = true; }
+    if (c->blink_enabled && c->settings.blink_interval > 0.0f) { blink_remaining = c->settings.blink_interval - c->blink_timer - elapsed; if (blink_remaining < 0.0f) blink_remaining = 0.0f; if (!have || blink_remaining < remaining) { remaining = blink_remaining; have = true; } }
+    if (!have) return false;
+    seconds_to_timespec(remaining, out_duration);
+    return true; }

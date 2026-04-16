@@ -38,6 +38,8 @@ typedef struct {
     size_t history_rows;
     size_t view_offset;
     size_t scrollback_limit;
+    size_t capacity_rows;
+    size_t row0;
     size_t cursor_col;
     size_t cursor_row;
     size_t saved_cursor_col;
@@ -50,6 +52,8 @@ typedef struct {
     size_t alt_total_rows;
     size_t alt_history_rows;
     size_t alt_view_offset;
+    size_t alt_capacity_rows;
+    size_t alt_row0;
     size_t alt_cursor_col;
     size_t alt_cursor_row;
     size_t alt_saved_cursor_col;
@@ -61,6 +65,7 @@ typedef struct {
 typedef struct {
     uint64_t *bits;
     size_t rows;
+    bool full_damage;
 } rudo_damage_tracker;
 
 typedef struct {
@@ -175,6 +180,8 @@ void rudo_damage_mark_all(rudo_damage_tracker *damage);
 void rudo_damage_mark_row(rudo_damage_tracker *damage, size_t row);
 void rudo_damage_mark_rows(rudo_damage_tracker *damage, size_t start_row, size_t end_row);
 bool rudo_damage_has_damage(const rudo_damage_tracker *damage);
+bool rudo_damage_is_full(const rudo_damage_tracker *damage);
+size_t rudo_damage_collect_row_ranges(const rudo_damage_tracker *damage, rudo_render_row_range *out, size_t cap);
 
 void rudo_selection_init(rudo_selection *sel);
 void rudo_selection_clear(rudo_selection *sel);

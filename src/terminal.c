@@ -60,13 +60,23 @@ static void cell_reset_with_bg(rudo_cell *cell, uint32_t bg, bool bg_default, co
     cell->bg_default = bg_default;
 }
 
+static size_t storage_row_index_for(size_t logical_row, size_t total_rows, size_t capacity_rows, size_t row0) {
+    if (!capacity_rows) capacity_rows = total_rows;
+    if (!capacity_rows) return 0;
+    return (row0 + logical_row) % capacity_rows;
+}
+
+static size_t storage_row_index(const rudo_grid *grid, size_t logical_row) {
+    return storage_row_index_for(logical_row, grid->total_rows, grid->capacity_rows, grid->row0);
+}
+
 static void clear_row(rudo_grid *grid, size_t row, const rudo_theme *theme) {
-    size_t i, idx = row * grid->cols;
+    size_t i, idx = storage_row_index(grid, row) * grid->cols;
     for (i = 0; i < grid->cols; ++i) cell_reset(&grid->cells[idx + i], theme);
 }
 
 static void clear_row_with_bg(rudo_grid *grid, size_t row, uint32_t bg, bool bg_default, const rudo_theme *theme) {
-    size_t i, idx = row * grid->cols;
+    size_t i, idx = storage_row_index(grid, row) * grid->cols;
     for (i = 0; i < grid->cols; ++i) cell_reset_with_bg(&grid->cells[idx + i], bg, bg_default, theme);
 }
 
@@ -76,7 +86,7 @@ static size_t visible_row_index(const rudo_grid *grid, size_t row) {
     return base - grid->view_offset + row;
 }
 
-static size_t row_base(const rudo_grid *grid, size_t row) { return visible_row_index(grid, row) * grid->cols; }
+static size_t row_base(const rudo_grid *grid, size_t row) { return storage_row_index(grid, visible_row_index(grid, row)) * grid->cols; }
 static size_t clamp_col(const rudo_grid *grid, size_t col) { return grid->cols ? RUDO_MIN(col, grid->cols - 1u) : 0; }
 static size_t clamp_row(const rudo_grid *grid, size_t row) { return grid->rows ? RUDO_MIN(row, grid->rows - 1u) : 0; }
 
@@ -294,9 +304,9 @@ void rudo_grid_destroy(rudo_grid *grid) { free(grid->cells); free(grid->alt_cell
 void rudo_grid_reset(rudo_grid *grid, size_t cols, size_t rows, size_t scrollback_lines) {
     rudo_theme theme; size_t i;
     free(grid->cells); free(grid->alt_cells); memset(grid, 0, sizeof(*grid));
-    grid->cols = cols < 2 ? 2 : cols; grid->rows = rows < 2 ? 2 : rows; grid->scrollback_limit = scrollback_lines; grid->total_rows = grid->rows; grid->cells = rudo_calloc(grid->cols * grid->total_rows, sizeof(*grid->cells)); grid->cursor_visible = true; grid->scroll_top = 0; grid->scroll_bottom = grid->rows ? grid->rows - 1u : 0;
+    grid->cols = cols < 2 ? 2 : cols; grid->rows = rows < 2 ? 2 : rows; grid->scrollback_limit = scrollback_lines; grid->capacity_rows = grid->rows; grid->total_rows = grid->rows; grid->cells = rudo_calloc(grid->cols * grid->capacity_rows, sizeof(*grid->cells)); grid->cursor_visible = true; grid->scroll_top = 0; grid->scroll_bottom = grid->rows ? grid->rows - 1u : 0;
     rudo_theme_init_default(&theme);
-    for (i = 0; i < grid->cols * grid->total_rows; ++i) cell_reset(&grid->cells[i], &theme);
+    for (i = 0; i < grid->cols * grid->capacity_rows; ++i) cell_reset(&grid->cells[i], &theme);
 }
 
 static void copy_row_prefix_cells(rudo_cell *dst, size_t dst_cols, const rudo_cell *src, size_t src_cols, size_t copy_cols) {
@@ -307,6 +317,8 @@ static void copy_row_prefix_cells(rudo_cell *dst, size_t dst_cols, const rudo_ce
 }
 
 static void grid_resize_store(rudo_cell **cells_ptr,
+                              size_t *capacity_rows_ptr,
+                              size_t *row0_ptr,
                               size_t *total_rows_ptr,
                               size_t *history_rows_ptr,
                               size_t old_cols,
@@ -320,17 +332,20 @@ static void grid_resize_store(rudo_cell **cells_ptr,
                               size_t *view_offset_out) {
     rudo_theme theme;
     rudo_cell *old_cells = cells_ptr ? *cells_ptr : NULL;
+    size_t old_capacity_rows = capacity_rows_ptr ? *capacity_rows_ptr : 0;
+    size_t old_row0 = row0_ptr ? *row0_ptr : 0;
     size_t old_history_rows = history_rows_ptr ? *history_rows_ptr : 0;
     size_t total_history, total_content, rows_at_and_below, new_anchor, anchor_logical;
     size_t visible_src_start, blank_top, max_scrollback, new_history_rows, scrollback_src_start;
     size_t visible_slots, visible_copy, copy_cols, src_logical, dst_idx, src_idx, i;
     rudo_cell *new_cells;
 
-    if (!cells_ptr || !total_rows_ptr || !history_rows_ptr) return;
+    if (!cells_ptr || !capacity_rows_ptr || !row0_ptr || !total_rows_ptr || !history_rows_ptr) return;
 
     new_cols = new_cols < 2 ? 2 : new_cols;
     new_rows = new_rows < 2 ? 2 : new_rows;
     total_history = old_rows + old_history_rows;
+    if (!old_capacity_rows) old_capacity_rows = total_history;
     if (cursor_row >= old_rows) cursor_row = old_rows ? old_rows - 1u : 0u;
     total_content = old_history_rows + cursor_row + 1u;
     if (total_content <= new_rows) new_anchor = cursor_row;
@@ -360,7 +375,7 @@ static void grid_resize_store(rudo_cell **cells_ptr,
     for (i = 0; i < new_history_rows; ++i) {
         src_logical = scrollback_src_start + i;
         if (src_logical >= total_history) break;
-        src_idx = src_logical;
+        src_idx = storage_row_index_for(src_logical, total_history, old_capacity_rows, old_row0);
         dst_idx = i;
         copy_row_prefix_cells(new_cells + dst_idx * new_cols, new_cols, old_cells + src_idx * old_cols, old_cols, copy_cols);
     }
@@ -368,13 +383,15 @@ static void grid_resize_store(rudo_cell **cells_ptr,
     for (i = 0; i < visible_copy; ++i) {
         src_logical = visible_src_start + i;
         if (src_logical >= total_history) break;
-        src_idx = src_logical;
+        src_idx = storage_row_index_for(src_logical, total_history, old_capacity_rows, old_row0);
         dst_idx = new_history_rows + blank_top + i;
         copy_row_prefix_cells(new_cells + dst_idx * new_cols, new_cols, old_cells + src_idx * old_cols, old_cols, copy_cols);
     }
 
     free(*cells_ptr);
     *cells_ptr = new_cells;
+    *capacity_rows_ptr = new_history_rows + new_rows;
+    *row0_ptr = 0;
     *total_rows_ptr = new_history_rows + new_rows;
     *history_rows_ptr = new_history_rows;
     if (cursor_row_out) *cursor_row_out = RUDO_MIN(new_anchor, new_rows - 1u);
@@ -390,6 +407,8 @@ void rudo_grid_resize(rudo_grid *grid, size_t cols, size_t rows) {
     if (new_cols == grid->cols && new_rows == grid->rows) return;
 
     grid_resize_store(&grid->cells,
+                      &grid->capacity_rows,
+                      &grid->row0,
                       &grid->total_rows,
                       &grid->history_rows,
                       grid->cols,
@@ -404,6 +423,8 @@ void rudo_grid_resize(rudo_grid *grid, size_t cols, size_t rows) {
 
     if (grid->alt_cells) {
         grid_resize_store(&grid->alt_cells,
+                          &grid->alt_capacity_rows,
+                          &grid->alt_row0,
                           &grid->alt_total_rows,
                           &grid->alt_history_rows,
                           grid->cols,
@@ -446,18 +467,30 @@ static void grid_scroll_up_region(rudo_grid *grid, size_t top, size_t bottom, si
     copy_rows = bottom - top + 1u - lines;
     if (top == 0 && bottom + 1u == grid->rows && !grid->alternate_active) {
         size_t row_size = grid->cols * sizeof(*grid->cells);
-        if (grid->history_rows < grid->scrollback_limit) {
-            grid->cells = rudo_realloc(grid->cells, (grid->total_rows + lines) * row_size);
-            memmove(grid->cells + lines * grid->cols, grid->cells, grid->total_rows * row_size);
-            grid->total_rows += lines;
-            grid->history_rows += lines;
-            if (grid->history_rows > grid->scrollback_limit) grid->history_rows = grid->scrollback_limit;
-        } else {
-            memmove(grid->cells, grid->cells + lines * grid->cols, (grid->total_rows - lines) * row_size);
+        size_t max_total = grid->rows + grid->scrollback_limit;
+        size_t desired_total = grid->total_rows + lines;
+        if (desired_total > grid->capacity_rows && grid->capacity_rows < max_total) {
+            size_t old_capacity = grid->capacity_rows;
+            size_t new_capacity = grid->capacity_rows ? grid->capacity_rows : grid->rows;
+            if (new_capacity < grid->rows) new_capacity = grid->rows;
+            while (new_capacity < desired_total && new_capacity < max_total) {
+                size_t grown = new_capacity * 2u;
+                if (grown <= new_capacity) { new_capacity = max_total; break; }
+                new_capacity = RUDO_MIN(grown, max_total);
+            }
+            if (new_capacity < desired_total) new_capacity = RUDO_MIN(max_total, desired_total);
+            grid->cells = rudo_realloc(grid->cells, new_capacity * row_size);
+            for (r = old_capacity; r < new_capacity; ++r) {
+                size_t base = r * grid->cols, c;
+                for (c = 0; c < grid->cols; ++c) grid->cells[base + c] = *blank;
+            }
+            grid->capacity_rows = new_capacity;
         }
-        for (r = 0; r < lines; ++r) {
-            size_t rr = grid->total_rows - grid->rows + (grid->rows - lines + r);
-            size_t base = rr * grid->cols, c;
+        if (desired_total > max_total && grid->capacity_rows) grid->row0 = (grid->row0 + desired_total - max_total) % grid->capacity_rows;
+        grid->total_rows = RUDO_MIN(desired_total, max_total);
+        grid->history_rows = grid->total_rows > grid->rows ? grid->total_rows - grid->rows : 0u;
+        for (r = grid->total_rows - lines; r < grid->total_rows; ++r) {
+            size_t base = storage_row_index(grid, r) * grid->cols, c;
             for (c = 0; c < grid->cols; ++c) grid->cells[base + c] = *blank;
         }
         if (grid->view_offset > grid->history_rows) grid->view_offset = grid->history_rows;
@@ -512,19 +545,98 @@ bool rudo_grid_scroll_view_up(rudo_grid *grid, size_t lines) { size_t max_off = 
 bool rudo_grid_scroll_view_down(rudo_grid *grid, size_t lines) { size_t old = grid->view_offset; grid->view_offset = lines > grid->view_offset ? 0 : grid->view_offset - lines; return grid->view_offset != old; }
 bool rudo_grid_is_viewing_scrollback(const rudo_grid *grid) { return grid->view_offset != 0; }
 void rudo_grid_reset_view(rudo_grid *grid) { grid->view_offset = 0; }
-void rudo_grid_clear(rudo_grid *grid, const rudo_theme *theme) { size_t i; for (i = 0; i < grid->cols * grid->total_rows; ++i) cell_reset(&grid->cells[i], theme); grid->cursor_col = grid->cursor_row = 0; grid->scroll_top = 0; grid->scroll_bottom = grid->rows ? grid->rows - 1u : 0; }
-const rudo_cell *rudo_grid_cell(const rudo_grid *grid, size_t row, size_t col) { static const rudo_cell fallback = { .ch = " "[0], .fg = 0, .bg = 0, .flags = 0, .fg_default = true, .bg_default = true }; size_t idx; if (!grid || !grid->cells || row >= grid->rows || col >= grid->cols) return &fallback; idx = row_base(grid, row) + col; if (idx >= grid->cols * grid->total_rows) return &fallback; return &grid->cells[idx]; }
-rudo_cell *rudo_grid_cell_mut(rudo_grid *grid, size_t row, size_t col) { static rudo_cell fallback = { .ch = " "[0], .fg = 0, .bg = 0, .flags = 0, .fg_default = true, .bg_default = true }; size_t idx; if (!grid || !grid->cells || row >= grid->rows || col >= grid->cols) return &fallback; idx = row_base(grid, row) + col; if (idx >= grid->cols * grid->total_rows) return &fallback; return &grid->cells[idx]; }
-void rudo_grid_build_render_cells(const rudo_grid *grid, rudo_render_cell *out) { size_t row, col; for (row = 0; row < grid->rows; ++row) for (col = 0; col < grid->cols; ++col) { const rudo_cell *src = rudo_grid_cell(grid, row, col); rudo_render_cell *dst = &out[row * grid->cols + col]; dst->col = (uint32_t)col; dst->row = (uint32_t)row; dst->width = (src->flags & RUDO_CELL_WIDE) ? 2u : 1u; dst->flags = src->flags; dst->ch = src->ch; dst->fg = src->fg; dst->bg = src->bg; dst->fg_default = src->fg_default; dst->bg_default = src->bg_default; } }
+void rudo_grid_clear(rudo_grid *grid, const rudo_theme *theme) { size_t i, n = grid->capacity_rows ? grid->capacity_rows : grid->total_rows; for (i = 0; i < grid->cols * n; ++i) cell_reset(&grid->cells[i], theme); grid->cursor_col = grid->cursor_row = 0; grid->scroll_top = 0; grid->scroll_bottom = grid->rows ? grid->rows - 1u : 0; }
+const rudo_cell *rudo_grid_cell(const rudo_grid *grid, size_t row, size_t col) { static const rudo_cell fallback = { .ch = " "[0], .fg = 0, .bg = 0, .flags = 0, .fg_default = true, .bg_default = true }; size_t idx, n; if (!grid || !grid->cells || row >= grid->rows || col >= grid->cols) return &fallback; idx = row_base(grid, row) + col; n = grid->capacity_rows ? grid->capacity_rows : grid->total_rows; if (idx >= grid->cols * n) return &fallback; return &grid->cells[idx]; }
+rudo_cell *rudo_grid_cell_mut(rudo_grid *grid, size_t row, size_t col) { static rudo_cell fallback = { .ch = " "[0], .fg = 0, .bg = 0, .flags = 0, .fg_default = true, .bg_default = true }; size_t idx, n; if (!grid || !grid->cells || row >= grid->rows || col >= grid->cols) return &fallback; idx = row_base(grid, row) + col; n = grid->capacity_rows ? grid->capacity_rows : grid->total_rows; if (idx >= grid->cols * n) return &fallback; return &grid->cells[idx]; }
+void rudo_grid_build_render_cells(const rudo_grid *grid, rudo_render_cell *out) { size_t row, col; for (row = 0; row < grid->rows; ++row) for (col = 0; col < grid->cols; ++col) { const rudo_cell *src = rudo_grid_cell(grid, row, col); rudo_render_cell *dst = &out[row * grid->cols + col]; dst->col = (uint32_t)col; dst->row = (uint32_t)row; dst->width = (src->flags & RUDO_CELL_WIDE) ? 2u : 1u; dst->flags = 0; if (src->flags & RUDO_CELL_BOLD) dst->flags |= RUDO_CELL_FLAG_BOLD; if (src->flags & RUDO_CELL_ITALIC) dst->flags |= RUDO_CELL_FLAG_ITALIC; if (src->flags & RUDO_CELL_UNDERLINE) dst->flags |= RUDO_CELL_FLAG_UNDERLINE; if (src->flags & RUDO_CELL_STRIKETHROUGH) dst->flags |= RUDO_CELL_FLAG_STRIKETHROUGH; if (src->flags & RUDO_CELL_REVERSE) dst->flags |= RUDO_CELL_FLAG_REVERSE; if (src->flags & RUDO_CELL_DIM) dst->flags |= RUDO_CELL_FLAG_DIM; if (src->flags & RUDO_CELL_HIDDEN) dst->flags |= RUDO_CELL_FLAG_HIDDEN; if (src->flags & RUDO_CELL_WIDE_SPACER) dst->flags |= RUDO_CELL_FLAG_WIDE_SPACER; dst->ch = src->ch; dst->fg = src->fg; dst->bg = src->bg; dst->fg_default = src->fg_default; dst->bg_default = src->bg_default; } }
+
+static size_t damage_word_count(size_t rows) { return (rows + 63u) / 64u; }
 
 void rudo_damage_init(rudo_damage_tracker *damage, size_t rows) { memset(damage, 0, sizeof(*damage)); rudo_damage_resize(damage, rows); }
 void rudo_damage_destroy(rudo_damage_tracker *damage) { free(damage->bits); memset(damage, 0, sizeof(*damage)); }
-void rudo_damage_resize(rudo_damage_tracker *damage, size_t rows) { size_t words = (rows + 63u) / 64u; if (words) { damage->bits = rudo_realloc(damage->bits, words * sizeof(uint64_t)); memset(damage->bits, 0xff, words * sizeof(uint64_t)); } else { free(damage->bits); damage->bits = NULL; } damage->rows = rows; }
-void rudo_damage_clear(rudo_damage_tracker *damage) { size_t words = (damage->rows + 63u) / 64u; if (words && damage->bits) memset(damage->bits, 0, words * sizeof(uint64_t)); }
-void rudo_damage_mark_all(rudo_damage_tracker *damage) { size_t words = (damage->rows + 63u) / 64u; if (words && damage->bits) memset(damage->bits, 0xff, words * sizeof(uint64_t)); }
-void rudo_damage_mark_row(rudo_damage_tracker *damage, size_t row) { if (row < damage->rows) damage->bits[row >> 6] |= 1ull << (row & 63u); }
-void rudo_damage_mark_rows(rudo_damage_tracker *damage, size_t start_row, size_t end_row) { size_t r; if (end_row >= damage->rows) end_row = damage->rows ? damage->rows - 1u : 0; for (r = start_row; damage->rows && r <= end_row; ++r) rudo_damage_mark_row(damage, r); }
-bool rudo_damage_has_damage(const rudo_damage_tracker *damage) { size_t i, n = (damage->rows + 63u) / 64u; for (i = 0; i < n; ++i) if (damage->bits[i]) return true; return false; }
+void rudo_damage_resize(rudo_damage_tracker *damage, size_t rows) {
+    size_t words = damage_word_count(rows);
+    if (words) {
+        damage->bits = rudo_realloc(damage->bits, words * sizeof(uint64_t));
+        memset(damage->bits, 0, words * sizeof(uint64_t));
+    } else {
+        free(damage->bits);
+        damage->bits = NULL;
+    }
+    damage->rows = rows;
+    damage->full_damage = rows != 0;
+}
+void rudo_damage_clear(rudo_damage_tracker *damage) {
+    size_t words = damage_word_count(damage->rows);
+    if (words && damage->bits) memset(damage->bits, 0, words * sizeof(uint64_t));
+    damage->full_damage = false;
+}
+void rudo_damage_mark_all(rudo_damage_tracker *damage) {
+    size_t words = damage_word_count(damage->rows);
+    if (words && damage->bits) memset(damage->bits, 0, words * sizeof(uint64_t));
+    damage->full_damage = damage->rows != 0;
+}
+void rudo_damage_mark_row(rudo_damage_tracker *damage, size_t row) {
+    if (!damage || damage->full_damage || row >= damage->rows || !damage->bits) return;
+    damage->bits[row >> 6] |= 1ull << (row & 63u);
+}
+void rudo_damage_mark_rows(rudo_damage_tracker *damage, size_t start_row, size_t end_row) {
+    size_t start_word, end_word, word;
+    uint64_t start_mask, end_mask;
+    if (!damage || damage->full_damage || !damage->rows || start_row >= damage->rows || !damage->bits) return;
+    if (end_row >= damage->rows) end_row = damage->rows - 1u;
+    if (start_row > end_row) return;
+    start_word = start_row >> 6;
+    end_word = end_row >> 6;
+    start_mask = ~0ull << (start_row & 63u);
+    end_mask = ~0ull >> (63u - (end_row & 63u));
+    if (start_word == end_word) {
+        damage->bits[start_word] |= start_mask & end_mask;
+        return;
+    }
+    damage->bits[start_word] |= start_mask;
+    for (word = start_word + 1u; word < end_word; ++word) damage->bits[word] = ~0ull;
+    damage->bits[end_word] |= end_mask;
+}
+bool rudo_damage_has_damage(const rudo_damage_tracker *damage) {
+    size_t i, n;
+    if (!damage) return false;
+    if (damage->full_damage) return damage->rows != 0;
+    n = damage_word_count(damage->rows);
+    for (i = 0; i < n; ++i) if (damage->bits[i]) return true;
+    return false;
+}
+bool rudo_damage_is_full(const rudo_damage_tracker *damage) { return damage && damage->full_damage; }
+size_t rudo_damage_collect_row_ranges(const rudo_damage_tracker *damage, rudo_render_row_range *out, size_t cap) {
+    size_t count = 0, row = 0;
+    if (!damage || !damage->rows) return 0;
+    if (damage->full_damage) {
+        if (out && cap) {
+            out[0].start_row = 0;
+            out[0].end_row_inclusive = damage->rows - 1u;
+        }
+        return 1;
+    }
+    while (row < damage->rows) {
+        bool dirty = (damage->bits[row >> 6] & (1ull << (row & 63u))) != 0;
+        if (!dirty) {
+            ++row;
+            continue;
+        }
+        {
+            size_t start = row;
+            do {
+                ++row;
+            } while (row < damage->rows && (damage->bits[row >> 6] & (1ull << (row & 63u))) != 0);
+            if (out && count < cap) {
+                out[count].start_row = start;
+                out[count].end_row_inclusive = row - 1u;
+            }
+            ++count;
+        }
+    }
+    return count;
+}
 
 void rudo_selection_init(rudo_selection *sel) { memset(sel, 0, sizeof(*sel)); sel->state = RUDO_SELECTION_NONE; }
 void rudo_selection_clear(rudo_selection *sel) { sel->state = RUDO_SELECTION_NONE; sel->start.col = sel->start.row = sel->end.col = sel->end.row = 0; }
@@ -751,6 +863,8 @@ static void grid_enter_alt(rudo_grid *g, const rudo_theme *theme) {
     g->alt_total_rows = g->total_rows;
     g->alt_history_rows = g->history_rows;
     g->alt_view_offset = g->view_offset;
+    g->alt_capacity_rows = g->capacity_rows;
+    g->alt_row0 = g->row0;
     g->alt_cursor_col = g->cursor_col;
     g->alt_cursor_row = g->cursor_row;
     g->alt_saved_cursor_col = g->saved_cursor_col;
@@ -758,6 +872,8 @@ static void grid_enter_alt(rudo_grid *g, const rudo_theme *theme) {
     g->alt_scroll_top = g->scroll_top;
     g->alt_scroll_bottom = g->scroll_bottom;
     g->cells = rudo_calloc(g->cols * g->rows, sizeof(*g->cells));
+    g->capacity_rows = g->rows;
+    g->row0 = 0;
     g->total_rows = g->rows;
     g->history_rows = 0;
     g->view_offset = 0;
@@ -778,6 +894,8 @@ static void grid_leave_alt(rudo_grid *g) {
     g->total_rows = g->alt_total_rows;
     g->history_rows = g->alt_history_rows;
     g->view_offset = g->alt_view_offset;
+    g->capacity_rows = g->alt_capacity_rows;
+    g->row0 = g->alt_row0;
     g->cursor_col = g->alt_cursor_col;
     g->cursor_row = g->alt_cursor_row;
     g->saved_cursor_col = g->alt_saved_cursor_col;
@@ -786,7 +904,26 @@ static void grid_leave_alt(rudo_grid *g) {
     g->scroll_bottom = g->alt_scroll_bottom;
     g->alt_cells = NULL;
     g->alt_total_rows = g->alt_history_rows = g->alt_view_offset = 0;
+    g->alt_capacity_rows = g->alt_row0 = 0;
     g->alternate_active = false;
+}
+
+static void grid_erase_scrollback(rudo_grid *g) {
+    rudo_cell *cells;
+    size_t r, c;
+    if (!g) return;
+    g->view_offset = 0;
+    if (g->alternate_active || !g->history_rows) return;
+    cells = rudo_malloc(g->cols * g->rows * sizeof(*cells));
+    for (r = 0; r < g->rows; ++r) {
+        for (c = 0; c < g->cols; ++c) cells[r * g->cols + c] = *rudo_grid_cell(g, r, c);
+    }
+    free(g->cells);
+    g->cells = cells;
+    g->capacity_rows = g->rows;
+    g->row0 = 0;
+    g->total_rows = g->rows;
+    g->history_rows = 0;
 }
 
 static void parser_handle_sgr(rudo_terminal_parser *p, const char *params) {
@@ -886,23 +1023,28 @@ static void parser_handle_osc(rudo_terminal_parser *p, bool bell_terminated) {
         return;
     }
     if (!strcmp(cmd, "104")) {
-        bool any = false;
+        bool any = false, had_param = false;
         while ((param = strtok_r(NULL, ";", &save)) != NULL) {
             unsigned idx = parse_uint_param(param, 0u, false);
+            had_param = true;
             if (idx < 16u) { p->theme.ansi[idx] = p->base_theme.ansi[idx]; any = true; }
         }
-        if (!save || !*save) {
+        if (!had_param) {
             size_t i; for (i = 0; i < 16u; ++i) p->theme.ansi[i] = p->base_theme.ansi[i]; any = true;
         }
         if (any) p->theme_changed = true;
         return;
     }
-    if (!strcmp(cmd, "110")) { memcpy(p->theme.foreground, p->base_theme.foreground, sizeof(p->theme.foreground)); p->theme_changed = true; parser_sync_default_attrs(p); return; }
-    if (!strcmp(cmd, "111")) { memcpy(p->theme.background, p->base_theme.background, sizeof(p->theme.background)); p->theme_changed = true; parser_sync_default_attrs(p); return; }
-    if (!strcmp(cmd, "112")) { memcpy(p->theme.cursor, p->base_theme.cursor, sizeof(p->theme.cursor)); p->theme_changed = true; return; }
+    if (!strcmp(cmd, "110")) { if (save && *save) return; memcpy(p->theme.foreground, p->base_theme.foreground, sizeof(p->theme.foreground)); p->theme_changed = true; parser_sync_default_attrs(p); return; }
+    if (!strcmp(cmd, "111")) { if (save && *save) return; memcpy(p->theme.background, p->base_theme.background, sizeof(p->theme.background)); p->theme_changed = true; parser_sync_default_attrs(p); return; }
+    if (!strcmp(cmd, "112")) { if (save && *save) return; memcpy(p->theme.cursor, p->base_theme.cursor, sizeof(p->theme.cursor)); p->theme_changed = true; return; }
 }
 
-static void parser_handle_dcs(rudo_terminal_parser *p) { RUDO_UNUSED(p); }
+static void parser_handle_dcs(rudo_terminal_parser *p) {
+    if (!p || !p->dcs_buf[0]) return;
+    if (strcmp(p->dcs_buf, "=1s") == 0) p->synchronized_output = true;
+    else if (strcmp(p->dcs_buf, "=2s") == 0) p->synchronized_output = false;
+}
 
 static void parser_handle_csi(rudo_terminal_parser *p, rudo_grid *g, rudo_damage_tracker *d) {
     char final = p->esc_len ? p->esc_buf[p->esc_len - 1u] : 0;
@@ -922,12 +1064,14 @@ static void parser_handle_csi(rudo_terminal_parser *p, rudo_grid *g, rudo_damage
         case 'G': { size_t n = parse_uint_param(params, 1u, true); g->cursor_col = RUDO_MIN(n ? n - 1u : 0u, g->cols ? g->cols - 1u : 0u); } break;
         case 'H': case 'f': {
             char *semi = strchr(params, ';');
-            size_t row = parse_uint_param(params, 1u, true), col = 1u;
-            if (semi) { *semi++ = 0; col = parse_uint_param(semi, 1u, true); }
+            size_t row, col = 1u;
+            if (semi) *semi++ = 0;
+            row = parse_uint_param(params, 1u, true);
+            if (semi) col = parse_uint_param(semi, 1u, true);
             g->cursor_row = parser_absolute_row(p, g, row ? row - 1u : 0u);
             g->cursor_col = RUDO_MIN(col ? col - 1u : 0u, g->cols ? g->cols - 1u : 0u);
         } break;
-        case 'J': { unsigned mode = parse_uint_param(params, 0u, false); size_t r; if (mode == 0u) { grid_erase_line_range(g, g->cursor_row, g->cursor_col, g->cols ? g->cols - 1u : 0u, &blank); for (r = g->cursor_row + 1u; r < g->rows; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); } else if (mode == 1u) { for (r = 0; r < g->cursor_row; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); grid_erase_line_range(g, g->cursor_row, 0, g->cursor_col, &blank); } else if (mode == 2u || mode == 3u) { for (r = 0; r < g->rows; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); } rudo_damage_mark_all(d); } break;
+        case 'J': { unsigned mode = parse_uint_param(params, 0u, false); size_t r; if (mode == 0u) { grid_erase_line_range(g, g->cursor_row, g->cursor_col, g->cols ? g->cols - 1u : 0u, &blank); for (r = g->cursor_row + 1u; r < g->rows; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); } else if (mode == 1u) { for (r = 0; r < g->cursor_row; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); grid_erase_line_range(g, g->cursor_row, 0, g->cursor_col, &blank); } else if (mode == 2u) { for (r = 0; r < g->rows; ++r) clear_row_with_bg(g, visible_row_index(g, r), blank.bg, blank.bg_default, &p->theme); } else if (mode == 3u) grid_erase_scrollback(g); rudo_damage_mark_all(d); } break;
         case 'K': { unsigned mode = parse_uint_param(params, 0u, false); if (mode == 0u) grid_erase_line_range(g, g->cursor_row, g->cursor_col, g->cols ? g->cols - 1u : 0u, &blank); else if (mode == 1u) grid_erase_line_range(g, g->cursor_row, 0, g->cursor_col, &blank); else if (mode == 2u) grid_erase_line_range(g, g->cursor_row, 0, g->cols ? g->cols - 1u : 0u, &blank); rudo_damage_mark_row(d, g->cursor_row); } break;
         case 'L': { size_t n = parse_uint_param(params, 1u, true); grid_insert_lines(g, n, &blank); parser_mark_scroll_damage(d, g->cursor_row, g->scroll_bottom); } break;
         case 'M': { size_t n = parse_uint_param(params, 1u, true); grid_delete_lines(g, n, &blank); parser_mark_scroll_damage(d, g->cursor_row, g->scroll_bottom); } break;
@@ -939,7 +1083,7 @@ static void parser_handle_csi(rudo_terminal_parser *p, rudo_grid *g, rudo_damage
         case 'd': { size_t n = parse_uint_param(params, 1u, true); g->cursor_row = parser_absolute_row(p, g, n ? n - 1u : 0u); } break;
         case 'm': parser_handle_sgr(p, params); break;
         case 'n': { unsigned mode = parse_uint_param(params, 0u, false); char reply[64]; if (mode == 5u) responses_push(&p->responses, "\033[0n"); else if (mode == 6u) { size_t row = g->cursor_row + 1u, col = clamp_col(g, g->cursor_col) + 1u; if (p->origin_mode) row = g->cursor_row - g->scroll_top + 1u; snprintf(reply, sizeof(reply), "\033[%zu;%zuR", row, col); responses_push(&p->responses, reply); } } break;
-        case 'r': if (!p->csi_private) { char *semi = strchr(params, ';'); size_t top = parse_uint_param(params, 1u, true), bottom = g->rows; if (semi) { *semi++ = 0; bottom = parse_uint_param(semi, (unsigned)g->rows, true); } grid_set_scroll_region(g, top ? top - 1u : 0u, bottom ? bottom - 1u : 0u); } break;
+        case 'r': if (!p->csi_private) { char *semi = strchr(params, ';'); size_t top, bottom = g->rows; if (semi) *semi++ = 0; top = parse_uint_param(params, 1u, true); if (semi) bottom = parse_uint_param(semi, (unsigned)g->rows, true); grid_set_scroll_region(g, top ? top - 1u : 0u, bottom ? bottom - 1u : 0u); } break;
         case 's': if (!p->csi_private) grid_save_cursor(g); break;
         case 'u': if (!p->csi_private) grid_restore_cursor(g); break;
         case 'c': if (!p->csi_private && parse_uint_param(params, 0u, false) == 0u) responses_push(&p->responses, "\033[?62;c"); break;

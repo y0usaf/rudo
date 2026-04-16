@@ -3,6 +3,7 @@
 
 #include "rudo/common.h"
 #include "rudo/defaults.h"
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,8 +114,15 @@ enum {
 };
 
 typedef struct {
+    size_t start_row;
+    size_t end_row_inclusive;
+} rudo_render_row_range;
+
+typedef struct {
     bool full_redraw;
     bool draw_cursor;
+    const rudo_render_row_range *dirty_rows;
+    size_t dirty_row_count;
 } rudo_render_options;
 
 typedef struct {
@@ -178,12 +186,16 @@ float rudo_cursor_renderer_unfocused_outline_width(const rudo_cursor_renderer *c
 void rudo_cursor_renderer_corner_positions(const rudo_cursor_renderer *cursor, float out_xy4[8]);
 size_t rudo_cursor_renderer_particle_count(const rudo_cursor_renderer *cursor);
 size_t rudo_cursor_renderer_particles(const rudo_cursor_renderer *cursor, rudo_cursor_particle *out, size_t cap);
+bool rudo_cursor_renderer_next_wakeup(const rudo_cursor_renderer *cursor, const struct timespec *elapsed_since_frame, struct timespec *out_duration);
 
 rudo_software_renderer *rudo_software_renderer_new(float font_size_points, const char *font_family, const rudo_theme_colors *theme, uint32_t padding_px);
 void rudo_software_renderer_free(rudo_software_renderer *renderer);
 void rudo_software_renderer_set_theme(rudo_software_renderer *renderer, const rudo_theme_colors *theme);
 void rudo_software_renderer_set_scale(rudo_software_renderer *renderer, float scale);
 void rudo_software_renderer_set_font_size(rudo_software_renderer *renderer, float font_size_points);
+void rudo_software_renderer_increase_font_size(rudo_software_renderer *renderer, float delta_points);
+void rudo_software_renderer_decrease_font_size(rudo_software_renderer *renderer, float delta_points);
+void rudo_software_renderer_reset_font_size(rudo_software_renderer *renderer);
 void rudo_software_renderer_set_background_alpha(rudo_software_renderer *renderer, uint8_t alpha);
 void rudo_software_renderer_cell_size(const rudo_software_renderer *renderer, float *cell_width, float *cell_height);
 void rudo_software_renderer_grid_offset(const rudo_software_renderer *renderer, float *offset_x, float *offset_y);
